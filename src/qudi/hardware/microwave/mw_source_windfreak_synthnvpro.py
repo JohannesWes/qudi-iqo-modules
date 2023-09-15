@@ -30,7 +30,7 @@ from qudi.util.enums import SamplingOutputMode
 
 
 class MicrowaveSynthNVPro(MicrowaveInterface):
-    """ Hardware class to controls a SynthNV Pro.
+    """ Hardware class to control a SynthNV Pro only for mode EQUIDISTANT_SWEEP.
 
     Example config for copy-paste:
 
@@ -177,7 +177,6 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         @param float frequency: frequency to set in Hz
         @param float power: power to set in dBm
         """
-        print(self._scan_frequencies)
         with self._thread_lock:
             if self.module_state() != 'idle':
                 raise RuntimeError('Unable to set CW parameters. Microwave output active.')
@@ -291,7 +290,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         # trigger mode: single step
         self._device.write('y2')
-        self._device.write('t37.5')
+        #self._device.write('t37.5')
 
         # sweep direction
         if stop >= start:
