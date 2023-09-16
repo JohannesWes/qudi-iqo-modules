@@ -79,7 +79,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             power_limits=(-50, 18),
             frequency_limits=(54e6, 14e9),
             scan_size_limits=(2, 100),
-            sample_rate_limits=(0.1, 1e3/4),
+            sample_rate_limits=(0.1, 1e3 / 4),
             scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP,)
         )
 
@@ -205,10 +205,11 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # configure scan according to scan mode
             self._scan_power = power
             self._scan_frequencies = tuple(frequencies)
-            self._write_sweep()
 
             self._device.write(f't{1000 * 0.75 / sample_rate:f}')
             self._scan_sample_rate = float(self._device.query('t?')) / 1000
+            print(self._device.query('t?'))
+            self._write_sweep()
 
             self.log.debug(f'Configured scan with: '
                            f'scan_power = {self._scan_power}, '
@@ -290,7 +291,8 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         # trigger mode: single step
         self._device.write('y2')
-        #self._device.write('t37.5')
+        # self._device.write('t37.5')
+        print(self._device.query('t?'))
 
         # sweep direction
         if stop >= start:
