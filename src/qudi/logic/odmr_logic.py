@@ -59,7 +59,7 @@ class OdmrLogic(LogicBase):
     # declare config options
     _save_thumbnails = ConfigOption(name='save_thumbnails', default=True)
     _default_scan_mode = ConfigOption(name='default_scan_mode',
-                                      default='JUMP_LIST',
+                                      default='EQUIDISTANT_SWEEP',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
 
     # declare status variables
@@ -526,6 +526,7 @@ class OdmrLogic(LogicBase):
                 else:
                     mode = self._default_scan_mode
                 if mode == SamplingOutputMode.JUMP_LIST:
+                    # todo: hier erstellen wir eigentlich einen array aus Frequenzen. Dann müsste man aber auch den Modus X1 in der windfreak verwenden oder
                     frequencies = np.concatenate(self._frequency_data)
                     if self._oversampling_factor > 1:
                         frequencies = np.repeat(frequencies, self._oversampling_factor)
