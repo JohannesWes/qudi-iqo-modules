@@ -205,11 +205,11 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # configure scan according to scan mode
             self._scan_power = power
             self._scan_frequencies = tuple(frequencies)
+            self._write_sweep()
 
             self._device.write(f't{1000 * 0.75 / sample_rate:f}')
             self._scan_sample_rate = float(self._device.query('t?')) / 1000
-            print(self._device.query('t?'))
-            self._write_sweep()
+
 
             self.log.debug(f'Configured scan with: '
                            f'scan_power = {self._scan_power}, '
