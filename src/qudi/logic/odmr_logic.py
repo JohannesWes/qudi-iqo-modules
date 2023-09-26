@@ -59,7 +59,7 @@ class OdmrLogic(LogicBase):
     # declare config options
     _save_thumbnails = ConfigOption(name='save_thumbnails', default=True)
     _default_scan_mode = ConfigOption(name='default_scan_mode',
-                                      default='EQUIDISTANT_SWEEP',
+                                      default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
 
     # declare status variables
