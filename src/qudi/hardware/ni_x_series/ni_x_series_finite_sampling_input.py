@@ -504,7 +504,7 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                 task.co_channels.add_co_pulse_chan_freq(
                     '/{0}/{1}'.format(self._device_name, src),
                     freq=self._sample_rate,
-                    idle_state=ni.constants.Level.LOW)
+                    idle_state=ni.constants.Level.HIGH)
                 task.timing.cfg_implicit_timing(
                     sample_mode=ni.constants.AcquisitionType.FINITE,
                     samps_per_chan=self._frame_size + 1)

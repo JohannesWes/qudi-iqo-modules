@@ -524,7 +524,6 @@ class OdmrLogic(LogicBase):
                 else:
                     mode = self._default_scan_mode
                 if mode == SamplingOutputMode.JUMP_LIST:
-                    # todo: hier erstellen wir eigentlich einen array aus Frequenzen. Dann müsste man aber auch den Modus X1 in der windfreak verwenden oder
                     frequencies = np.concatenate(self._frequency_data)
                     if self._oversampling_factor > 1:
                         frequencies = np.repeat(frequencies, self._oversampling_factor)
@@ -536,9 +535,11 @@ class OdmrLogic(LogicBase):
                 # Set up data acquisition device
                 sampler.set_sample_rate(sample_rate)
                 sampler.set_frame_size(samples)
+
                 # Set up microwave scan and start it
                 microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
                 microwave.start_scan()
+
             except:
                 self.module_state.unlock()
                 self.log.exception('Unable to start ODMR scan. Error while setting up hardware:')
