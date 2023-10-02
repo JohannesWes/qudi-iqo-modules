@@ -20,8 +20,10 @@ See the GNU Lesser General Public License for more details.
 You should have received a copy of the GNU Lesser General Public License along with qudi.
 If not, see <https://www.gnu.org/licenses/>.
 """
+import time
 
 import pyvisa
+import numpy as np
 
 from qudi.util.mutex import Mutex
 from qudi.core.configoption import ConfigOption
@@ -55,8 +57,10 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         self._model = ''
         self._constraints = None
         self._scan_power = -20
+        self._scan_mode = None
         self._scan_frequencies = None
         self._scan_sample_rate = 0.
+        self._scan_step_time = 0.
         self._in_cw_mode = True
 
     def on_activate(self):
@@ -78,9 +82,9 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         self._constraints = MicrowaveConstraints(
             power_limits=(-50, 18),
             frequency_limits=(54e6, 14e9),
-            scan_size_limits=(2, 100),
-            sample_rate_limits=(0.1, 1e3 / 4),
-            scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP,)
+            scan_size_limits=(2, 10000),
+            sample_rate_limits=(0.1, 1000),
+            scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
         )
 
         self._scan_power = -20
@@ -143,6 +147,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
     def scan_frequencies(self):
         """The microwave frequencies used for scanning. Must implement setter as well.
 
+        In case of scan_mode == SamplingOutputMode.JUMP_LIST, this will be a 1D numpy array.
         In case of scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP, this will be a tuple
         containing 3 values (freq_begin, freq_end, number_of_samples).
         If no frequency scan has been specified, return None.
@@ -204,12 +209,26 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
             # configure scan according to scan mode
             self._scan_power = power
-            self._scan_frequencies = tuple(frequencies)
-            self._write_sweep()
+            self._scan_mode = mode
 
             self._device.write(f't{1000 * 0.75 / sample_rate:f}')
+            self._scan_step_time = 0.75 / sample_rate
             self._scan_sample_rate = float(self._device.query('t?')) / 1000
 
+            # necessary due to a bug with the temperature compensation in the current windfreak firmare
+            # recommended by David Goins (Windfreak developer & owner)
+            self._device.write('Z0')
+
+            if mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                self._scan_frequencies = tuple(frequencies)
+                self._write_sweep()
+
+            elif mode == SamplingOutputMode.JUMP_LIST:
+                self._scan_frequencies = np.asarray(frequencies, dtype=np.float64)
+                self._write_list()
+
+                # TESTING: Vielleicht macht es hier Sinn, etwas zu warten, um sicherzugehen, dass configuration done ist
+                time.sleep(0.2)
 
             self.log.debug(f'Configured scan with: '
                            f'scan_power = {self._scan_power}, '
@@ -265,8 +284,17 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             self._in_cw_mode = False
             self.log.debug(f'start_scan: {self._on()}')
             # enable sweep mode and set to start frequency
-            self._device.write('g1')
+            if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                self._device.write('g1g0')
+            else:
+                # self._device.write('g0')
+                # TESTING: maybe good to wait here to be sure that commands have been processed before triggering starts
+                #time.sleep(0.2)
+                pass
+
             self.module_state.lock()
+
+
 
     def reset_scan(self):
         """Reset currently running scan and return to start frequency.
@@ -278,8 +306,18 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             if self._in_cw_mode:
                 raise RuntimeError('Can not reset frequency scan. CW microwave output active.')
 
-            # enable sweep mode and set to start frequency
-            self._device.write('g1')
+            if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                # enable sweep mode and set to start frequency
+                self._device.write('g1g0')
+            else:
+                # TESTING: waiting before the reset, because otherwise the MW doesnt seem to spend time on last point
+                #print(0.75/self._scan_sample_rate)
+                time.sleep(self._scan_step_time)
+                self._device.write('X1')
+                self._device.write('g0')
+                # TESTING: maybe good to wait here to be sure that the reset has been processed before triggering starts
+                # todo: If I wait here for longer (e.g. 2 s, does the curve change?)
+                #time.sleep(0.2)
 
     def _write_sweep(self):
         start, stop, points = self._scan_frequencies
@@ -291,8 +329,6 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         # trigger mode: single step
         self._device.write('y2')
-        # self._device.write('t37.5')
-        print(self._device.query('t?'))
 
         # sweep direction
         if stop >= start:
@@ -312,6 +348,44 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         # set sweep upper end power
         self._device.write(f']{self._scan_power:2.3f}')
 
+    def _write_list(self):
+        # todo: implement
+
+        # sweep mode: tabular sweep, non-continuous
+        self._device.write('c0')
+        self._device.write('X1')
+
+        # trigger mode: single step
+        self._device.write('y2')
+
+        # delete possible old list
+        self._device.write('Ld')
+
+        # todo: create string from frequencies array and self._scan_power
+        list_string = [f"L{ii}f{freq:.6f}L{ii}a-10.0" for ii, freq in enumerate(self._scan_frequencies / 1e6)]
+        # write strings to device in two parts due to pyvisa chunk length of 20 kB
+        list_string1, list_string2, list_string3 = "".join(list_string[0:175]), "".join(list_string[175:350]), "".join(list_string[350:])
+        print(len(list_string1))
+        print(len(list_string2))
+        self._device.write(list_string1)
+        #print(len(list_string2))
+        time.sleep(0.1)
+        if list_string2:
+            self._device.write(list_string2)
+        time.sleep(0.1)
+        if list_string3:
+            self._device.write(list_string3)
+
+        # setzt g0 die WF im list Modus auch wieder auf den Anfang zurück?
+        self._device.write('X1')
+        self._device.write('g0')
+
+        # sweep direction
+        # todo: is it necessary to set the direction for the tabular mode?
+        ...
+
+        pass
+
     def _off(self):
         """ Turn the current channel off.
 
@@ -325,6 +399,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         @return tuple(bool): see _stat()
         """
+        self._device.write('W-20')
         self._device.write('E1h1')
         return self._stat()
 
