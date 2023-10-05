@@ -25,6 +25,7 @@ import time
 import datetime
 import matplotlib.pyplot as plt
 from PySide2 import QtCore
+import inspect
 
 from qudi.util.datafitting import FitContainer, FitConfigurationsModel
 from qudi.core.module import LogicBase
@@ -61,6 +62,7 @@ class OdmrLogic(LogicBase):
     _default_scan_mode = ConfigOption(name='default_scan_mode',
                                       default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
+    _lock_in = ConfigOption(name='lock_in', default=False)
 
     # declare status variables
     _cw_frequency = StatusVar(name='cw_frequency', default=2870e6)
@@ -87,24 +89,24 @@ class OdmrLogic(LogicBase):
     sigFitUpdated = QtCore.Signal(object, str, int)
 
     __default_fit_configs = (
-        {'name'             : 'Gaussian Dip',
-         'model'            : 'Gaussian',
-         'estimator'        : 'Dip',
+        {'name': 'Gaussian Dip',
+         'model': 'Gaussian',
+         'estimator': 'Dip',
          'custom_parameters': None},
 
-        {'name'             : 'Two Gaussian Dips',
-         'model'            : 'DoubleGaussian',
-         'estimator'        : 'Dips',
+        {'name': 'Two Gaussian Dips',
+         'model': 'DoubleGaussian',
+         'estimator': 'Dips',
          'custom_parameters': None},
 
-        {'name'             : 'Lorentzian Dip',
-         'model'            : 'Lorentzian',
-         'estimator'        : 'Dip',
+        {'name': 'Lorentzian Dip',
+         'model': 'Lorentzian',
+         'estimator': 'Dip',
          'custom_parameters': None},
 
-        {'name'             : 'Two Lorentzian Dips',
-         'model'            : 'DoubleLorentzian',
-         'estimator'        : 'Dips',
+        {'name': 'Two Lorentzian Dips',
+         'model': 'DoubleLorentzian',
+         'estimator': 'Dips',
          'custom_parameters': None},
     )
 
@@ -539,7 +541,15 @@ class OdmrLogic(LogicBase):
                 sampler.set_frame_size(samples)
 
                 # Set up microwave scan and start it
-                microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+                # check if lock_in is implemented for the microwave
+                sgn_cfg_scan = str(inspect.signature(microwave.configure_scan))
+                print(f"Signature of microwave function configure_scan(): {sgn_cfg_scan}")
+                if "lock_in" in sgn_cfg_scan:
+                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
+                    print("MW is implemented")
+                else:
+                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+
                 microwave.start_scan()
 
             except:
