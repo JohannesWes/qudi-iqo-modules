@@ -58,6 +58,9 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         self._constraints = None
         self._scan_power = -20
         self._scan_mode = None
+        self._lock_in = None
+        self._modulation_frequency = 2150  # in Hz
+        self._modulation_amplitude = 220000  # in Hz
         self._scan_frequencies = None
         self._scan_sample_rate = 0.
         self._scan_step_time = 0.
@@ -83,7 +86,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             power_limits=(-50, 18),
             frequency_limits=(54e6, 14e9),
             scan_size_limits=(2, 10000),
-            sample_rate_limits=(0.1, 1000),
+            sample_rate_limits=(0.1, 50),
             scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
         )
 
@@ -198,7 +201,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             self._device.write(f'l{frequency / 1e6:5.7f}')
             self._device.write(f'u{frequency / 1e6:5.7f}')
 
-    def configure_scan(self, power, frequencies, mode, sample_rate):
+    def configure_scan(self, power, frequencies, mode, sample_rate, lock_in=False):
         """
         """
         with self._thread_lock:
@@ -210,8 +213,11 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # configure scan according to scan mode
             self._scan_power = power
             self._scan_mode = mode
+            self._lock_in = lock_in
 
-            self._device.write(f't{1000 * 0.75 / sample_rate:f}')
+            # step time is reduced by one modulation step ...
+            T_mod_cycle = 1 / self._modulation_frequency
+            self._device.write(f't{1000 * (0.75 / sample_rate - T_mod_cycle):f}')
             self._scan_step_time = 0.75 / sample_rate
             self._scan_sample_rate = float(self._device.query('t?')) / 1000
 
@@ -219,7 +225,25 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # recommended by David Goins (Windfreak developer & owner)
             self._device.write('Z0')
 
-            if mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+            if lock_in == True:
+                assert mode == SamplingOutputMode.EQUIDISTANT_SWEEP, \
+                    "Lock-In selected but mode != EQUIDISTANT_SWEEP"
+
+                self._device.write(f'<{self._modulation_frequency}')
+                self._device.write(f'>{self._modulation_amplitude}')
+                # in my understanding, the WF completes 1 FM cycle and then checks if t > t_step. If so, and if also
+                # trigger == LOW, it jumps to the next frequency point in the sweep, otherwise it starts the next
+                # FM cycle at the current frequency point
+                self._device.write(',1')
+
+                # sets FM mode to sinuisoidal modulation (in the WF documentation 1 <-> 0  are swapped/wrong)
+                self._device.write(';0')
+
+                self._scan_frequencies = tuple(frequencies)
+                self._write_sweep()
+
+
+            elif mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
                 self._scan_frequencies = tuple(frequencies)
                 self._write_sweep()
 
@@ -227,8 +251,8 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 self._scan_frequencies = np.asarray(frequencies, dtype=np.float64)
                 self._write_list()
 
-                # TESTING: Vielleicht macht es hier Sinn, etwas zu warten, um sicherzugehen, dass configuration done ist
-                time.sleep(0.2)
+            # TESTING: Vielleicht macht es hier Sinn, etwas zu warten, um sicherzugehen, dass configuration done ist
+            time.sleep(0.2)
 
             self.log.debug(f'Configured scan with: '
                            f'scan_power = {self._scan_power}, '
@@ -245,6 +269,8 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 self._device.write('g0')
                 # set trigger source to software
                 self._device.write('y0')
+                # ToDo: Hier noch E0h0 schreiben, damit das device auch tatsächlich aus geht?
+                # self._device.write('E0h0')
                 # turn off everything for the current channel
                 self.log.debug(f'Off: {self._off()}')
                 self.module_state.unlock()
@@ -285,16 +311,15 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             self.log.debug(f'start_scan: {self._on()}')
             # enable sweep mode and set to start frequency
             if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                if self._lock_in:
+                    # starts FM
+                    self._device.write('/1')
                 self._device.write('g1g0')
+            # nothing to be done for list mode
             else:
-                # self._device.write('g0')
-                # TESTING: maybe good to wait here to be sure that commands have been processed before triggering starts
-                #time.sleep(0.2)
                 pass
 
             self.module_state.lock()
-
-
 
     def reset_scan(self):
         """Reset currently running scan and return to start frequency.
@@ -311,13 +336,9 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 self._device.write('g1g0')
             else:
                 # TESTING: waiting before the reset, because otherwise the MW doesnt seem to spend time on last point
-                #print(0.75/self._scan_sample_rate)
                 time.sleep(self._scan_step_time)
                 self._device.write('X1')
                 self._device.write('g0')
-                # TESTING: maybe good to wait here to be sure that the reset has been processed before triggering starts
-                # todo: If I wait here for longer (e.g. 2 s, does the curve change?)
-                #time.sleep(0.2)
 
     def _write_sweep(self):
         start, stop, points = self._scan_frequencies
@@ -364,11 +385,12 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         # todo: create string from frequencies array and self._scan_power
         list_string = [f"L{ii}f{freq:.6f}L{ii}a-10.0" for ii, freq in enumerate(self._scan_frequencies / 1e6)]
         # write strings to device in two parts due to pyvisa chunk length of 20 kB
-        list_string1, list_string2, list_string3 = "".join(list_string[0:175]), "".join(list_string[175:350]), "".join(list_string[350:])
+        list_string1, list_string2, list_string3 = "".join(list_string[0:175]), "".join(list_string[175:350]), "".join(
+            list_string[350:])
         print(len(list_string1))
         print(len(list_string2))
         self._device.write(list_string1)
-        #print(len(list_string2))
+        # print(len(list_string2))
         time.sleep(0.1)
         if list_string2:
             self._device.write(list_string2)
@@ -382,7 +404,6 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         # sweep direction
         # todo: is it necessary to set the direction for the tabular mode?
-        ...
 
         pass
 
