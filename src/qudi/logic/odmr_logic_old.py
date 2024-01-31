@@ -60,7 +60,7 @@ class OdmrLogic(LogicBase):
     _default_scan_mode = ConfigOption(name='default_scan_mode',
                                       default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
-    _lock_in = ConfigOption(name='lock_in', default=False)
+    _lock_in = ConfigOption(name='lock_in_FM_with_windfreak', default=False)
 
     # declare status variables
     _cw_frequency = StatusVar(name='cw_frequency', default=2870e6)
@@ -546,6 +546,7 @@ class OdmrLogic(LogicBase):
                 if "lock_in" in sgn_cfg_scan:
                     microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
                     print("Lock-in is implemented")
+                    print(f"lock in: {self._lock_in}")
                 else:
                     microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
                     print("Lock-in is not implemented")
