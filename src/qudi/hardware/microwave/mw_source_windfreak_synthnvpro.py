@@ -48,12 +48,12 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
     _comm_timeout = ConfigOption('comm_timeout', default=10, missing='warn')
     _output_channel = ConfigOption('output_channel', 0, missing='info')
 
-    # _lock_in = ConfigOption(name='lock_in', default=False)
+    # _lock_in_FM_with_windfreak = ConfigOption(name='lock_in_FM_with_windfreak', default=False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._lock_in = bool(ConfigOption(name='lock_in_FM_with_windfreak', default=False))
+        self._lock_in_FM_with_windfreak = bool(ConfigOption(name='lock_in_FM_with_windfreak', default=False))
         self._thread_lock = Mutex()
         self._rm = None
         self._device = None
@@ -96,7 +96,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         self._scan_frequencies = None
         self._scan_sample_rate = self._constraints.max_sample_rate
         self._in_cw_mode = True
-        print(f"activate, line 98: {self._lock_in}")
+        print(f"activate, line 98: {self._lock_in_FM_with_windfreak}")
 
     def on_deactivate(self):
         """ Cleanup performed during deactivation of the module.
@@ -219,7 +219,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
             # either no lock-in is used, that is we have a normal frequency sweep
             # or the OPX is used for FM, which is controlled outside qudi
-            if not self._lock_in:
+            if not self._lock_in_FM_with_windfreak:
                 # set step time, s.t. step time ("dead time") lies in part of trigger cycle where trigger == high, that
                 # means the MW does not react (as it's low active)
                 self._device.write(f't{1000 * 0.75 / sample_rate:f}')
@@ -236,7 +236,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # recommended by David Goins (Windfreak developer & owner)
             self._device.write('Z0')
 
-            if self._lock_in:
+            if self._lock_in_FM_with_windfreak:
                 print(f"here self._lock_in true")
                 assert mode == SamplingOutputMode.EQUIDISTANT_SWEEP, \
                     "Lock-In selected but mode != EQUIDISTANT_SWEEP"
@@ -324,7 +324,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # enable sweep mode and set to start frequency
             if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
                 print("hello")
-                if self._lock_in:
+                if self._lock_in_FM_with_windfreak:
                     # starts FM
                     print("Lock-In")
                     self._device.write('/1')
