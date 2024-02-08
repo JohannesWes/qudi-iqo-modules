@@ -540,10 +540,10 @@ class OdmrLogic(LogicBase):
 
                 # Set up microwave scan and start it
                 # check if lock_in is implemented for the microwave
-                sgn_cfg_scan = str(inspect.signature(microwave.configure_scan))
-                print(f"Signature of microwave function configure_scan(): {sgn_cfg_scan}\n\n")
+                signature_configure_scan = str(inspect.signature(microwave.configure_scan))
+                print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
                 print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
-                if "lock_in" in sgn_cfg_scan:
+                if "lock_in" in signature_configure_scan:
                     microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
                     print("Lock-in is implemented")
                     print(f"lock in: {bool(self._lock_in)}")
