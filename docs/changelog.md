@@ -7,7 +7,6 @@
 ### Bugfixes
 
 ### New Features
-- Improved support for Stanford Research Systems signal generators
 
 ### Other
 
