@@ -85,10 +85,10 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         # Generate constraints
         self._constraints = MicrowaveConstraints(
-            power_limits=(-50, 18),
-            frequency_limits=(54e6, 14e9),
+            power_limits=(-50, 13),
+            frequency_limits=(12.5e6, 6.4e9),
             scan_size_limits=(2, 10000),
-            sample_rate_limits=(0.1, 1000),
+            sample_rate_limits=(0.1, 2500),
             scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
         )
 
