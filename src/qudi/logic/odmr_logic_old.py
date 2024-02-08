@@ -25,6 +25,7 @@ import time
 import datetime
 import matplotlib.pyplot as plt
 from PySide2 import QtCore
+import inspect
 
 from qudi.util.datafitting import FitContainer, FitConfigurationsModel
 from qudi.core.module import LogicBase
@@ -48,8 +49,6 @@ class OdmrLogic(LogicBase):
         connect:
             microwave: <microwave_name>
             data_scanner: <data_scanner_name>
-        options:
-            default_scan_mode: 'JUMP_LIST'  # optional
     """
 
     # declare connectors
@@ -61,6 +60,7 @@ class OdmrLogic(LogicBase):
     _default_scan_mode = ConfigOption(name='default_scan_mode',
                                       default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
+    _lock_in = ConfigOption(name='lock_in_FM_with_windfreak', default=False)
 
     # declare status variables
     _cw_frequency = StatusVar(name='cw_frequency', default=2870e6)
@@ -87,24 +87,24 @@ class OdmrLogic(LogicBase):
     sigFitUpdated = QtCore.Signal(object, str, int)
 
     __default_fit_configs = (
-        {'name'             : 'Gaussian Dip',
-         'model'            : 'Gaussian',
-         'estimator'        : 'Dip',
+        {'name': 'Gaussian Dip',
+         'model': 'Gaussian',
+         'estimator': 'Dip',
          'custom_parameters': None},
 
-        {'name'             : 'Two Gaussian Dips',
-         'model'            : 'DoubleGaussian',
-         'estimator'        : 'Dips',
+        {'name': 'Two Gaussian Dips',
+         'model': 'DoubleGaussian',
+         'estimator': 'Dips',
          'custom_parameters': None},
 
-        {'name'             : 'Lorentzian Dip',
-         'model'            : 'Lorentzian',
-         'estimator'        : 'Dip',
+        {'name': 'Lorentzian Dip',
+         'model': 'Lorentzian',
+         'estimator': 'Dip',
          'custom_parameters': None},
 
-        {'name'             : 'Two Lorentzian Dips',
-         'model'            : 'DoubleLorentzian',
-         'estimator'        : 'Dips',
+        {'name': 'Two Lorentzian Dips',
+         'model': 'DoubleLorentzian',
+         'estimator': 'Dips',
          'custom_parameters': None},
     )
 
@@ -537,9 +537,22 @@ class OdmrLogic(LogicBase):
                 # Set up data acquisition device
                 sampler.set_sample_rate(sample_rate)
                 sampler.set_frame_size(samples)
+
                 # Set up microwave scan and start it
-                microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+                # check if lock_in is implemented for the microwave
+                sgn_cfg_scan = str(inspect.signature(microwave.configure_scan))
+                print(f"Signature of microwave function configure_scan(): {sgn_cfg_scan}\n\n")
+                print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
+                if "lock_in" in sgn_cfg_scan:
+                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
+                    print("Lock-in is implemented")
+                    print(f"lock in: {self._lock_in}")
+                else:
+                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+                    print("Lock-in is not implemented")
+
                 microwave.start_scan()
+
             except:
                 self.module_state.unlock()
                 self.log.exception('Unable to start ODMR scan. Error while setting up hardware:')
@@ -690,22 +703,16 @@ class OdmrLogic(LogicBase):
         self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
 
     def _get_metadata(self):
-        metadata = {'Microwave CW Power (dBm)': self._cw_power,
-                    'Microwave Scan Power (dBm)': self._scan_power,
-                    'Approx. Run Time (s)': self._elapsed_time,
-                    'Number of Frequency Sweeps (#)': self._elapsed_sweeps,
-                    'Start Frequencies (Hz)': tuple(rng[0] for rng in self._scan_frequency_ranges),
-                    'Stop Frequencies (Hz)': tuple(rng[1] for rng in self._scan_frequency_ranges),
-                    'Step sizes (Hz)': tuple(rng[2] for rng in self._scan_frequency_ranges),
-                    'Data Rate (Hz)': self._data_rate,
-                    'Oversampling factor (Hz)': self._oversampling_factor,
-                    'Channel Name': ''}
-        for fit_channel in self._fit_results:
-            for ii, fit_result in enumerate(self._fit_results[fit_channel]):
-                if fit_result:
-                    export_dict = FitContainer.dict_result(fit_result[1])
-                    metadata[f'fit result (channel "{fit_channel}" range {ii})'] = export_dict
-        return metadata
+        return {'Microwave CW Power (dBm)': self._cw_power,
+                'Microwave Scan Power (dBm)': self._scan_power,
+                'Approx. Run Time (s)': self._elapsed_time,
+                'Number of Frequency Sweeps (#)': self._elapsed_sweeps,
+                'Start Frequencies (Hz)': tuple(rng[0] for rng in self._scan_frequency_ranges),
+                'Stop Frequencies (Hz)': tuple(rng[1] for rng in self._scan_frequency_ranges),
+                'Step sizes (Hz)': tuple(rng[2] for rng in self._scan_frequency_ranges),
+                'Data Rate (Hz)': self._data_rate,
+                'Oversampling factor (Hz)': self._oversampling_factor,
+                'Channel Name': ''}
 
     def _get_raw_column_headers(self, data_channel):
         channel_unit = self.data_constraints.channel_units[data_channel]
