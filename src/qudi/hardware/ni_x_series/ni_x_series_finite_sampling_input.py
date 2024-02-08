@@ -75,6 +75,7 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
 
     _physical_sample_clock_output = ConfigOption(name='sample_clock_output', default=None)
     _invert_trigger_polarity = ConfigOption(name='invert_trigger_polarity', default=False)
+
     _adc_voltage_range = ConfigOption('adc_voltage_range', default=(-10, 10), missing='info')
     _max_channel_samples_buffer = ConfigOption(
         'max_channel_samples_buffer', default=25e6, missing='info')
