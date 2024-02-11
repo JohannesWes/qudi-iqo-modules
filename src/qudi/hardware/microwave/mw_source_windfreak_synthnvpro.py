@@ -282,7 +282,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 # set trigger source to software
                 self._device.write('y0')
                 # ToDo: Hier noch E0h0 schreiben, damit das device auch tatsächlich aus geht?
-                # self._device.write('E0h0')
+                self._device.write('E0h0')
                 # turn off everything for the current channel
                 self.log.debug(f'Off: {self._off()}')
                 self.module_state.unlock()
