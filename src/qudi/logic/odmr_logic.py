@@ -541,8 +541,8 @@ class OdmrLogic(LogicBase):
                 # Set up microwave scan and start it
                 # check if lock_in is implemented for the microwave
                 signature_configure_scan = str(inspect.signature(microwave.configure_scan))
-                print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
-                print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
+                # print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
+                # print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
                 if "lock_in" in signature_configure_scan:
                     microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
                     print("Lock-in is implemented.")
@@ -627,8 +627,14 @@ class OdmrLogic(LogicBase):
             try:
                 scanner = self._data_scanner()
                 # fixme: this is a workaround for the Windfreak: it needs an extra trigger for the jump between the first two frequencies
-                scanner.generate_pulse(0.02)
-                
+                scanner.generate_pulse(0.75/self._data_rate)
+                print("Generated a pulse")
+                time.sleep(1/self._data_rate)
+                scanner.generate_pulse(0.75/self._data_rate)
+                print("Generated a pulse")
+                time.sleep(2)
+                print("GO")
+
                 new_counts = scanner.acquire_frame()
                 if self._oversampling_factor > 1:
                     for ch in new_counts:
