@@ -628,12 +628,7 @@ class OdmrLogic(LogicBase):
                 scanner = self._data_scanner()
                 # fixme: this is a workaround for the Windfreak: it needs an extra trigger for the jump between the first two frequencies
                 scanner.generate_pulse(0.75/self._data_rate)
-                print("Generated a pulse")
                 time.sleep(1/self._data_rate)
-                scanner.generate_pulse(0.75/self._data_rate)
-                print("Generated a pulse")
-                time.sleep(2)
-                print("GO")
 
                 new_counts = scanner.acquire_frame()
                 if self._oversampling_factor > 1:
