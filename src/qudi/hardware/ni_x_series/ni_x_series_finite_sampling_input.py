@@ -145,7 +145,6 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
         self.__all_counters = tuple(
             ctr.split('/')[-1] for ctr in self._device_handle.co_physical_chans.channel_names if
             'ctr' in ctr.lower())
-        print(f"Counters: {self.__all_counters}")
         self.__all_digital_terminals = tuple(
             term.rsplit('/', 1)[-1].lower() for term in self._device_handle.terminals if 'PFI' in term)
         self.__all_analog_terminals = tuple(
@@ -506,7 +505,6 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
 
             # Try to configure the task
             try:
-                print(f"{self._device_name}/{src}")
                 task.co_channels.add_co_pulse_chan_freq(
                     '/{0}/{1}'.format(self._device_name, src),
                     freq=self._sample_rate,
@@ -866,94 +864,100 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
         Generates a pulse of finite duration on the physical_sample_clock_output channel.
 
         Args:
-            dur (float): The duration of the pulse in milliseconds.
+            dur (float): The duration of the pulse in seconds.
 
         Returns:
             int: Error code (0: OK, -1: Error)
         """
+        with self._thread_lock:
+            assert self.module_state() == 'idle', \
+                'Unable to start pulse task. Module is locked.'
+            self.module_state.lock()
 
-        assert self.module_state() == 'idle', \
-            'Unable to start pulse task. Module is locked.'
-        self.module_state.lock()
-
-        if self._pulse_task_handle is not None:
-            self.log.error('Pulse task is already running. Unable to set up a new pulse '
-                           'before you close the previous one.')
-            return -1
-
-        # Try to find an available counter; once found, use that one and stop searching (break loop)
-        for src in self.__all_counters:
-            # Check if task by that name already exists
-            task_name = 'Pulse_{0:d}'.format(id(self))
-            try:
-                task = ni.Task(task_name)
-            except ni.DaqError:
-                self.log.exception(f'Could not create task with name "{task_name}".')
+            if self._pulse_task_handle is not None:
+                self.log.error('Pulse task is already running. Unable to set up a new pulse '
+                               'before you close the previous one.')
                 return -1
 
-            # Try to configure the task
-            try:
-                task.co_channels.add_co_pulse_chan_time(
-                    '/{0}/{1}'.format(self._device_name, src),
-                    low_time=dur * 1e-3,
-                    units=TimeUnits.SECONDS,
-                    idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW)
-                task.timing.cfg_implicit_timing(
-                    sample_mode=ni.constants.AcquisitionType.FINITE,
-                    # todo wir möchten ja lediglich einen einzigen Puls generieren
-                    samps_per_chan=1)
-            except ni.DaqError:
-                self.log.exception('Error while configuring pulse task.')
+            # Try to find an available counter; once found, use that one and stop searching (break loop)
+            for src in self.__all_counters:
+                # Check if task by that name already exists
+                task_name = 'Pulse_{0:d}'.format(id(self))
                 try:
-                    del task
-                except NameError:
-                    pass
-                return -1
-
-            # Try to reserve resources for the task
-            try:
-                task.control(ni.constants.TaskMode.TASK_RESERVE)
-            except ni.DaqError:
-                # Try to clean up task handle
-                try:
-                    task.close()
+                    task = ni.Task(task_name)
                 except ni.DaqError:
-                    pass
-                try:
-                    del task
-                except NameError:
-                    pass
-
-                # Return if no counter could be reserved
-                if src == self.__all_counters[-1]:
-                    self.log.exception('Error while setting up pulse. Probably because no free '
-                                       'counter resource could be reserved.')
+                    self.log.exception(f'Could not create task with name "{task_name}".')
                     return -1
-                continue
-            break
 
-        self._pulse_task_handle = task
+                # Try to configure the task
+                try:
+                    # pulse
+                    task.co_channels.add_co_pulse_chan_time(
+                        '/{0}/{1}'.format(self._device_name, src),
+                        low_time=dur,
+                        units=TimeUnits.SECONDS,
+                        idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW)
 
-        # pulse is generated on the physical_sample_clock_output channel
-        if self._physical_sample_clock_output is not None:
-            pulse_channel = '/{0}InternalOutput'.format(self._pulse_task_handle.channel_names[0])
-            ni.system.System().connect_terms(source_terminal=pulse_channel,
-                                             destination_terminal='/{0}/{1}'.format(
-                                                 self._device_name, self._physical_sample_clock_output))
+                    task.timing.cfg_implicit_timing(
+                        sample_mode=ni.constants.AcquisitionType.FINITE,
+                        # todo wir möchten ja lediglich einen einzigen Puls generieren
+                        samps_per_chan=1)
 
-        # Start the task
-        try:
-            self._pulse_task_handle.start()
-        except ni.DaqError:
-            self.log.exception('Error while starting pulse task.')
-            self.terminate_all_tasks()
-            self.module_state.unlock()
-            raise
+                except ni.DaqError:
+                    self.log.exception('Error while configuring pulse task.')
+                    try:
+                        del task
+                    except NameError:
+                        pass
+                    return -1
 
-        # stops the task, as the pulse has been generated
-        if self.module_state() == 'locked':
-            self.terminate_all_tasks()
-            self.module_state.unlock()
+                # Try to reserve resources for the task
+                try:
+                    task.control(ni.constants.TaskMode.TASK_RESERVE)
+                except ni.DaqError:
+                    # Try to clean up task handle
+                    try:
+                        task.close()
+                    except ni.DaqError:
+                        pass
+                    try:
+                        del task
+                    except NameError:
+                        pass
+
+                    # Return if no counter could be reserved
+                    if src == self.__all_counters[-1]:
+                        self.log.exception('Error while setting up pulse. Probably because no free '
+                                           'counter resource could be reserved.')
+                        return -1
+                    continue
+                break
+
+            self._pulse_task_handle = task
+
+            # pulse is generated on the physical_sample_clock_output channel
+            if self._physical_sample_clock_output is not None:
+                pulse_channel = '/{0}InternalOutput'.format(self._pulse_task_handle.channel_names[0])
+                ni.system.System().connect_terms(source_terminal=pulse_channel,
+                                                 destination_terminal='/{0}/{1}'.format(
+                                                     self._device_name, self._physical_sample_clock_output))
+
+            # Start the task
+            try:
+                self._pulse_task_handle.start()
+            except ni.DaqError:
+                self.log.exception('Error while starting pulse task.')
+                self.terminate_all_tasks()
+                self.module_state.unlock()
+                raise
+
+            # wait until the pulse has been generated with certainty; only then stop the task
+            time.sleep(1 / self._sample_rate)
+
+            # stops the task, as the pulse has been generated
+            if self.module_state() == 'locked':
+                self.terminate_all_tasks()
+                self.module_state.unlock()
 
 
 class NiInitError(Exception):
