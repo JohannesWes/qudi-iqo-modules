@@ -53,7 +53,9 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # fixme: das bool(configoption) funktioniert hier glaube ich nicht, ich bekomme immer true.
         self._lock_in_FM_with_windfreak = bool(ConfigOption(name='lock_in_FM_with_windfreak', default=False))
+        self._lock_in_FM_with_windfreak = False
         self._thread_lock = Mutex()
         self._rm = None
         self._device = None
