@@ -508,7 +508,8 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                 task.co_channels.add_co_pulse_chan_freq(
                     '/{0}/{1}'.format(self._device_name, src),
                     freq=self._sample_rate,
-                    idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW)
+                    idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW,
+                    duty_cycle=0.5)
                 task.timing.cfg_implicit_timing(
                     sample_mode=ni.constants.AcquisitionType.FINITE,
                     # TODO: Ich glaube hier kommt das warning 200010 "finite Finite acquisition or generation has been stopped before the requested number of samples were acquired or generated." her
@@ -896,7 +897,8 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                         '/{0}/{1}'.format(self._device_name, src),
                         low_time=dur,
                         units=TimeUnits.SECONDS,
-                        idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW)
+                        idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW,
+                        duty_cycle=0.5)
 
                     task.timing.cfg_implicit_timing(
                         sample_mode=ni.constants.AcquisitionType.FINITE,
