@@ -125,6 +125,9 @@ class OdmrLogic(LogicBase):
         self._frequency_data = None
         self._fit_results = None
 
+        # JW
+        self._use_timestamp = True
+
     def on_activate(self):
         """
         Initialisation performed during activation of the module.
@@ -800,7 +803,8 @@ class OdmrLogic(LogicBase):
                                    nametag=nametag,
                                    timestamp=timestamp,
                                    column_headers=column_headers,
-                                   column_dtypes=[float] * len(column_headers))
+                                   column_dtypes=[float] * len(column_headers),
+                                   use_timestamp=self._use_timestamp)
 
     def _draw_figure(self, channel, range_index):
         """ Draw the summary figure to save with the data.
