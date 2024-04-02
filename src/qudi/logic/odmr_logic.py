@@ -781,7 +781,8 @@ class OdmrLogic(LogicBase):
                                                          nametag=nametag,
                                                          timestamp=timestamp,
                                                          column_headers=column_headers,
-                                                         column_dtypes=float)
+                                                         column_dtypes=float,
+                                                         use_timestamp=self._use_timestamp)
 
                 # Save plot images if required. This takes by far the most time to complete.
                 if self._save_thumbnails:
