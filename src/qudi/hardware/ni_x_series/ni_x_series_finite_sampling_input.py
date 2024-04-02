@@ -75,7 +75,8 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
         name='external_sample_clock_frequency', default=None, missing='nothing')
 
     _physical_sample_clock_output = ConfigOption(name='sample_clock_output', default=None)
-    _invert_trigger_polarity = ConfigOption(name='invert_trigger_polarity', default=False)
+    _trigger_edge = ConfigOption(name='trigger_edge', default="RISING",
+                                 constructor=lambda x: ni.constants.Edge[x.upper()], missing="warn")
 
     _adc_voltage_range = ConfigOption('adc_voltage_range', default=(-10, 10), missing='info')
     _max_channel_samples_buffer = ConfigOption(
@@ -505,10 +506,11 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
 
             # Try to configure the task
             try:
+                #print(f"invert trigger polarity: {self._invert_trigger_polarity}")
                 task.co_channels.add_co_pulse_chan_freq(
                     '/{0}/{1}'.format(self._device_name, src),
                     freq=self._sample_rate,
-                    idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW,
+                    idle_state=ni.constants.Level.HIGH if self._trigger_edge==ni.constants.Edge.FALLING else ni.constants.Level.LOW,
                     duty_cycle=0.5)
                 task.timing.cfg_implicit_timing(
                     sample_mode=ni.constants.AcquisitionType.FINITE,
@@ -594,12 +596,13 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                     return -1
 
                 try:
+                    #print(f"invert trigger polarity: {self._invert_trigger_polarity}")
                     task.ci_channels.add_ci_period_chan(
                         ctr_name,
                         min_val=0,
                         max_val=100000000,
                         units=ni.constants.TimeUnits.TICKS,
-                        edge=ni.constants.Edge.FALLING if self._invert_trigger_polarity else ni.constants.Edge.RISING)
+                        edge=self._trigger_edge)
                     # NOTE: The following two direct calls to C-function wrappers are a
                     # workaround due to a bug in some NIDAQmx.lib property getters. If one of
                     # these getters is called, it will mess up the task timing.
@@ -720,8 +723,7 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                                                     min_val=min(self._adc_voltage_range))
             ai_task.timing.cfg_samp_clk_timing(sample_freq,
                                                source=clock_channel,
-                                               active_edge=ni.constants.Edge.FALLING if self._invert_trigger_polarity \
-                                                   else ni.constants.Edge.RISING,
+                                               active_edge=self._trigger_edge,
                                                sample_mode=ni.constants.AcquisitionType.FINITE,
                                                samps_per_chan=self._frame_size)
         except ni.DaqError:
@@ -897,8 +899,7 @@ class NIXSeriesFiniteSamplingInput(FiniteSamplingInputInterface):
                         '/{0}/{1}'.format(self._device_name, src),
                         low_time=dur,
                         units=TimeUnits.SECONDS,
-                        idle_state=ni.constants.Level.HIGH if self._invert_trigger_polarity else ni.constants.Level.LOW,
-                        duty_cycle=0.5)
+                        idle_state=ni.constants.Level.HIGH if self._trigger_edge==ni.constants.Edge.FALLING else ni.constants.Level.LOW)
 
                     task.timing.cfg_implicit_timing(
                         sample_mode=ni.constants.AcquisitionType.FINITE,
