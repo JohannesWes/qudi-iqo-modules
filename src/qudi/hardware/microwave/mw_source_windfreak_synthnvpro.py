@@ -48,12 +48,13 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
     _comm_timeout = ConfigOption('comm_timeout', default=10, missing='warn')
     _output_channel = ConfigOption('output_channel', 0, missing='info')
 
-    # _lock_in_FM_with_windfreak = ConfigOption(name='lock_in_FM_with_windfreak', default=False)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # fixme: das bool(configoption) funktioniert hier glaube ich nicht, ich bekomme immer true.
         self._lock_in_FM_with_windfreak = bool(ConfigOption(name='lock_in_FM_with_windfreak', default=False))
+        self._lock_in_FM_with_windfreak = False
         self._thread_lock = Mutex()
         self._rm = None
         self._device = None
@@ -220,6 +221,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             # either no lock-in is used, that is we have a normal frequency sweep
             # or the OPX is used for FM, which is controlled outside qudi
             if not self._lock_in_FM_with_windfreak:
+                print("Not doing FM")
                 # set step time, s.t. step time ("dead time") lies in part of trigger cycle where trigger == high, that
                 # means the MW does not react (as it's low active)
                 self._device.write(f't{1000 * 0.75 / sample_rate:f}')
@@ -237,7 +239,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             self._device.write('Z0')
 
             if self._lock_in_FM_with_windfreak:
-                print(f"here self._lock_in true")
+                print(f"LOCK IN ON here self._lock_in true")
                 assert mode == SamplingOutputMode.EQUIDISTANT_SWEEP, \
                     "Lock-In selected but mode != EQUIDISTANT_SWEEP"
 
@@ -260,6 +262,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 self._write_sweep()
 
             elif mode == SamplingOutputMode.JUMP_LIST:
+                print("CAREFUL: JJump list activated")
                 self._scan_frequencies = np.asarray(frequencies, dtype=np.float64)
                 self._write_list()
 
@@ -323,11 +326,12 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
             self.log.debug(f'start_scan: {self._on()}')
             # enable sweep mode and set to start frequency
             if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
-                print("hello")
+                print("Scan Mode: Equidistant Sweep")
                 if self._lock_in_FM_with_windfreak:
                     # starts FM
-                    print("Lock-In")
+                    print("Using Lock-In")
                     self._device.write('/1')
+                    # fixme: wäre nur g0 besser? springt bei g1 schon irgendwas los?
                 self._device.write('g1g0')
             # nothing to be done for list mode
             else:

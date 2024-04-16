@@ -125,6 +125,9 @@ class OdmrLogic(LogicBase):
         self._frequency_data = None
         self._fit_results = None
 
+        # JW
+        self._use_timestamp = True
+
     def on_activate(self):
         """
         Initialisation performed during activation of the module.
@@ -540,11 +543,12 @@ class OdmrLogic(LogicBase):
 
                 # Set up microwave scan and start it
                 # check if lock_in is implemented for the microwave
-                signature_configure_scan = str(inspect.signature(microwave.configure_scan))
-                print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
-                print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
+                # fixme: configure scan not (1,2) of course
+                signature_configure_scan = (1,2) #str(inspect.signature(microwave.configure_scan))
+                # print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
+                # print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
                 if "lock_in" in signature_configure_scan:
-                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=self._lock_in)
+                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=False) #fixme  lock_in=self._lock_in)
                     print("Lock-in is implemented.")
                     print(f"Is lock-in activated: {bool(self._lock_in)}")
                 else:
@@ -627,8 +631,9 @@ class OdmrLogic(LogicBase):
             try:
                 scanner = self._data_scanner()
                 # fixme: this is a workaround for the Windfreak: it needs an extra trigger for the jump between the first two frequencies
-                scanner.generate_pulse(0.02)
-                
+                scanner.generate_pulse(0.75/self._data_rate)
+                time.sleep(1/self._data_rate)
+
                 new_counts = scanner.acquire_frame()
                 if self._oversampling_factor > 1:
                     for ch in new_counts:
@@ -776,7 +781,8 @@ class OdmrLogic(LogicBase):
                                                          nametag=nametag,
                                                          timestamp=timestamp,
                                                          column_headers=column_headers,
-                                                         column_dtypes=float)
+                                                         column_dtypes=float,
+                                                         use_timestamp=self._use_timestamp)
 
                 # Save plot images if required. This takes by far the most time to complete.
                 if self._save_thumbnails:
@@ -799,7 +805,8 @@ class OdmrLogic(LogicBase):
                                    nametag=nametag,
                                    timestamp=timestamp,
                                    column_headers=column_headers,
-                                   column_dtypes=[float] * len(column_headers))
+                                   column_dtypes=[float] * len(column_headers),
+                                   use_timestamp=self._use_timestamp)
 
     def _draw_figure(self, channel, range_index):
         """ Draw the summary figure to save with the data.
