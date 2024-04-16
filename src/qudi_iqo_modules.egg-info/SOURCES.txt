@@ -11,6 +11,12 @@ src/qudi/gui/laser/laser_control_dockwidget.py
 src/qudi/gui/laser/laser_gui.py
 src/qudi/gui/laser/laser_plot_dockwidgets.py
 src/qudi/gui/laserscanner/laserscannergui.py
+src/qudi/gui/lockin_odmr/odmr_control_dockwidget.py
+src/qudi/gui/lockin_odmr/odmr_fit_dockwidget.py
+src/qudi/gui/lockin_odmr/odmr_main_window.py
+src/qudi/gui/lockin_odmr/odmr_plot_widget.py
+src/qudi/gui/lockin_odmr/odmr_settings_dialog.py
+src/qudi/gui/lockin_odmr/odmrgui.py
 src/qudi/gui/nv_calculator/nv_calculatorgui.py
 src/qudi/gui/nv_calculator/ui_nv_calculator.ui
 src/qudi/gui/odmr/odmr_control_dockwidget.py
@@ -47,6 +53,7 @@ src/qudi/gui/scanning/scan_dockwidget.py
 src/qudi/gui/scanning/scan_settings_dialog.py
 src/qudi/gui/scanning/scan_widget.py
 src/qudi/gui/scanning/scannergui.py
+src/qudi/gui/scanning/tilt_correction_dockwidget.py
 src/qudi/gui/scanning/ui_scannergui.ui
 src/qudi/gui/spectrometer/control_widget.py
 src/qudi/gui/spectrometer/data_widget.py
@@ -58,8 +65,6 @@ src/qudi/gui/switch/switch_state_widgets.py
 src/qudi/gui/time_series/main_window.py
 src/qudi/gui/time_series/settings_dialog.py
 src/qudi/gui/time_series/time_series_gui.py
-src/qudi/gui/wavemeter/ui_scanwindow.ui
-src/qudi/gui/wavemeter/wavemeterloggui.py
 src/qudi/hardware/interface_test_hardware.py
 src/qudi/hardware/awg/keysight_M3202A.py
 src/qudi/hardware/awg/keysight_m819x.py
@@ -104,6 +109,10 @@ src/qudi/hardware/microwave/mw_source_smiq.py
 src/qudi/hardware/microwave/mw_source_smr.py
 src/qudi/hardware/microwave/mw_source_srssg.py
 src/qudi/hardware/microwave/mw_source_windfreak_synthhdpro.py
+src/qudi/hardware/microwave/mw_source_windfreak_synthnvpro.py
+src/qudi/hardware/microwave/mw_source_windfreak_synthnvpro_lockin.py
+src/qudi/hardware/microwave/mw_source_windfreak_synthnvpro_max.py
+src/qudi/hardware/microwave/test.py
 src/qudi/hardware/motor/aptmotor.py
 src/qudi/hardware/motor/motor_newport_conex_agp.py
 src/qudi/hardware/motor/motor_stage_micos.py
@@ -115,6 +124,8 @@ src/qudi/hardware/ni_x_series/ni_x_series_analog_output.py
 src/qudi/hardware/ni_x_series/ni_x_series_finite_sampling_input.py
 src/qudi/hardware/ni_x_series/ni_x_series_finite_sampling_io.py
 src/qudi/hardware/ni_x_series/ni_x_series_in_streamer.py
+src/qudi/hardware/opx/FM.py
+src/qudi/hardware/opx/configuration_FM.py
 src/qudi/hardware/picoquant/hydraharp400.py
 src/qudi/hardware/picoquant/picoharp300.py
 src/qudi/hardware/power_supply/Keysight_E3631A.py
@@ -133,7 +144,10 @@ src/qudi/hardware/switches/ok_s6_switch.py
 src/qudi/hardware/switches/osw12.py
 src/qudi/hardware/temperature/CTC100_temperature.py
 src/qudi/hardware/temperature/cryocon.py
+src/qudi/hardware/wavemeter/high_finesse_constants.py
+src/qudi/hardware/wavemeter/high_finesse_proxy.py
 src/qudi/hardware/wavemeter/high_finesse_wavemeter.py
+src/qudi/hardware/wavemeter/high_finesse_wrapper.py
 src/qudi/interface/camera_interface.py
 src/qudi/interface/data_instream_interface.py
 src/qudi/interface/fast_counter_interface.py
@@ -151,7 +165,6 @@ src/qudi/interface/simple_laser_interface.py
 src/qudi/interface/spectrometer_interface.py
 src/qudi/interface/switch_interface.py
 src/qudi/interface/test_interface.py
-src/qudi/interface/wavemeter_interface.py
 src/qudi/interface/mixins/process_control_switch.py
 src/qudi/logic/camera_logic.py
 src/qudi/logic/interface_test_logic.py
@@ -159,6 +172,8 @@ src/qudi/logic/laser_logic.py
 src/qudi/logic/laser_scanner_logic.py
 src/qudi/logic/nv_calculator_logic.py
 src/qudi/logic/odmr_logic.py
+src/qudi/logic/odmr_logic_old.py
+src/qudi/logic/odmr_logic_withLOCKINOPTION.py
 src/qudi/logic/pid_logic.py
 src/qudi/logic/poi_manager_logic.py
 src/qudi/logic/qdplot_logic.py
@@ -169,7 +184,6 @@ src/qudi/logic/software_pid_controller.py
 src/qudi/logic/spectrometer_logic.py
 src/qudi/logic/switch_logic.py
 src/qudi/logic/time_series_reader_logic.py
-src/qudi/logic/wavemeter_logger_logic.py
 src/qudi/logic/pulsed/pulse_analyzer.py
 src/qudi/logic/pulsed/pulse_extractor.py
 src/qudi/logic/pulsed/pulse_objects.py
