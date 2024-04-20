@@ -280,12 +280,12 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         """
         with self._thread_lock:
             if self.module_state() != 'idle':
-                # disable sweep mode
-                self._device.write('g0')
-                # set trigger source to software
-                self._device.write('y0')
-                # ToDo: Hier noch E0h0 schreiben, damit das device auch tatsächlich aus geht?
-                self._device.write('E0h0')
+                # # disable sweep mode
+                # self._device.write('g0')
+                # # set trigger source to software
+                # self._device.write('y0')
+                # # ToDo: Hier noch E0h0 schreiben, damit das device auch tatsächlich aus geht?
+                # self._device.write('E0h0')
                 # turn off everything for the current channel
                 self.log.debug(f'Off: {self._off()}')
                 self.module_state.unlock()
@@ -430,7 +430,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         @return tuple: see _stat()
         """
-        self._device.write('E0h0')
+        #self._device.write('E0h0')
         return self._stat()
 
     def _on(self):
