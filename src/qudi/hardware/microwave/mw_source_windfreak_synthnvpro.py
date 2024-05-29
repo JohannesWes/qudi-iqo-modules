@@ -280,6 +280,8 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         """
         with self._thread_lock:
             if self.module_state() != 'idle':
+                # fixme: AKTUELL WIRD DER MICROWAVE OUTPUT NICHT AUSGESCHALTET, WEIL ICH WOLLTE, DASS DIE WF DIE GANZE ZEIT BALLERT,
+                # WEGEN DES PROBLEMS MIT DER MAGNETISIERUNG
                 # # disable sweep mode
                 # self._device.write('g0')
                 # # set trigger source to software
@@ -287,6 +289,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
                 # # ToDo: Hier noch E0h0 schreiben, damit das device auch tatsächlich aus geht?
                 # self._device.write('E0h0')
                 # turn off everything for the current channel
+
                 self.log.debug(f'Off: {self._off()}')
                 self.module_state.unlock()
 
@@ -430,7 +433,9 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
 
         @return tuple: see _stat()
         """
+        # fixme: CURRENTLY NOT TURNING OFF, WEGEN PROBLEM MIT MAGNETISIERUNG
         #self._device.write('E0h0')
+
         return self._stat()
 
     def _on(self):
