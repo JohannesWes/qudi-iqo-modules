@@ -330,7 +330,7 @@ class MicrowaveSRSSG(MicrowaveInterface):
         #           Bit 4:  -   (Disable HF, RF doubler output)
         #   8 = TYPE (Modulation type, integer number with the meaning)
         #           0: AM/ASK   (amplitude modulation)
-        #           1: FM/FSK   (frequency modulation)
+        #           1: FM/FSK   (frequency_modulation)
         #           2: ΦM/PSK   (phase modulation)
         #           3: Sweep
         #           4: Pulse
