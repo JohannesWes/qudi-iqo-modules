@@ -60,7 +60,6 @@ class OdmrLogic(LogicBase):
     _default_scan_mode = ConfigOption(name='default_scan_mode',
                                       default='JUMP_LIST',
                                       constructor=lambda x: SamplingOutputMode[x.upper()])
-    _lock_in = ConfigOption(name='lock_in_FM_with_windfreak', default=False)
 
     # declare status variables
     _cw_frequency = StatusVar(name='cw_frequency', default=2870e6)
@@ -542,18 +541,8 @@ class OdmrLogic(LogicBase):
                 sampler.set_frame_size(samples)
 
                 # Set up microwave scan and start it
-                # check if lock_in is implemented for the microwave
-                # fixme: configure scan not (1,2) of course
-                signature_configure_scan = (1,2) #str(inspect.signature(microwave.configure_scan))
-                # print(f"Signature of microwave function configure_scan(): {signature_configure_scan}\n\n")
-                # print("Parameter: ", self._scan_power, frequencies, mode, sample_rate, self._lock_in, "\n\n")
-                if "lock_in" in signature_configure_scan:
-                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate, lock_in=False) #fixme  lock_in=self._lock_in)
-                    print("Lock-in is implemented.")
-                    print(f"Is lock-in activated: {bool(self._lock_in)}")
-                else:
-                    microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
-                    print("Lock-in is not implemented.")
+                microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
+                print("Lock-in is not implemented.")
 
                 # "entschärft" eigentlich die Windfreak nur -> Wenn jetzt getriggert wird, springt die WF los
                 microwave.start_scan()
@@ -850,7 +839,7 @@ class OdmrLogic(LogicBase):
         fig, (ax_signal, ax_raw) = plt.subplots(nrows=2, ncols=1)
 
         # plot signal data
-        ax_signal.plot(freq_data, signal_data, linestyle=':', linewidth=0.5, marker='o')
+        ax_signal.plot(freq_data, signal_data, linestyle=':', linewidth=0.5, marker='o', markersize=2)
         # Include fit curve if there is one
         if fit_result is not None:
             ax_signal.plot(fit_x, fit_y, marker='None')
