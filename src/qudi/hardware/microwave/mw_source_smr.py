@@ -54,7 +54,7 @@ class MicrowaveSMR(MicrowaveInterface):
             rising_edge_trigger: True  # optional
     """
 
-    _visa_address = ConfigOption('visa_address', missing='error')
+    _serial_port = ConfigOption('serial_port', missing='error')
     _comm_timeout = ConfigOption('comm_timeout', default=10, missing='warn')
     _rising_edge_trigger = ConfigOption('rising_edge_trigger', default=True, missing='info')
 
@@ -84,7 +84,7 @@ class MicrowaveSMR(MicrowaveInterface):
 
         # trying to load the visa connection to the module
         self._rm = visa.ResourceManager()
-        self._device = self._rm.open_resource(self._visa_address,
+        self._device = self._rm.open_resource(self._serial_port,
                                               write_termination='\r\n',
                                               read_termination=None,
                                               timeout=int(self._comm_timeout * 1000))
