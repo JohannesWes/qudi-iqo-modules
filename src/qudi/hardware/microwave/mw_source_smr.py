@@ -254,7 +254,7 @@ class MicrowaveSMR(MicrowaveInterface):
             if self.module_state() != 'idle':
                 self._device.write(':OUTP OFF')
                 self._device.write(':FREQ:MODE CW')
-                while int(float(self._ask('OUTP:STAT?').strip())) != 0:
+                while int(float(self._device.query('OUTP:STAT?').strip())) != 0:
                     time.sleep(0.2)
                 self.module_state.unlock()
 
@@ -313,7 +313,7 @@ class MicrowaveSMR(MicrowaveInterface):
         with self._thread_lock:
             if self.module_state() == 'idle':
                 return
-            if self._in_cw_mode:
+            if self._in_cw_mode():
                 raise RuntimeError('Can not reset frequency scan. CW microwave output active.')
 
             self._device.write(':ABOR:LIST')
