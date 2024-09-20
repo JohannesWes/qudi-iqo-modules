@@ -59,7 +59,7 @@ class MicrowaveSynthNVPro(MicrowaveInterface):
         self._model = ''
         self._constraints = None
         self._scan_power = -20
-        self._scan_mode = None
+        self._scan_mode = SamplingOutputMode.EQUIDISTANT_SWEEP
         self._modulation_frequency = 5000  # in Hz
         self._modulation_amplitude = 700000  # in Hz
         self._scan_frequencies = None

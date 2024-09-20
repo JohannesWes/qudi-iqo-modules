@@ -539,10 +539,8 @@ class OdmrLogic(LogicBase):
                 # Set up data acquisition device
                 sampler.set_sample_rate(sample_rate)
                 sampler.set_frame_size(samples)
-
                 # Set up microwave scan and start it
                 microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
-                print("Lock-in is not implemented.")
 
                 # "entschärft" eigentlich die Windfreak nur -> Wenn jetzt getriggert wird, springt die WF los
                 microwave.start_scan()
@@ -564,6 +562,12 @@ class OdmrLogic(LogicBase):
 
             # hier wird eigentlich erst das Signal zum nächsten Scan gesendet
             self._sigNextLine.emit()
+
+    def clear_all_fits(self):
+        for channel, range_data in self._raw_data.items():
+            for range_index, _ in enumerate(range_data):
+                self._fit_results[channel][range_index] = None
+                self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
 
     @QtCore.Slot()
     def continue_odmr_scan(self):
@@ -621,7 +625,7 @@ class OdmrLogic(LogicBase):
                 scanner = self._data_scanner()
                 # fixme: this is a workaround for the Windfreak: it needs an extra trigger for the jump between the first two frequencies
                 scanner.generate_pulse(0.75/self._data_rate)
-                time.sleep(1/self._data_rate)
+                time.sleep(1 / self._data_rate)
 
                 new_counts = scanner.acquire_frame()
                 if self._oversampling_factor > 1:

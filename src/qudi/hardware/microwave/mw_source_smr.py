@@ -78,6 +78,7 @@ class MicrowaveSMR(MicrowaveInterface):
         self._scan_power = -20
         self._scan_frequencies = None
         self._scan_sample_rate = 0.
+        self._scan_mode = SamplingOutputMode.JUMP_LIST
 
     def on_activate(self):
         """ Initialisation performed during activation of the module. """
@@ -119,7 +120,7 @@ class MicrowaveSMR(MicrowaveInterface):
             frequency_limits=(freq_min, freq_max),
             scan_size_limits=(2, max_list_entries),
             sample_rate_limits=(1, 100),
-            scan_modes=(SamplingOutputMode.JUMP_LIST,)
+            scan_modes=(SamplingOutputMode.JUMP_LIST, SamplingOutputMode.EQUIDISTANT_SWEEP)
         )
 
         self._scan_frequencies = None
@@ -199,7 +200,7 @@ class MicrowaveSMR(MicrowaveInterface):
         @return SamplingOutputMode: The currently set scan mode Enum
         """
         with self._thread_lock:
-            return SamplingOutputMode.JUMP_LIST
+            return self._scan_mode
 
     @property
     def scan_sample_rate(self):
@@ -241,8 +242,16 @@ class MicrowaveSMR(MicrowaveInterface):
             # configure scan according to scan mode
             self._scan_sample_rate = sample_rate
             self._scan_power = power
-            self._scan_frequencies = np.asarray(frequencies, dtype=np.float64)
-            self._write_list()
+
+            if mode == SamplingOutputMode.JUMP_LIST:
+                print("Mode in hardware file: jump list")
+                self._scan_frequencies = np.asarray(frequencies, dtype=np.float64)
+                self._write_list()
+
+            elif mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                print("Mode in hardware file: equidistant sweep")
+                self._scan_frequencies = tuple(frequencies)
+                self._write_sweep()
 
             self._set_trigger_edge()
 
@@ -295,15 +304,24 @@ class MicrowaveSMR(MicrowaveInterface):
             assert self._scan_frequencies is not None, \
                 'No scan_frequencies set. Unable to start scan.'
 
-            if not self._in_list_mode():
-                self._write_list()
+            if self._scan_mode == SamplingOutputMode.JUMP_LIST:
+                if not self._in_list_mode():
+                    self._write_list()
+                    self._device.write(':LIST:LEARN')
+                    self._device.write(':FREQ:MODE LIST')
+            elif self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                if not self._in_sweep_mode():
+                    self._write_sweep()
+                    self._device.write(':SWE:LEARN')
+                    self._device.write(':FREQ:MODE SWE')
 
-            self._device.write(':LIST:LEARN')
-            self._device.write(':FREQ:MODE LIST')
             self._device.write(':OUTP:STAT ON')
             while int(float(self._device.query(':OUTP:STAT?'))) == 0:
                 time.sleep(0.2)
 
+            # fixme:
+            self.turn_FM_on(500e3, 5e3)
+            time.sleep(1)
             self.module_state.lock()
 
     def reset_scan(self):
@@ -316,7 +334,11 @@ class MicrowaveSMR(MicrowaveInterface):
             if self._in_cw_mode():
                 raise RuntimeError('Can not reset frequency scan. CW microwave output active.')
 
-            self._device.write(':ABOR:LIST')
+            if self._scan_mode == SamplingOutputMode.JUMP_LIST:
+                self._device.write(':ABOR:LIST')
+
+            elif self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+                self._device.write(':ABOR:SWE')
 
     def _command_wait(self, command_str):
         """ Writes the command in command_str via PyVisa and waits until the device has finished
@@ -332,6 +354,9 @@ class MicrowaveSMR(MicrowaveInterface):
     def _in_list_mode(self):
         return self._device.query(':FREQ:MODE?').strip().lower() == 'list'
 
+    def _in_sweep_mode(self):
+        return self._device.query(':FREQ:MODE?').strip().lower() == 'swe'
+
     def _in_cw_mode(self):
         return self._device.query(':FREQ:MODE?').strip().lower() in ('cw', 'fix')
 
@@ -345,6 +370,7 @@ class MicrowaveSMR(MicrowaveInterface):
 
         # FIXME: Is this needed?
         self._device.write(':TRIG1:LIST:SOUR EXT')
+        #self._device.write(':TRIG:LIST:SOUR EXT')
         # self._device.write(':TRIG1:SLOP NEG')
 
         # delete all list entries and create/select a new list
@@ -364,17 +390,61 @@ class MicrowaveSMR(MicrowaveInterface):
         # there was a problem with excessive wait times after issuing :LIST:LEARN over a GPIB
         # connection in firmware 5.88.
         self._device.write(':FREQ:MODE LIST')
-
-        list_len = int(round(float(self._device.query(':SOUR:LIST:FREQ:POIN?'))))
+        time.sleep(0.5)
+        list_len = int(round(float(self._device.query(':SOUR:LIST:FREQ:POIN?').strip())))
 
         if list_len != len(self._scan_frequencies):
             self.log.error('The input frequency list does not correspond to the generated list '
                            'inside the SMR20.')
 
+    def _write_sweep(self):
+        self._device.write('SOUR:FREQ:MODE SWE')
+        self._device.write(':SOUR:SWE:MODE STEP')
+        self._device.write(":SOUR:SWE:SPAC LIN")
+        # It seems that we have to set a DWELL for the device, but it is not so
+        # clear why it is necessary. At least there was a hint in the manual for
+        # that and the instrument displays an error, when this parameter is not
+        # set in the list mode (even it should be set by default):
+        self._device.write(f':SOUR:SWE:DWEL {self._SWEEP_DWELL}')
+
+        # FIXME: Is this needed?
+        self._device.write(':TRIG1:SWE:SOUR EXT')
+        self._device.write(':TRIG:SWE:SOUR EXT')
+        self._device.write("TRIG:SOUR EXT")
+        # self._device.write(':TRIG1:SLOP NEG')
+
+        start, stop, points = self._scan_frequencies
+        step = (stop - start) / (points - 1)
+        print(f'Start: {start}, Stop: {stop}, Step: {step}')
+
+        self._device.write(f':SOUR:FREQ:STAR {start}Hz')
+        self._device.write(f':SOUR:FREQ:STOP {stop}Hz')
+        self._device.write(f':SOUR:SWE:STEP {step}Hz')
+        self._device.write(f':SOUR:POW {self._scan_power:f}')
+
+        self._device.write(':OUTP:AMOD FIX')
+
+        # Apply settings in hardware
+        self._device.write(':SWE:LEARN')
+        # If there are timeout problems after this command, update the smiq firmware to > 5.90 as
+        # there was a problem with excessive wait times after issuing :LIST:LEARN over a GPIB
+        # connection in firmware 5.88.
+        self._device.write(':FREQ:MODE SWE')
+        self._device.write(':SOUR:SWE:MODE STEP')
+        print("Points:", self._device.query(':SOUR:SWE:POIN?'))
+        time.sleep(0.5)
+
     def _set_trigger_edge(self):
         edge = 'POS' if self._rising_edge_trigger else 'NEG'
-        self._device.write(':TRIG1:LIST:SOUR EXT')
-        self._device.write(f':TRIG1:SLOP {edge}')
+        if self._scan_mode == SamplingOutputMode.JUMP_LIST:
+            self._device.write(':TRIG1:LIST:SOUR EXT')
+            self._device.write(f':TRIG1:SLOP {edge}')
+        elif self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
+            self._device.write(':TRIG1:SWE:SOUR EXT')
+            self._device.write(f':TRIG1:SWE:SLOP {edge}')
+            self._device.write(':TRIG:SWE:SOUR EXT')
+            self._device.write(f':TRIG:SWE:SLOP {edge}')
+
 
     # ================== Non interface commands: ==================
 
@@ -399,3 +469,35 @@ class MicrowaveSMR(MicrowaveInterface):
         @return int: error code (0:OK, -1:error)
         """
         self._device.write(':AM:STAT OFF')
+
+    def turn_FM_on(self, f_dev, f_mod):
+        """ Turn on the Frequency Modulation mode.
+
+        @param float f_dev: frequency deviation in Hz.
+        @param float f_mod: modulation frequency in Hz.
+
+        @return int: error code (0:OK, -1:error)
+
+        Set the Frequency modulation with the internal source
+        """
+        self._device.write('FM:SOUR INT')
+
+        self._device.write('FM:EXT1:COUP AC')
+        self._device.write('FM:EXT2:COUP AC')
+        self._device.write('FM:EXT1:IMP 100kOhm')
+        self._device.write('FM:EXT2:IMP 100kOhm')
+
+        self._device.write('FM {0:f}'.format(float(f_dev)))
+        self._device.write('FM:INT:FREQ {0:f}'.format(float(f_mod)))
+        self._device.write(':SOUR2:FUNC SIN')
+
+        self._device.write('FM:STAT ON')
+        self._device.write("OUTP2 ON")
+
+    def turn_FM_off(self):
+        """ Turn off the Frequency Modulation Mode.
+
+        @return int: error code (0:OK, -1:error)
+        """
+        self._device.write('FM:STAT OFF')
+        self._device.write("OUTP2 OFF")
