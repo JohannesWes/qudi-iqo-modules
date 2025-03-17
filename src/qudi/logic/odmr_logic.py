@@ -623,10 +623,11 @@ class OdmrLogic(LogicBase):
 
             try:
                 scanner = self._data_scanner()
-                # fixme: this is a workaround for the Windfreak: it needs an extra trigger for the jump between the first two frequencies
+                # fixme: this is a workaround for the Windfreak: it needs an extra pulse for the jump between the first two frequencies
+                # The sweep does not actually start yet, only the acquire_frame makes the windfreak step through the sweep and
+                # acquires the data sychnronously (see nidaq file). The pulse is not starting the triggering yet.
                 scanner.generate_pulse(0.75/self._data_rate)
                 time.sleep(1 / self._data_rate)
-
                 new_counts = scanner.acquire_frame()
                 if self._oversampling_factor > 1:
                     for ch in new_counts:
