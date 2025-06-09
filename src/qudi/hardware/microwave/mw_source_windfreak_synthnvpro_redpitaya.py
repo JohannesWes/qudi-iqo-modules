@@ -118,6 +118,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         # Power calibration data
         self._power_cal_data = None
 
+        # Initialize per-component FM settings
+        self._fm_enables_per_component = []
+        self._fm_deviations_per_component = []
+
     def on_activate(self):
         """ Initialisation performed during activation of the module. """
         try:
@@ -127,6 +131,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             # Initialize multi-frequency settings
             self._update_active_frequencies()
+
+            # Initialize per-component FM settings
+            self._fm_enables_per_component = [self._enable_fm] * len(self._if_frequencies)
+            self._fm_deviations_per_component = [self._fm_deviation_khz] * len(self._if_frequencies)
 
             # Load power calibration if available
             if self._power_calibration_table:
@@ -274,7 +282,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
             )
 
-            self.log.info(f'Set multi-frequency mode to {mode} with {len(self._active_if_frequencies)} active frequencies')
+            self.log.info(
+                f'Set multi-frequency mode to {mode} with {len(self._active_if_frequencies)} active frequencies')
 
     @property
     def constraints(self):
@@ -385,15 +394,22 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 if_amplitude = self._power_to_if_amplitude(power) * amp_ratio
                 if_amplitudes.append(if_amplitude)
 
-            # Set up FM parameters if enabled
-            fm_enables = [self._enable_fm] * len(self._active_if_frequencies)
-            fm_deviations = [self._fm_deviation_khz] * len(self._active_if_frequencies) if self._enable_fm else [0.0] * len(self._active_if_frequencies)
-            fm_mod_freq = self._fm_modulation_frequency if self._enable_fm else None
+            # Use per-component FM settings if available
+            fm_enables = getattr(self, '_fm_enables_per_component',
+                                 [self._enable_fm] * len(self._active_if_frequencies))
+            fm_deviations = getattr(self, '_fm_deviations_per_component',
+                                    [self._fm_deviation_khz] * len(self._active_if_frequencies))
+
+            # Only use FM settings for active components
+            fm_enables = fm_enables[:len(self._active_if_frequencies)]
+            fm_deviations = fm_deviations[:len(self._active_if_frequencies)]
+
+            fm_mod_freq = self._fm_modulation_frequency if any(fm_enables) else None
 
             # Build calibration files dict for active frequencies
             active_cal_files = {freq: self._calibration_files[freq]
-                               for freq in self._active_if_frequencies
-                               if freq in self._calibration_files}
+                                for freq in self._active_if_frequencies
+                                if freq in self._calibration_files}
 
             # Use the calibrated multi-frequency setup
             self._redpitaya.set_multi_frequency_signal(
@@ -407,8 +423,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             )
 
             self.log.debug(f'CW configured: RF center={frequency / 1e9:.4f} GHz, LO={lo_frequency / 1e9:.4f} GHz, '
-                           f'Active IFs={[f/1e6 for f in self._active_if_frequencies]} MHz, Power={power} dBm, '
-                           f'Mode={self._multi_frequency_mode}, FM={self._enable_fm}')
+                           f'Active IFs={[f / 1e6 for f in self._active_if_frequencies]} MHz, Power={power} dBm, '
+                           f'Mode={self._multi_frequency_mode}, FM enables={fm_enables}')
 
     def configure_scan(self, power, frequencies, mode, sample_rate):
         """Configure frequency scan."""
@@ -428,10 +444,17 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 if_amplitude = self._power_to_if_amplitude(power) * amp_ratio
                 if_amplitudes.append(if_amplitude)
 
-            # FM parameters for scan
-            fm_enables = [self._enable_fm] * len(self._active_if_frequencies)
-            fm_deviations_khz = [self._fm_deviation_khz] * len(self._active_if_frequencies) if self._enable_fm else [0.0] * len(self._active_if_frequencies)
-            fm_mod_freq = self._fm_modulation_frequency if self._enable_fm else None
+            # Use per-component FM settings
+            fm_enables = getattr(self, '_fm_enables_per_component',
+                                 [self._enable_fm] * len(self._active_if_frequencies))
+            fm_deviations_khz = getattr(self, '_fm_deviations_per_component',
+                                        [self._fm_deviation_khz] * len(self._active_if_frequencies))
+
+            # Only use FM settings for active components
+            fm_enables = fm_enables[:len(self._active_if_frequencies)]
+            fm_deviations_khz = fm_deviations_khz[:len(self._active_if_frequencies)]
+
+            fm_mod_freq = self._fm_modulation_frequency if any(fm_enables) else None
 
             # Calculate average IF frequency for LO calculations
             avg_if_freq = self._get_average_if_frequency()
@@ -447,8 +470,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
                 # Build calibration files dict for active frequencies
                 active_cal_files = {freq: self._calibration_files[freq]
-                                   for freq in self._active_if_frequencies
-                                   if freq in self._calibration_files}
+                                    for freq in self._active_if_frequencies
+                                    if freq in self._calibration_files}
 
                 # Configure Red Pitaya with multi-frequency signal
                 self._redpitaya.set_multi_frequency_signal(
@@ -475,8 +498,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
                 # Build calibration files dict for active frequencies
                 active_cal_files = {freq: self._calibration_files[freq]
-                                   for freq in self._active_if_frequencies
-                                   if freq in self._calibration_files}
+                                    for freq in self._active_if_frequencies
+                                    if freq in self._calibration_files}
 
                 # Configure Red Pitaya with multi-frequency signal
                 self._redpitaya.set_multi_frequency_signal(
@@ -497,7 +520,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             time.sleep(0.2)
 
             self.log.debug(f'Configured scan: mode={mode}, power={power} dBm, '
-                           f'sample_rate={sample_rate} Hz, multi_freq_mode={self._multi_frequency_mode}')
+                           f'sample_rate={sample_rate} Hz, multi_freq_mode={self._multi_frequency_mode}, '
+                           f'FM enables={fm_enables}')
 
     def off(self):
         """Switches off any microwave output (both scan and CW)."""
@@ -713,6 +737,28 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
         return power_dbm
 
+    def set_component_enabled(self, component_index: int, enabled: bool):
+        """Enable or disable a specific frequency component.
+
+        @param int component_index: Index of the component (0-2)
+        @param bool enabled: True to enable, False to disable
+        """
+        with self._thread_lock:
+            if self.module_state() != 'idle':
+                raise RuntimeError('Unable to change component state. Microwave output active.')
+
+            if component_index >= len(self._if_frequencies):
+                raise ValueError(f'Component index {component_index} out of range')
+
+            # This would need to be implemented with a new data structure
+            # to track which components are enabled
+            # For now, we'll implement this through the Red Pitaya
+            if self._redpitaya and self._redpitaya.is_connected:
+                config = self._redpitaya.get_current_config()
+                if config and component_index < len(config.components):
+                    config.components[component_index].enabled = enabled
+                    self._redpitaya.configure_signal(config)
+
     def set_fm_parameters(self, enable=None, deviation_khz=None, modulation_frequency=None):
         """Set FM modulation parameters.
 
@@ -735,6 +781,33 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             # If CW is currently on, update the configuration
             if self.module_state() != 'idle' and self._in_cw_mode:
                 self.set_cw(self._current_rf_frequency, self._current_rf_power)
+
+    def set_fm_per_component(self, component_index: int, fm_enabled: bool, fm_deviation_khz: float = None):
+        """Set FM parameters for a specific component.
+
+        @param int component_index: Index of the component (0-2)
+        @param bool fm_enabled: Enable/disable FM for this component
+        @param float fm_deviation_khz: FM deviation in kHz (optional)
+        """
+        with self._thread_lock:
+            if self.module_state() != 'idle':
+                raise RuntimeError('Unable to change FM settings. Microwave output active.')
+
+            if component_index >= len(self._if_frequencies):
+                raise ValueError(f'Component index {component_index} out of range')
+
+            # Store per-component FM settings
+            if not hasattr(self, '_fm_enables_per_component'):
+                self._fm_enables_per_component = [self._enable_fm] * len(self._if_frequencies)
+            if not hasattr(self, '_fm_deviations_per_component'):
+                self._fm_deviations_per_component = [self._fm_deviation_khz] * len(self._if_frequencies)
+
+            self._fm_enables_per_component[component_index] = fm_enabled
+            if fm_deviation_khz is not None:
+                self._fm_deviations_per_component[component_index] = fm_deviation_khz
+
+            self.log.info(f'Component {component_index} FM settings: enabled={fm_enabled}, '
+                          f'deviation={self._fm_deviations_per_component[component_index]} kHz')
 
     def get_multi_frequency_info(self):
         """Get information about the current multi-frequency configuration.
@@ -760,5 +833,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 'active_if_amplitudes': self._active_if_amplitudes.copy(),
                 'average_if_frequency': avg_if,
                 'rf_frequencies': rf_frequencies,
-                'fm_enabled': self._enable_fm
+                'fm_enabled': self._enable_fm,
+                'fm_deviation_khz': self._fm_deviation_khz,
+                'fm_modulation_frequency': self._fm_modulation_frequency,
+                'fm_enables_per_component': getattr(self, '_fm_enables_per_component',
+                                                    [self._enable_fm] * len(self._if_frequencies)),
+                'fm_deviations_per_component': getattr(self, '_fm_deviations_per_component',
+                                                       [self._fm_deviation_khz] * len(self._if_frequencies))
             }

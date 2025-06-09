@@ -543,9 +543,9 @@ if __name__ == "__main__":
 
     # Specify calibration files explicitly
     calibration_files = {
-        19.422e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\my_software\redpitaya_tools\IQ_calibration\calibration_results\2025-06-02-01-41-05\IF_19.422MHz\calibration_redpitaya_all_results_IF_19.422MHz.csv",
-        21.580e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\my_software\redpitaya_tools\IQ_calibration\calibration_results\2025-06-02-01-41-05\IF_21.580MHz\calibration_redpitaya_all_results_IF_21.580MHz.csv",
-        23.738e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\my_software\redpitaya_tools\IQ_calibration\calibration_results\2025-06-02-01-41-05\IF_23.738MHz\calibration_redpitaya_all_results_IF_23.738MHz.csv"
+        19.422e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\qudi-iqo-modules\src\qudi\hardware\microwave\redpitaya\calibration_results\2025-06-06-23-01-25\IF_19.422MHz\calibration_redpitaya_all_results_IF_19.422MHz.csv",
+        21.580e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\qudi-iqo-modules\src\qudi\hardware\microwave\redpitaya\calibration_results\2025-06-06-23-01-25\IF_21.580MHz\calibration_redpitaya_all_results_IF_21.580MHz.csv",
+        23.738e6: r"C:\Users\aj92uwef\PycharmProjects\qudi-core\qudi-iqo-modules\src\qudi\hardware\microwave\redpitaya\calibration_results\2025-06-06-23-01-25\IF_23.738MHz\calibration_redpitaya_all_results_IF_23.738MHz.csv"
     }
 
     # Configure the multi-frequency signal with calibration and FM
