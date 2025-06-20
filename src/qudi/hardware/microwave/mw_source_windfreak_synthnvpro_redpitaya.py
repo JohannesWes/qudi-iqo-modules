@@ -769,8 +769,19 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         with self._thread_lock:
             if enable is not None:
                 self._enable_fm = bool(enable)
+
             if deviation_khz is not None:
                 self._fm_deviation_khz = float(deviation_khz)
+                # This is the crucial part: we must also update the per-component list
+                # that is actually used by configure_scan.
+                if hasattr(self, '_fm_deviations_per_component'):
+                    num_components = len(self._fm_deviations_per_component)
+                    self._fm_deviations_per_component = [self._fm_deviation_khz] * num_components
+                else:
+                    # Fallback in case the list doesn't exist yet for some reason
+                    num_if_freqs = len(getattr(self, '_if_frequencies', [1]))
+                    self._fm_deviations_per_component = [self._fm_deviation_khz] * num_if_freqs
+
             if modulation_frequency is not None:
                 self._fm_modulation_frequency = float(modulation_frequency)
 
