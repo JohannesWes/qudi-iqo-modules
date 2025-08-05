@@ -56,7 +56,8 @@ Usage Example:
 ```python
 # Connect to Red Pitaya
 rp_source = RedPitayaIFSource("192.168.1.100")
-rp_source.connect()
+# The config_name is important for sharing the connection with other modules
+rp_source.connect(config_name='my_shared_rp_config')
 
 # Simple single frequency (backward compatible)
 rp_source.set_amplitude(0.5)  # Sets frequency 0 to 0.5 amplitude
@@ -105,6 +106,7 @@ import numpy as np
 import pyrpl
 from typing import Tuple, Optional, Dict, List
 from .if_source_base import IFSourceBase, IQDeviceConfig, IQComponentConfig
+from qudi.hardware.redpitaya.resource_manager import get_pyrpl_instance, release_pyrpl_instance
 import logging
 import pandas as pd
 from scipy.interpolate import interp2d, griddata
@@ -119,23 +121,27 @@ class RedPitayaIFSource(IFSourceBase):
         self.port = port
         self.pyrpl = None
         self.fgen3 = None
+        self._config_name = None
         self._current_config = None
-        self._calibration_data = {}  # Dict[frequency, DataFrame]
-        self._max_components = 3  # fgen3 supports 3 components
+        self._calibration_data = {}
+        self._max_components = 3
 
     def connect(self, **kwargs) -> None:
         """Connect to the Red Pitaya."""
         try:
-            self.logger.info(f"Connecting to Red Pitaya at {self.hostname}:{self.port}")
+            self.logger.info(f"Connecting to Red Pitaya at {self.hostname}")
 
-            config_name = kwargs.get('config_name', 'iq_calibration_config')
+            # Get config name from kwargs, with a reasonable default
+            self._config_name = kwargs.get('config_name', 'rp_default_config')
             gui = kwargs.get('gui', False)
 
-            self.pyrpl = pyrpl.Pyrpl(
+            # Use the shared factory to get a pyrpl instance
+            self.pyrpl, _ = get_pyrpl_instance(
                 hostname=self.hostname,
-                config=config_name,
-                gui=False # fixme: should be gui -> configurable
+                config_name=self._config_name,
+                gui=gui
             )
+            self.logger.info(f"Acquired shared pyrpl instance for {self.hostname} with config '{self._config_name}'")
 
             # Initialize fgen3 module
             self.fgen3 = self.pyrpl.rp.fgen3
@@ -165,9 +171,14 @@ class RedPitayaIFSource(IFSourceBase):
                 self.logger.debug("Red Pitaya output disabled")
 
             if self.pyrpl:
-                # PyRPL doesn't have a proper disconnect method
-                del self.pyrpl
+                # Release our use of the shared instance
+                # using the config name we stored during connection
+                release_pyrpl_instance(
+                    hostname=self.hostname,
+                    config_name=self._config_name
+                )
                 self.pyrpl = None
+                self._config_name = None
 
             self._is_connected = False
             self.logger.info("Red Pitaya disconnected")
@@ -176,7 +187,7 @@ class RedPitayaIFSource(IFSourceBase):
             self.logger.error(f"Error disconnecting Red Pitaya: {e}")
 
     def load_calibration_data(self, frequency: float, path: str) -> pd.DataFrame:
-        """Load IQ calibration settings for a specific frequency from a CSV file."""
+        """Load IQ calibration settings for a specific IF frequency from a CSV file."""
         if not self._is_connected:
             raise RuntimeError("Red Pitaya not connected")
 
@@ -270,7 +281,13 @@ class RedPitayaIFSource(IFSourceBase):
         try:
             # Set the frequency on iq0 module which controls FM modulation
             self.pyrpl.rp.iq0.frequency = frequency
-            self.pyrpl.rp.hk.setup_iq0_square_output(pin=1, enable=True)
+            self.pyrpl.rp.iq0.input = "in1"
+            self.pyrpl.rp.iq0.bandwidth = 1000
+            self.pyrpl.rp.iq0.output_signal = "quadrature"
+            self.pyrpl.rp.iq0.gain = 1.0
+            #self.pyrpl.rp.iq0.output_direct = "off"
+
+            self.pyrpl.rp.hk.configure_pin("P1", direction="output", source="module") # reference pin for external lock-in amplifier
             self.logger.info(f"FM modulation frequency set to {frequency / 1e3:.3f} kHz")
 
             # Update current config if it exists

@@ -11,16 +11,13 @@ For multi-frequency excitation: RF_i = LO - IF_i for each IF frequency
 import time
 import pyvisa
 import numpy as np
-from typing import Optional, Dict, List, Union
-import sys
-import os
+from typing import Optional, List
 
 from qudi.util.mutex import Mutex
 from qudi.core.configoption import ConfigOption
 from qudi.interface.microwave_interface import MicrowaveInterface, MicrowaveConstraints
 from qudi.util.enums import SamplingOutputMode
 
-from .redpitaya.if_source_base import IFSourceBase
 from .redpitaya.redpitaya_if_source import RedPitayaIFSource
 
 
@@ -36,12 +33,13 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
     Example config for copy-paste:
 
     mw_source_rp_windfreak:
-        module.Class: 'microwave.mw_source_redpitaya_windfreak.MicrowaveRedPitayaWindfreak'
+        module.Class: 'microwave.mw_source_windfreak_synthnvpro_redpitaya.MicrowaveRedPitayaWindfreak'
         options:
             windfreak_serial_port: 'COM3'
             windfreak_comm_timeout: 10  # in seconds
             redpitaya_hostname: '10.203.129.28'
-            if_frequencies: [19.422e6, 21.580e6, 23.738e6]  # Hz
+            redpitaya_config_name: 'rpy_shared_config'
+            if_frequencies: [19.422e6, 21.580e6, 23.738e6]
             if_frequency_index: 1  # Use middle frequency (21.580 MHz) for calculations
             lo_power: 13  # dBm - fixed power for IQ mixer LO input
             calibration_files:
@@ -51,9 +49,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             enable_fm: False  # Enable FM modulation capability
             fm_deviation_khz: 100.0  # Default FM deviation in kHz
             fm_modulation_frequency: 5000.0  # Default FM modulation frequency in Hz
-            power_calibration_table: null  # Optional: path to power calibration file
-            multi_frequency_mode: 'single'  # Options: 'single', 'dual', 'triple'
-            multi_frequency_amplitudes: [0.5, 0.5, 0.5]  # Relative amplitudes for multi-freq mode
+            multi_frequency_mode: 'triple'  # Options: 'single', 'dual', 'triple'
+            multi_frequency_amplitudes: [0.1, 0.1, 0.1]  # RELATIVE amplitudes for multi-freq mode
     """
 
     # Windfreak config options
@@ -63,6 +60,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
     # Red Pitaya config options
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
     _redpitaya_port = ConfigOption('redpitaya_port', default=2222, missing='info')
+    # This is not the qudi config, but the pyrpl/Red Pitaya config
+    _redpitaya_config_name = ConfigOption('redpitaya_config_name', default='rpy_shared_config', missing='info')
 
     # IF configuration
     _if_frequencies = ConfigOption('if_frequencies', missing='error')
@@ -159,7 +158,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             # Connect to Red Pitaya
             self._redpitaya = RedPitayaIFSource(self._redpitaya_hostname, self._redpitaya_port)
-            self._redpitaya.connect()
+            # Pass the config name to the connect method
+            self._redpitaya.connect(config_name=self._redpitaya_config_name)
             self.log.info('Connected to Red Pitaya')
 
             # Load calibration data
@@ -176,9 +176,9 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             max_rf = 6.4e9 - avg_if_freq
 
             self._constraints = MicrowaveConstraints(
-                power_limits=(-50, 0),  # Limited by IF source dynamic range
+                power_limits=(-50, 10),
                 frequency_limits=(min_rf, max_rf),
-                scan_size_limits=(2, 10000),
+                scan_size_limits=(2, 2**12),
                 sample_rate_limits=(0.1, 2500),
                 scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
             )
@@ -187,6 +187,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             self._scan_frequencies = None
             self._scan_sample_rate = self._constraints.max_sample_rate
             self._in_cw_mode = True
+
+            # Ensure outputs are off on startup
+            self.log.info('Ensuring all microwave outputs are off upon activation.')
+            self._windfreak_off()
+            self._redpitaya.enable_output(False)
 
         except Exception as e:
             self.log.error(f'Failed to activate module: {e}')
@@ -275,9 +280,9 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             max_rf = 6.4e9 - avg_if_freq
 
             self._constraints = MicrowaveConstraints(
-                power_limits=(-50, 0),
+                power_limits=(-50, 10),
                 frequency_limits=(min_rf, max_rf),
-                scan_size_limits=(2, 10000),
+                scan_size_limits=(2, 2**12),
                 sample_rate_limits=(0.1, 2500),
                 scan_modes=(SamplingOutputMode.EQUIDISTANT_SWEEP, SamplingOutputMode.JUMP_LIST)
             )
