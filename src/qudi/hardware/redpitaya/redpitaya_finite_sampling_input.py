@@ -30,9 +30,10 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             redpitaya_hostname: '192.168.1.100'  # IP address of Red Pitaya
             calibration_factor: 1.0  # optional, scaling factor for data
             trigger_output_duration: 50e-6  # trigger pulse duration in seconds
-            settling_time: 100e-6  # settling time after trigger in seconds
+            settling_time: 100e-6  # settling time after trigger in seconds (time until data is acquired after trigg)
             input_channel: 'in1'  # 'in1' or 'in2' (hardwired to in1 in FPGA)
             signal_scale: 1.0  # Scale factor to convert ADC units to physical units
+            input_select: 'adc', 'iq0', or 'demod'
     """
 
     # Config options
@@ -43,6 +44,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     _settling_time = ConfigOption('settling_time', default=100e-6, missing='info')
     _input_channel = ConfigOption('input_channel', default='in1', missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
+    _input_select = ConfigOption('input_select', default='adc', missing='info')  # New config option
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -81,7 +83,15 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             self._scan_module.trigger_length = self._trigger_output_duration
             self._scan_module.settling_time = self._settling_time
 
-            # Note: The scan module is hardwired to read from adc_a (in1)
+            # Set input select from config
+            valid_inputs = {'adc', 'iq0', 'demod'}
+            if self._input_select not in valid_inputs:
+                self.log.warning(f'Invalid input_select "{self._input_select}" specified. Falling back to "adc".')
+                self._input_select = 'adc'
+            self._scan_module.input_select = self._input_select
+            self.log.info(f'Scan input selected: {self._input_select}')
+
+            # Note: The physical input channel is set to ADC1 (out of ADC1 and ADC2)
             if self._input_channel != 'in1':
                 self.log.warning('Scan module is hardwired to read from in1 (adc_a). '
                                  'Input channel setting will be ignored.')
@@ -239,7 +249,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                 # Try to get any partial data
                 if self._scan_module.done or self._scan_module.current_step > 0:
                     try:
-                        raw_data = self._scan_module.get_data(average=False) #fixme: at some later point set to true
+                        raw_data = self._scan_module.get_data(average=True) #fixme: at some later point set to true
                         # Apply calibration and scaling
                         self._data_buffer = raw_data * self._calibration_factor * self._signal_scale
                         self._buffer_position = 0
@@ -268,7 +278,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
             if self._scan_module.wait_done(timeout=timeout):
                 try:
-                    raw_data = self._scan_module.get_data(average=False) #fixme: at some later point set to true
+                    raw_data = self._scan_module.get_data(average=True) #fixme: at some later point set to true
                     # Apply calibration and scaling
                     self._data_buffer = raw_data * self._calibration_factor * self._signal_scale
                     self._buffer_position = 0

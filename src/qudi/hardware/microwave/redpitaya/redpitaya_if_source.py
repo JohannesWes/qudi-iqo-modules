@@ -133,7 +133,7 @@ class RedPitayaIFSource(IFSourceBase):
 
             # Get config name from kwargs, with a reasonable default
             self._config_name = kwargs.get('config_name', 'rp_default_config')
-            gui = kwargs.get('gui', False)
+            gui = kwargs.get('gui', True)
 
             # Use the shared factory to get a pyrpl instance
             self.pyrpl, _ = get_pyrpl_instance(
@@ -209,18 +209,18 @@ class RedPitayaIFSource(IFSourceBase):
         calibration_data = self._calibration_data[frequency]
 
         # Extract the parameter ranges from calibration data
-        lo_min = calibration_data['lo_frequency_ghz'].min()
-        lo_max = calibration_data['lo_frequency_ghz'].max()
-        if_min = calibration_data['if_amplitude'].min()
-        if_max = calibration_data['if_amplitude'].max()
+        lo_freq_min = calibration_data['lo_frequency_ghz'].min()
+        lo_freq_max = calibration_data['lo_frequency_ghz'].max()
+        if_amp_min = calibration_data['if_amplitude'].min()
+        if_amp_max = calibration_data['if_amplitude'].max()
 
         # Check if requested parameters are within bounds
-        if not (lo_min <= lo_frequency_ghz <= lo_max):
+        if not (lo_freq_min <= lo_frequency_ghz <= lo_freq_max):
             raise ValueError(
-                f"lo_frequency_ghz ({lo_frequency_ghz}) is outside the calibrated range [{lo_min}, {lo_max}]")
+                f"lo_frequency_ghz ({lo_frequency_ghz}) is outside the calibrated range [{lo_freq_min}, {lo_freq_max}]")
 
-        if not (if_min <= if_amplitude <= if_max):
-            raise ValueError(f"if_amplitude ({if_amplitude}) is outside the calibrated range [{if_min}, {if_max}]")
+        if not (if_amp_min <= if_amplitude <= if_amp_max):
+            raise ValueError(f"if_amplitude ({if_amplitude}) is outside the calibrated range [{if_amp_min}, {if_amp_max}]")
 
         # Log the interpolation request
         self.logger.debug(
@@ -282,9 +282,10 @@ class RedPitayaIFSource(IFSourceBase):
             # Set the frequency on iq0 module which controls FM modulation
             self.pyrpl.rp.iq0.frequency = frequency
             self.pyrpl.rp.iq0.input = "in1"
-            self.pyrpl.rp.iq0.bandwidth = 1000
+            self.pyrpl.rp.iq0.bandwidth = [500, 500]
             self.pyrpl.rp.iq0.output_signal = "quadrature"
-            self.pyrpl.rp.iq0.gain = 1.0
+            self.pyrpl.rp.iq0.quadrature_factor = 1.0
+            #self.pyrpl.rp.iq0.gain = 1.0
             #self.pyrpl.rp.iq0.output_direct = "off"
 
             self.pyrpl.rp.hk.configure_pin("P1", direction="output", source="module") # reference pin for external lock-in amplifier
