@@ -285,6 +285,10 @@ class RedPitayaIFSource(IFSourceBase):
             self.pyrpl.rp.iq0.bandwidth = [500, 500]
             self.pyrpl.rp.iq0.output_signal = "quadrature"
             self.pyrpl.rp.iq0.quadrature_factor = 1.0
+
+            self.pyrpl.rp.lockin.ref_select1 = "sin_shifted"
+            self.pyrpl.rp.lockin.ref_select2 = "cos_shifted"
+            self.logger.warning(f"IQ Reference Info: {self.pyrpl.rp.lockin.get_iq_reference_info(channel=1)}")
             #self.pyrpl.rp.iq0.gain = 1.0
             #self.pyrpl.rp.iq0.output_direct = "off"
 
