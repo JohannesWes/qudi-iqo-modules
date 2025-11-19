@@ -1,0 +1,104 @@
+# Example configuration for ODMR Tracking module
+#
+# This file shows how to configure and use the ODMR tracking functionality.
+# Copy the relevant sections to your actual qudi configuration file.
+
+global:
+    # Standard qudi global settings
+    startup_modules: [odmr_tracking_gui]
+    remote_modules_server:
+        address: 'localhost'
+        port: 12345
+
+hardware:
+    # Example microwave source (replace with your actual hardware)
+    microwave_source:
+        module.Class: 'qudi.hardware.microwave.mw_source_smbv.MicrowaveSmb'
+        visa_address: 'TCPIP0::192.168.1.100::INSTR'
+        comm_timeout: 10000
+
+    # Example data scanner/detector (replace with your actual hardware)
+    data_scanner:
+        module.Class: 'qudi.hardware.ni_card.NationalInstrumentsXSeries'
+        device_name: 'Dev1'
+        input_channel_units:
+            PFI8: 'c/s'
+        output_channel_units: {}
+        aom_voltage_range: [0, 5]
+
+logic:
+    # ODMR Tracking Logic
+    odmr_tracking_logic:
+        module.Class: 'qudi.logic.odmr_tracking_logic.OdmrTrackingLogic'
+
+        # Hardware connections
+        connect:
+            microwave: microwave_source
+            data_scanner: data_scanner
+
+        # Optional: tracking-specific configuration
+        # These can also be set via the GUI during runtime
+        options:
+            # Initial tracking target: 'dip' or 'peak'
+            tracking_target: 'dip'
+
+            # Minimum contrast threshold for valid tracking
+            tracking_threshold: 0.01
+
+            # Number of data points to keep in tracking history
+            max_history_length: 1000
+
+            # Window size for feature detection (number of points)
+            tracking_window_size: 5
+
+gui:
+    # ODMR Tracking GUI
+    odmr_tracking_gui:
+        module.Class: 'qudi.gui.odmr_tracking.odmrgui.OdmrTrackingGui'
+
+        # Connect to tracking logic
+        connect:
+            odmr_logic: odmr_tracking_logic
+
+        # Optional: GUI-specific settings
+        options:
+            # Maximum number of previous scans to display
+            max_shown_scans: 50
+
+
+# ==============================================================================
+# Usage Notes:
+# ==============================================================================
+#
+# 1. The ODMR tracking module inherits ALL functionality from the standard
+#    ODMR module, so all standard ODMR features are available:
+#    - Frequency scanning
+#    - CW mode
+#    - Multi-range scanning
+#    - Data fitting
+#    - Data saving
+#
+# 2. Additional tracking features:
+#    - Automatic peak/dip frequency tracking
+#    - Frequency range adjustment to follow drifting features
+#    - Tracking history visualization
+#    - Tracking quality monitoring
+#
+# 3. To use:
+#    a) Start qudi with this configuration
+#    b) The ODMR Tracking GUI will open with standard ODMR controls
+#       plus an additional "Tracking Controls" dock widget
+#    c) Start a normal ODMR scan first
+#    d) Once signal is visible, enable tracking via the tracking controls
+#    e) The scan range will automatically adjust to follow the tracked feature
+#
+# 4. The tracking algorithm is a placeholder - you'll need to implement
+#    your specific tracking logic in the following methods:
+#    - _find_tracking_feature(): Detect the feature to track
+#    - _calculate_contrast(): Compute tracking quality metric
+#    - _should_adjust_scan_range(): Decide when to adjust scan range
+#
+# 5. Both standard ODMR and ODMR-tracking modules can be configured
+#    simultaneously if you want both available in the same qudi instance.
+#
+# ==============================================================================
