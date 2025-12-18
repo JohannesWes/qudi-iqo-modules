@@ -23,7 +23,13 @@ Example config:
             channel_buffer_size: 100000    # Software buffer size (samples)
             calibration_factor: 1.0        # Multiply raw data by this factor
             signal_scale: 1.0              # Additional scaling factor
-            max_fpga_read_samples: null    # Max samples per FPGA poll (null=read all, prevents overflow)
+            max_fpga_read_samples: null    # Max samples per FPGA poll (null=read all)
+
+            # Lock-in filter options (only used when stream_input='demod'):
+            lock_in_fir_bypass_ch1: False  # True: CIC only (~15 kHz BW), False: CIC+FIR
+            lock_in_fir_bypass_ch2: False
+            lock_in_filter_ch1: '2kHz'     # FIR filter bandwidth: '500Hz', '2kHz', '5kHz'
+            lock_in_filter_ch2: '2kHz'
 
 Usage Example:
 
@@ -94,6 +100,14 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _max_fpga_read_samples = ConfigOption('max_fpga_read_samples', default=None, missing='info')
     _stream_input = ConfigOption('stream_input', default='demod', missing='info')
 
+    # Lock-in filter configuration (applies when stream_input='demod')
+    # FIR bypass: True = CIC only (~15 kHz BW, ~160 µs latency), False = CIC+FIR
+    _lock_in_fir_bypass_ch1 = ConfigOption('lock_in_fir_bypass_ch1', default=False, missing='info')
+    _lock_in_fir_bypass_ch2 = ConfigOption('lock_in_fir_bypass_ch2', default=False, missing='info')
+    # Filter selection (active when fir_bypass is False): '500Hz', '2kHz', '5kHz'
+    _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='2kHz', missing='info')
+    _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='2kHz', missing='info')
+
     # FPGA constants from pyrpl scan module
     _FPGA_CLOCK_FREQ = 125e6  # Hz
     _DEMOD_DECIMATION = 4096
@@ -143,6 +157,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
             self._current_stream_input = self._stream_input
             self._scan_module.input_select = self._current_stream_input
             self.log.info(f'Stream input configured: {self._current_stream_input}')
+
+            # Configure lock-in filter settings when using demod input
+            if self._current_stream_input == 'demod':
+                self._configure_lock_in_filters()
 
             # Create constraints
             self._constraints = DataInStreamConstraints(
@@ -197,6 +215,45 @@ class RedPitayaDataInStream(DataInStreamInterface):
 
         except Exception as e:
             self.log.error(f'Error during deactivation: {e}')
+
+    def _configure_lock_in_filters(self):
+        """Configure lock-in module filter settings from config options.
+
+        Applies FIR bypass and filter selection settings to the lock-in module.
+        Called automatically during activation when stream_input='demod'.
+        """
+        try:
+            # Module is named 'lockin' (not 'lock_in') per PyRPL naming convention
+            lock_in = self._pyrpl.rp.lockin
+
+            # Configure FIR bypass (True = CIC only, ~15 kHz BW, ~160 µs latency)
+            lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
+            lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
+
+            # Configure filter selection (only active when FIR bypass is False)
+            valid_filters = {'500Hz', '2kHz', '5kHz'}
+
+            if self._lock_in_filter_ch1 not in valid_filters:
+                self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
+                                 f'Using "2kHz". Valid options: {valid_filters}')
+                self._lock_in_filter_ch1 = '2kHz'
+            lock_in.filter_select_ch1 = self._lock_in_filter_ch1
+
+            if self._lock_in_filter_ch2 not in valid_filters:
+                self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
+                                 f'Using "2kHz". Valid options: {valid_filters}')
+                self._lock_in_filter_ch2 = '2kHz'
+            lock_in.filter_select_ch2 = self._lock_in_filter_ch2
+
+            # Log configuration summary
+            ch1_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch1 else f'CIC+FIR ({self._lock_in_filter_ch1})'
+            ch2_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch2 else f'CIC+FIR ({self._lock_in_filter_ch2})'
+            self.log.info(f'Lock-in filters configured - Ch1: {ch1_mode}, Ch2: {ch2_mode}')
+
+        except AttributeError as e:
+            self.log.warning(f'Could not configure lock-in filters (module not available): {e}')
+        except Exception as e:
+            self.log.error(f'Failed to configure lock-in filters: {e}')
 
     @property
     def constraints(self) -> DataInStreamConstraints:

@@ -30,10 +30,18 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             redpitaya_hostname: '192.168.1.100'  # IP address of Red Pitaya
             calibration_factor: 1.0  # optional, scaling factor for data
             trigger_output_duration: 50e-6  # trigger pulse duration in seconds
-            settling_time: 100e-6  # settling time after trigger in seconds (time until data is acquired after trigg)
+            settling_time: 100e-6  # settling time after trigger in seconds
             input_channel: 'in1'  # 'in1' or 'in2' (hardwired to in1 in FPGA)
             signal_scale: 1.0  # Scale factor to convert ADC units to physical units
-            input_select: 'adc', 'iq0', or 'demod'
+            input_select: 'demod'  # 'adc', 'iq0', or 'demod'
+
+            # Lock-in filter options (only used when input_select='demod'):
+            lock_in_fir_bypass_ch1: False  # True: CIC only (~15 kHz BW, ~160 µs latency)
+                                           # False: CIC+FIR (bandwidth per filter_select)
+            lock_in_fir_bypass_ch2: False
+            lock_in_filter_ch1: '500Hz'  # FIR filter bandwidth: '500Hz', '2kHz', '5kHz'
+                                         # 500Hz: ~9 ms latency, 2kHz/5kHz: lower latency
+            lock_in_filter_ch2: '500Hz'
     """
 
     # Config options
@@ -44,7 +52,15 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     _settling_time = ConfigOption('settling_time', default=100e-6, missing='info')
     _input_channel = ConfigOption('input_channel', default='in1', missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
-    _input_select = ConfigOption('input_select', default='adc', missing='info')  # New config option
+    _input_select = ConfigOption('input_select', default='adc', missing='info')  # 'adc', 'iq0', or 'demod'
+
+    # Lock-in filter configuration (applies when input_select='demod')
+    # FIR bypass: True = CIC only (~15 kHz BW, ~160 µs latency), False = CIC+FIR
+    _lock_in_fir_bypass_ch1 = ConfigOption('lock_in_fir_bypass_ch1', default=False, missing='info')
+    _lock_in_fir_bypass_ch2 = ConfigOption('lock_in_fir_bypass_ch2', default=False, missing='info')
+    # Filter selection (active when fir_bypass is False): '500Hz', '2kHz', '5kHz'
+    _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='500Hz', missing='info')
+    _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='500Hz', missing='info')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -90,6 +106,10 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                 self._input_select = 'adc'
             self._scan_module.input_select = self._input_select
             self.log.info(f'Scan input selected: {self._input_select}')
+
+            # Configure lock-in filter settings (relevant when input_select='demod')
+            if self._input_select == 'demod':
+                self._configure_lock_in_filters()
 
             # Note: The physical input channel is set to ADC1 (out of ADC1 and ADC2)
             if self._input_channel != 'in1':
@@ -362,3 +382,42 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
 
             except Exception as e:
                 self.log.error(f'Failed to generate pulse: {e}')
+
+    def _configure_lock_in_filters(self):
+        """Configure lock-in module filter settings from config options.
+
+        Applies FIR bypass and filter selection settings to the lock-in module.
+        Called automatically during activation when input_select='demod'.
+        """
+        try:
+            # Module is named 'lockin' (not 'lock_in') per PyRPL naming convention
+            lock_in = self._pyrpl.rp.lockin
+
+            # Configure FIR bypass (True = CIC only, ~15 kHz BW, ~160 µs latency)
+            lock_in.fir_bypass_ch1 = self._lock_in_fir_bypass_ch1
+            lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
+
+            # Configure filter selection (only active when FIR bypass is False)
+            valid_filters = {'500Hz', '2kHz', '5kHz'}
+
+            if self._lock_in_filter_ch1 not in valid_filters:
+                self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
+                                 f'Using "500Hz". Valid options: {valid_filters}')
+                self._lock_in_filter_ch1 = '500Hz'
+            lock_in.filter_select_ch1 = self._lock_in_filter_ch1
+
+            if self._lock_in_filter_ch2 not in valid_filters:
+                self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
+                                 f'Using "500Hz". Valid options: {valid_filters}')
+                self._lock_in_filter_ch2 = '500Hz'
+            lock_in.filter_select_ch2 = self._lock_in_filter_ch2
+
+            # Log configuration summary
+            ch1_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch1 else f'CIC+FIR ({self._lock_in_filter_ch1})'
+            ch2_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch2 else f'CIC+FIR ({self._lock_in_filter_ch2})'
+            self.log.info(f'Lock-in filters configured - Ch1: {ch1_mode}, Ch2: {ch2_mode}')
+
+        except AttributeError as e:
+            self.log.warning(f'Could not configure lock-in filters (module not available): {e}')
+        except Exception as e:
+            self.log.error(f'Failed to configure lock-in filters: {e}')
