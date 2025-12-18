@@ -49,6 +49,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             enable_fm: False  # Enable FM modulation capability
             fm_deviation_khz: 100.0  # Default FM deviation in kHz
             fm_modulation_frequency: 5000.0  # Default FM modulation frequency in Hz
+            iq0_phase_offset: 0.0  # IQ demodulation phase offset in degrees (adjust for max 1f signal)
             multi_frequency_mode: 'triple'  # Options: 'single', 'dual', 'triple'
             multi_frequency_amplitudes: [0.1, 0.1, 0.1]  # RELATIVE amplitudes for multi-freq mode
     """
@@ -73,6 +74,9 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
     _enable_fm = ConfigOption('enable_fm', default=False, missing='info')
     _fm_deviation_khz = ConfigOption('fm_deviation_khz', default=100.0, missing='info')
     _fm_modulation_frequency = ConfigOption('fm_modulation_frequency', default=5000.0, missing='info')
+
+    # IQ demodulation phase offset (degrees) - adjust to maximize 1f signal on ODMR slope
+    _iq0_phase_offset = ConfigOption('iq0_phase_offset', default=0.0, missing='info')
 
     # Power calibration
     _power_calibration_table = ConfigOption('power_calibration_table', default=None, missing='info')
@@ -169,6 +173,14 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                     self.log.info(f'Loaded calibration for {freq / 1e6:.3f} MHz')
                 except Exception as e:
                     self.log.error(f'Failed to load calibration for {freq / 1e6:.3f} MHz: {e}')
+
+            # Set IQ phase offset from config (if specified and non-zero)
+            if self._iq0_phase_offset != 0.0:
+                try:
+                    self._redpitaya.set_iq_phase_offset(self._iq0_phase_offset)
+                    self.log.info(f'IQ0 phase offset set to {self._iq0_phase_offset:.2f} degrees')
+                except Exception as e:
+                    self.log.warning(f'Could not set IQ phase offset: {e}')
 
             # Generate constraints based on average IF frequency
             avg_if_freq = self._get_average_if_frequency()
@@ -855,5 +867,25 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 'fm_enables_per_component': getattr(self, '_fm_enables_per_component',
                                                     [self._enable_fm] * len(self._if_frequencies)),
                 'fm_deviations_per_component': getattr(self, '_fm_deviations_per_component',
-                                                       [self._fm_deviation_khz] * len(self._if_frequencies))
+                                                       [self._fm_deviation_khz] * len(self._if_frequencies)),
+                'iq0_phase_offset': self._iq0_phase_offset
             }
+
+    def set_iq_phase_offset(self, phase_offset: float):
+        """Set the IQ demodulation phase offset (iq0.phase).
+
+        This adjusts the phase between modulation and demodulation in the IQ module.
+        Fine-tune this value to maximize the 1f signal amplitude on the ODMR resonance slope.
+
+        @param float phase_offset: Phase offset in degrees
+        """
+        with self._thread_lock:
+            self._iq0_phase_offset = float(phase_offset)
+
+            # Apply to Red Pitaya if connected
+            if self._redpitaya and self._redpitaya.is_connected:
+                try:
+                    self._redpitaya.set_iq_phase_offset(phase_offset)
+                    self.log.info(f'IQ phase offset set to {phase_offset:.2f} degrees')
+                except Exception as e:
+                    self.log.error(f'Failed to set IQ phase offset: {e}')

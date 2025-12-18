@@ -266,7 +266,7 @@ class RedPitayaIFSource(IFSourceBase):
         return (interpolated_values['g'], interpolated_values['phi'],
                 interpolated_values['I_offset'], interpolated_values['Q_offset'])
 
-    def set_fm_modulation_frequency(self, frequency: float) -> None:
+    def set_fm_modulation_frequency(self, frequency: float, phase_offset: float = None) -> None:
         """
         Set the FM modulation frequency via iq0 module.
 
@@ -274,6 +274,9 @@ class RedPitayaIFSource(IFSourceBase):
         -----------
         frequency : float
             FM modulation frequency in Hz
+        phase_offset : float, optional
+            Phase offset in degrees for IQ demodulation. Adjust to maximize
+            1f signal on the ODMR resonance slope. If None, phase is not changed.
         """
         if not self._is_connected:
             raise RuntimeError("Red Pitaya not connected")
@@ -285,6 +288,11 @@ class RedPitayaIFSource(IFSourceBase):
             self.pyrpl.rp.iq0.bandwidth = [500, 500]
             self.pyrpl.rp.iq0.output_signal = "quadrature"
             self.pyrpl.rp.iq0.quadrature_factor = 1.0
+
+            # Set phase offset if specified
+            if phase_offset is not None:
+                self.pyrpl.rp.iq0.phase = phase_offset
+                self.logger.info(f"IQ0 phase offset set to {phase_offset:.2f} degrees")
 
             self.pyrpl.rp.lockin.ref_select1 = "sin_shifted"
             self.pyrpl.rp.lockin.ref_select2 = "cos_shifted"
@@ -301,6 +309,30 @@ class RedPitayaIFSource(IFSourceBase):
 
         except Exception as e:
             self.logger.error(f"Failed to set FM modulation frequency: {e}")
+            raise
+
+    def set_iq_phase_offset(self, phase_offset: float) -> None:
+        """
+        Set the IQ demodulation phase offset (iq0.phase).
+
+        Parameters:
+        -----------
+        phase_offset : float
+            Phase offset in degrees. Adjust to maximize 1f signal on ODMR resonance slope.
+        """
+        if not self._is_connected:
+            raise RuntimeError("Red Pitaya not connected")
+
+        try:
+            self.pyrpl.rp.iq0.phase = phase_offset
+            self.logger.info(f"IQ0 phase offset set to {phase_offset:.2f} degrees")
+
+            # Update current config if it exists
+            if self._current_config:
+                self._current_config.iq_phase_offset = phase_offset
+
+        except Exception as e:
+            self.logger.error(f"Failed to set IQ phase offset: {e}")
             raise
 
     def configure_signal(self, config: IQDeviceConfig) -> None:
@@ -330,9 +362,12 @@ class RedPitayaIFSource(IFSourceBase):
         # Set DC offsets (averaged across all active components)
         self.set_dc_offsets(config.dc_offset_i, config.dc_offset_q)
 
-        # Set FM modulation frequency if specified
+        # Set FM modulation frequency if specified (also sets IQ phase offset if provided)
         if config.fm_modulation_frequency is not None:
-            self.set_fm_modulation_frequency(config.fm_modulation_frequency)
+            self.set_fm_modulation_frequency(config.fm_modulation_frequency, config.iq_phase_offset)
+        elif config.iq_phase_offset is not None:
+            # Set phase offset even without FM modulation frequency
+            self.set_iq_phase_offset(config.iq_phase_offset)
 
         self._current_config = config
         self.logger.debug("Signal configured")

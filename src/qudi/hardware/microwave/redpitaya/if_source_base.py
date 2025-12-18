@@ -112,6 +112,7 @@ class IQDeviceConfig:
     dc_offset_i: float = 0.0  # V
     dc_offset_q: float = 0.0  # V
     fm_modulation_frequency: Optional[float] = None  # Hz - shared for all components
+    iq_phase_offset: Optional[float] = None  # degrees - IQ demodulation phase offset
 
     @property
     def num_components(self) -> int:
