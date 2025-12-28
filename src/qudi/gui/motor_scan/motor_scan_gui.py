@@ -74,6 +74,17 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         
         self.toolbar.addSeparator()
         
+        # Home stages action
+        self.action_home_stages = QtWidgets.QAction('Home Stages', self)
+        self.action_home_stages.setToolTip(
+            'Home (calibrate) the motor stages.\n'
+            'Moves stages to home position and establishes zero reference.\n'
+            'Cannot be used during a scan.'
+        )
+        self.toolbar.addAction(self.action_home_stages)
+        
+        self.toolbar.addSeparator()
+        
         # Save action
         self.action_save = QtWidgets.QAction('Save Data', self)
         save_icon = QtGui.QIcon(os.path.join(icon_path, 'icons', 'document-save.svg'))
@@ -258,11 +269,13 @@ class MotorScanGui(GuiBase):
         self._logic.sigScanSettingsChanged.connect(self._on_settings_changed)
         self._logic.sigScanCompleted.connect(self._on_scan_completed)
         self._logic.sigSaveStateChanged.connect(self._on_save_state_changed)
+        self._logic.sigHomingStateChanged.connect(self._on_homing_state_changed)
         
         # Connect GUI signals
         self._mw.action_start_scan.triggered.connect(self._toggle_scan)
         self._mw.action_pause_scan.triggered.connect(self._toggle_pause)
         self._mw.action_save.triggered.connect(self._save_data)
+        self._mw.action_home_stages.triggered.connect(self._home_stages)
         self._mw.apply_settings_button.clicked.connect(self._apply_settings)
         self._mw.mode_combo.currentTextChanged.connect(self._mode_changed)
         self._mw.pattern_combo.currentTextChanged.connect(self._pattern_changed)
@@ -283,6 +296,7 @@ class MotorScanGui(GuiBase):
         self._logic.sigScanSettingsChanged.disconnect(self._on_settings_changed)
         self._logic.sigScanCompleted.disconnect(self._on_scan_completed)
         self._logic.sigSaveStateChanged.disconnect(self._on_save_state_changed)
+        self._logic.sigHomingStateChanged.disconnect(self._on_homing_state_changed)
         
         # Close window
         if self._mw is not None:
@@ -388,6 +402,30 @@ class MotorScanGui(GuiBase):
         nametag = self._mw.save_nametag_lineedit.text()
         self._logic.save_scan_data(nametag if nametag else None)
     
+    def _home_stages(self):
+        """Home (calibrate) the motor stages."""
+        # Confirm with user since homing takes time
+        reply = QtWidgets.QMessageBox.question(
+            self._mw,
+            'Home Stages',
+            'This will home (calibrate) all motor stages.\n'
+            'The stages will move to their home position.\n\n'
+            'Continue?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            self._mw.scan_status_label.setText('Homing...')
+            self._mw.action_home_stages.setEnabled(False)
+            # Use QTimer.singleShot to call on next event loop iteration
+            # This ensures the GUI updates before the blocking call
+            QtCore.QTimer.singleShot(100, self._do_home_stages)
+    
+    def _do_home_stages(self):
+        """Actually perform the homing (called after GUI update)."""
+        self._logic.home_stages()
+    
     def _mode_changed(self, mode_text: str):
         """Handle scan mode change."""
         self._logic.set_scan_mode(mode_text)
@@ -420,7 +458,7 @@ class MotorScanGui(GuiBase):
         self._mw.action_pause_scan.setChecked(is_paused)
         self._mw.action_pause_scan.setEnabled(is_running)
         
-        # Disable settings during scan
+        # Disable settings and home button during scan
         self._mw.x_start_spinbox.setEnabled(not is_running)
         self._mw.x_stop_spinbox.setEnabled(not is_running)
         self._mw.y_start_spinbox.setEnabled(not is_running)
@@ -430,6 +468,7 @@ class MotorScanGui(GuiBase):
         self._mw.mode_combo.setEnabled(not is_running)
         self._mw.pattern_combo.setEnabled(not is_running)
         self._mw.apply_settings_button.setEnabled(not is_running)
+        self._mw.action_home_stages.setEnabled(not is_running)
         
         # Update status
         self._mw.scan_status_label.setText(state.name)
@@ -464,6 +503,15 @@ class MotorScanGui(GuiBase):
             self._mw.scan_status_label.setText('Saving...')
         else:
             self._mw.scan_status_label.setText('Save complete')
+    
+    def _on_homing_state_changed(self, is_homing: bool):
+        """Handle homing state change from logic."""
+        self._mw.action_home_stages.setEnabled(not is_homing)
+        self._mw.action_start_scan.setEnabled(not is_homing)
+        if is_homing:
+            self._mw.scan_status_label.setText('Homing...')
+        else:
+            self._mw.scan_status_label.setText('Homing complete')
     
     def _update_display(self):
         """Update the scan image display."""

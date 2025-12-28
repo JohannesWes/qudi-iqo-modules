@@ -497,7 +497,8 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         Calibrate (home) the stage.
 
         Homing moves stage(s) to home position (negative limit switch)
-        and establishes the zero reference.
+        and establishes the zero reference. After homing, the stage stays
+        at the home offset position (typically ~1mm from the limit).
 
         Args:
             param_list: Optional list of axis labels to home. If None, homes all.
@@ -507,24 +508,47 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         """
         try:
             axes_to_home = param_list if param_list is not None else list(self._stages.keys())
-
             self.log.info(f"Homing axes: {axes_to_home}")
 
-            # Start homing on all requested axes (async)
             for axis_label in axes_to_home:
-                if axis_label in self._stages:
-                    self._stages[axis_label].home(sync=False)
-
-            # Wait for completion
-            timeout = 60.0  # seconds
-            for axis_label in axes_to_home:
-                if axis_label in self._stages:
-                    try:
-                        self._stages[axis_label].wait_for_home(timeout=timeout)
-                        self.log.info(f"{axis_label}-axis homed.")
-                    except Exception as e:
-                        self.log.error(f"Homing {axis_label} failed: {e}")
-                        return -1
+                if axis_label not in self._stages:
+                    self.log.warning(f"Axis {axis_label} not found")
+                    continue
+                    
+                stage = self._stages[axis_label]
+                pos_before = stage.get_position()
+                self.log.info(f"Homing {axis_label}-axis (from {pos_before*1000:.1f}mm)...")
+                
+                # Use force=True to ensure homing happens even if device thinks it's already homed
+                try:
+                    stage.home(sync=False, force=True)
+                except Exception as e:
+                    self.log.error(f"Failed to start homing on {axis_label}-axis: {e}")
+                    return -1
+                
+                time.sleep(1.0)
+                
+                # Poll until movement stops (timeout 120 seconds)
+                timeout = 120.0
+                start_time = time.time()
+                last_log_time = 0
+                
+                while time.time() - start_time < timeout:
+                    if not stage.is_moving():
+                        break
+                    elapsed = time.time() - start_time
+                    if elapsed - last_log_time >= 10:
+                        pos_now = stage.get_position()
+                        self.log.info(f"{axis_label}-axis homing... {pos_now*1000:.1f}mm, {elapsed:.0f}s")
+                        last_log_time = elapsed
+                    time.sleep(0.5)
+                else:
+                    self.log.error(f"{axis_label}-axis homing timed out after {timeout}s")
+                    return -1
+                
+                pos_after = stage.get_position()
+                elapsed = time.time() - start_time
+                self.log.info(f"{axis_label}-axis homed in {elapsed:.1f}s (position: {pos_after*1000:.1f}mm)")
 
             self._is_homed = True
             self.sigHomingComplete.emit()
@@ -532,7 +556,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             return 0
 
         except Exception as e:
-            self.log.error(f"Calibration failed: {e}")
+            self.log.error(f"Calibration failed: {e}", exc_info=True)
             return -1
 
     def get_velocity(self, param_list: Optional[List[str]] = None) -> Dict[str, float]:
@@ -638,8 +662,12 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         start_time = time.time()
         while time.time() - start_time < timeout:
             if not self.is_moving():
-                self.sigMovementFinished.emit()
-                return True
+                # Add small settling time to ensure position is stable
+                time.sleep(0.05)
+                # Double-check not moving after settling
+                if not self.is_moving():
+                    self.sigMovementFinished.emit()
+                    return True
             time.sleep(0.01)  # 10ms poll interval
 
         self.log.warning(f"wait_for_idle timed out after {timeout}s")
@@ -648,14 +676,16 @@ class ThorlabsKDC101Kinesis(MotorInterface):
     def move_abs_sync(
         self,
         param_dict: Dict[str, float],
-        timeout: float = 30.0
+        timeout: float = 30.0,
+        position_tolerance: float = 50e-6  # 50 µm tolerance
     ) -> int:
         """
-        Move to absolute position and wait for completion.
+        Move to absolute position and wait for completion with position verification.
 
         Args:
             param_dict: Dictionary with axis labels and absolute positions.
             timeout: Maximum time to wait for completion.
+            position_tolerance: Acceptable position error in meters (default 50 µm).
 
         Returns:
             int: Error code (0: OK, -1: error)
@@ -665,10 +695,24 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             return result
 
         if not self.wait_for_idle(timeout):
+            self.log.error("Movement timed out")
             return -1
 
+        # Verify positions reached target
+        actual_pos = self.get_pos()
+        for axis_label, target_pos in param_dict.items():
+            if axis_label in actual_pos:
+                actual = actual_pos[axis_label]
+                error = abs(actual - target_pos)
+                if error > position_tolerance:
+                    self.log.warning(
+                        f"{axis_label}-axis position error: target={target_pos*1000:.3f}mm, "
+                        f"actual={actual*1000:.3f}mm, error={error*1000:.3f}mm"
+                    )
+                    # Don't return error - just warn. The stage may have hit a limit.
+
         # Emit position update
-        self.sigPositionChanged.emit(self.get_pos())
+        self.sigPositionChanged.emit(actual_pos)
         return 0
 
     def move_rel_sync(

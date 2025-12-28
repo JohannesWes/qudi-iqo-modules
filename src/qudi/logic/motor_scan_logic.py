@@ -38,6 +38,8 @@ Example config:
 """
 
 import time
+import os
+import sys
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
@@ -55,6 +57,12 @@ from qudi.core.statusvariable import StatusVar
 from qudi.util.mutex import RecursiveMutex
 from qudi.util.datastorage import TextDataStorage
 from qudi.util.units import ScaledFloat
+
+# Add qudi-core root to path to find my_software (same as sensitivity_sweep_logic)
+# Get path to qudi-core root (3 levels up from this file)
+qudi_core_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+if qudi_core_root not in sys.path:
+    sys.path.insert(0, qudi_core_root)
 
 
 class ScanMode(Enum):
@@ -129,6 +137,8 @@ class MotorScanData:
     odmr_signal_data: Optional[Dict[str, np.ndarray]] = None  # channel -> 3D (ny, nx, n_freq)
     # Fit results per grid point
     odmr_fit_results: Optional[List[List[Dict]]] = None  # 2D list of fit result dicts
+    # Raw ODMR data per pixel (for saving individual scans)
+    odmr_raw_per_pixel: Optional[List[Dict]] = None  # List of dicts with 'frequency', 'signal' per point
     
     # Derived quantities for display (computed from fits)
     center_frequency: Optional[np.ndarray] = None  # 2D array (ny, nx)
@@ -303,6 +313,8 @@ class MotorScanData:
             self.fit_quality = np.full(shape_2d, np.nan)
             self.odmr_fit_results = [[None for _ in range(shape_2d[-1])] 
                                      for _ in range(shape_2d[0] if self.is_2d else 1)]
+            # Initialize storage for raw ODMR data per pixel
+            self.odmr_raw_per_pixel = [None for _ in range(self.total_points)]
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for saving."""
@@ -454,6 +466,32 @@ class MotorScanLogic(LogicBase):
         name='save_thumbnails',
         default=True
     )
+    # Fit parameters (matching sensitivity_sweep_logic defaults)
+    _fit_feature_prominence = ConfigOption(
+        name='fit_feature_prominence',
+        default=0.02,
+        missing='info'
+    )
+    _fit_n_most_prominent_peaks = ConfigOption(
+        name='fit_n_most_prominent_peaks',
+        default=5,
+        missing='info'
+    )
+    _fit_min_feature_height = ConfigOption(
+        name='fit_min_feature_height',
+        default=0.02,
+        missing='info'
+    )
+    _save_odmr_fit_plots = ConfigOption(
+        name='save_odmr_fit_plots',
+        default=True,
+        missing='info'
+    )
+    _home_before_scan = ConfigOption(
+        name='home_before_scan',
+        default=False,
+        missing='info'
+    )
     
     # Status variables (persistent across sessions)
     _scan_ranges = StatusVar(
@@ -475,6 +513,7 @@ class MotorScanLogic(LogicBase):
     sigPositionUpdated = QtCore.Signal(dict)  # current position dict
     sigScanSettingsChanged = QtCore.Signal(dict)
     sigSaveStateChanged = QtCore.Signal(bool)  # True when saving, False when done
+    sigHomingStateChanged = QtCore.Signal(bool)  # True when homing, False when done
     
     # Internal signal for scan loop
     _sigNextPoint = QtCore.Signal()
@@ -505,6 +544,9 @@ class MotorScanLogic(LogicBase):
 
         # Fit function reference (loaded dynamically)
         self._fit_function = None
+        
+        # Current scan folder for saving fit plots
+        self._current_scan_folder = None
         
         # Time series streaming state
         self._ts_we_started = False  # True if we started the time series reader
@@ -854,6 +896,50 @@ class MotorScanLogic(LogicBase):
         if pos:
             self.sigPositionUpdated.emit(pos)
     
+    @QtCore.Slot()
+    def home_stages(self, axes: List[str] = None):
+        """
+        Home (calibrate) the motor stages.
+        
+        Moves all stages to their home position and establishes zero reference.
+        Cannot be called during a scan.
+        
+        Args:
+            axes: Optional list of axes to home. If None, homes all available axes.
+        """
+        with self._thread_lock:
+            if self.is_scanning:
+                self.log.error("Cannot home stages during a scan.")
+                return
+            
+            motor = self._motor_hardware()
+            if motor is None:
+                self.log.error("Motor hardware not available.")
+                return
+            
+            if axes is None:
+                axes = self.available_axes
+            
+            self.log.info(f"Homing stages: {axes}")
+            self.sigHomingStateChanged.emit(True)
+            start_time = time.time()
+            
+            try:
+                result = motor.calibrate(list(axes) if axes else None)
+                elapsed = time.time() - start_time
+                
+                if result == 0:
+                    self.log.info(f"Homing completed in {elapsed:.1f}s")
+                else:
+                    self.log.warning(f"Homing returned error code: {result}")
+                
+                self.sigPositionUpdated.emit(self.current_position)
+                
+            except Exception as e:
+                self.log.error(f"Homing failed: {e}", exc_info=True)
+            finally:
+                self.sigHomingStateChanged.emit(False)
+    
     # =========================================================================
     # Scan Control Methods  
     # =========================================================================
@@ -862,6 +948,9 @@ class MotorScanLogic(LogicBase):
     def start_scan(self, axes: List[str] = None):
         """
         Start a new scan.
+        
+        If home_before_scan is enabled, homes the stages before starting the scan
+        to ensure accurate positioning.
         
         Args:
             axes: List of axes to scan. Defaults to ['x', 'y'] or ['x'] based on config.
@@ -879,6 +968,22 @@ class MotorScanLogic(LogicBase):
             for axis in axes:
                 if axis not in self._scan_ranges:
                     self.log.error(f"Axis '{axis}' not configured. Available: {list(self._scan_ranges.keys())}")
+                    return
+            
+            # Home stages before scan if configured
+            if self._home_before_scan:
+                self.log.info("Homing stages before scan...")
+                motor = self._motor_hardware()
+                if motor is not None:
+                    try:
+                        result = motor.calibrate(axes)
+                        if result != 0:
+                            self.log.warning(f"Homing returned error code {result}. Proceeding anyway.")
+                    except Exception as e:
+                        self.log.error(f"Homing failed: {e}. Aborting scan.")
+                        return
+                else:
+                    self.log.error("Motor hardware not available. Aborting scan.")
                     return
             
             # Determine scan mode
@@ -927,19 +1032,27 @@ class MotorScanLogic(LogicBase):
                 if ts_already_running:
                     # Time series already running - just connect to its signals
                     self._ts_we_started = False
-                    self.log.info(f"Time series reader already running. Subscribing to data stream "
-                                  f"with channels: {channel_names}")
                 else:
                     # Start the time series reader ourselves
                     self._ts_we_started = True
                     if ts_logic is not None:
                         ts_logic.start_reading()
-                        self.log.info(f"Started time series reader with channels: {channel_names}")
                 
                 # Connect to sigNewRawData for non-blocking data reception
                 self._connect_time_series_signals()
+                self._current_scan_folder = None  # Will be set on save
             else:
                 self._scan_data.initialize_data_arrays()
+                # Create scan folder now for STEP_ODMR mode so fit plots can be saved during scan
+                if self._save_odmr_fit_plots:
+                    timestamp = datetime.datetime.now()
+                    timestamp_str = timestamp.strftime('%Y%m%d-%H%M-%S')
+                    nametag = f'motor_scan_{mode.name}'
+                    scan_folder_name = f'{timestamp_str}_{nametag}'
+                    self._current_scan_folder = os.path.join(self.module_default_data_dir, scan_folder_name)
+                    os.makedirs(self._current_scan_folder, exist_ok=True)
+                else:
+                    self._current_scan_folder = None
             
             # Set state
             self._stop_requested = False
@@ -1044,11 +1157,46 @@ class MotorScanLogic(LogicBase):
                 is_moving = any(v != 0 for v in status.values())
 
             if is_moving:
-                # Still moving, continue polling
                 self._motor_poll_timer.start(50)
                 return
 
-            # Motor has stopped - proceed based on scan mode
+            # Verify position is within tolerance of target
+            if hasattr(motor, 'get_pos'):
+                actual_pos = motor.get_pos()
+                position_tolerance = 100e-6  # 100 µm
+                
+                position_ok = all(
+                    abs(actual_pos.get(axis, 0) - target) <= position_tolerance
+                    for axis, target in self._current_pos_dict.items()
+                )
+                
+                if not position_ok:
+                    # Wait up to 2 seconds for position to settle
+                    if not hasattr(self, '_position_settle_start'):
+                        self._position_settle_start = time.time()
+                    
+                    if time.time() - self._position_settle_start < 2.0:
+                        self._motor_poll_timer.start(100)
+                        return
+                    else:
+                        # Timeout - log warning
+                        for axis, target in self._current_pos_dict.items():
+                            error = abs(actual_pos.get(axis, 0) - target)
+                            if error > position_tolerance:
+                                self.log.warning(
+                                    f"Position error on {axis}: target={target*1000:.2f}mm, "
+                                    f"actual={actual_pos.get(axis, 0)*1000:.2f}mm"
+                                )
+                
+                if hasattr(self, '_position_settle_start'):
+                    delattr(self, '_position_settle_start')
+                
+                # Log position at measurement point
+                point_idx = self._scan_data.current_point_index
+                total_points = len(self._scan_data.target_positions)
+                pos_str = ", ".join(f"{a}={actual_pos.get(a, 0)*1000:.2f}" for a in self._current_pos_dict)
+                self.log.info(f"Point {point_idx+1}/{total_points} at ({pos_str})mm")
+            
             self._waiting_for_motor = False
 
             if self._scan_data.scan_mode == ScanMode.STEP_ODMR:
@@ -1107,7 +1255,7 @@ class MotorScanLogic(LogicBase):
             self._advance_to_next_point(result)
 
     def _process_odmr_results(self) -> Dict:
-        """Process ODMR scan results and extract data."""
+        """Process ODMR scan results and extract data using fit_hyperfine."""
         odmr = self._odmr_logic()
         motor = self._motor_hardware()
         point_idx = self._current_point_idx
@@ -1132,6 +1280,13 @@ class MotorScanLogic(LogicBase):
             'fit_result': None,
         }
 
+        # Get grid index for filename
+        grid_idx = self._scan_data.point_index_to_grid_index(point_idx)
+        if len(grid_idx) == 2:
+            pixel_tag = f'pixel_x{grid_idx[0]:03d}_y{grid_idx[1]:03d}'
+        else:
+            pixel_tag = f'pixel_{point_idx:04d}'
+
         # Perform fitting if we have data and fit function
         if self._fit_function is not None and len(frequency_data) > 0:
             try:
@@ -1140,42 +1295,65 @@ class MotorScanLogic(LogicBase):
                     channel_data = signal_data[channel_name]
 
                     if isinstance(channel_data, list) and len(channel_data) > 0:
-                        voltage_data = channel_data[0]
-                        freq_data = frequency_data[0] if isinstance(frequency_data, list) else frequency_data
+                        voltage_data = np.array(channel_data[0])
+                        freq_data = np.array(frequency_data[0]) if isinstance(frequency_data, list) else np.array(frequency_data)
                     else:
-                        voltage_data = channel_data
-                        freq_data = frequency_data
+                        voltage_data = np.array(channel_data)
+                        freq_data = np.array(frequency_data)
 
+                    # Determine if we should save fit plots
+                    save_plot = self._save_odmr_fit_plots and self._current_scan_folder is not None
+                    if save_plot:
+                        # Create odmr_fits subfolder if it doesn't exist
+                        fits_folder = os.path.join(self._current_scan_folder, 'odmr_fits')
+                        os.makedirs(fits_folder, exist_ok=True)
+                        fit_filename = os.path.join(fits_folder, pixel_tag)
+                    else:
+                        fit_filename = None
+
+                    # Call fit_hyperfine with same parameters as sensitivity_sweep_logic
                     fit_result = self._fit_function(
-                        frequency_array=freq_data,
-                        voltage_array=voltage_data,
-                        plot_all=False,
-                        plot_result=False
+                        freq_data,  # positional argument (like sensitivity_sweep)
+                        voltage_data,  # positional argument (like sensitivity_sweep)
+                        feature_prominence=self._fit_feature_prominence,
+                        n_most_prominent_peaks=self._fit_n_most_prominent_peaks,
+                        min_feature_height=self._fit_min_feature_height,
+                        plot_result=False,
+                        save_result_plot=save_plot,
+                        filename=fit_filename
                     )
 
-                    result['fit_result'] = fit_result
-                    result['n_features_found'] = fit_result.get('n_features_found', 0)
+                    if fit_result is not None:
+                        result['fit_result'] = fit_result
+                        result['n_features_found'] = fit_result.get('n_features_found', 0)
 
-                    zc_freqs = fit_result.get('zero_crossing_frequencies [Hz]', [])
-                    linewidths = fit_result.get('linewidths [Hz]', [])
+                        zc_freqs = fit_result.get('zero_crossing_frequencies [Hz]', [])
+                        linewidths = fit_result.get('linewidths [Hz]', [])
 
-                    if isinstance(zc_freqs, np.ndarray) and len(zc_freqs) > 0:
-                        valid_zc = zc_freqs[~np.isnan(zc_freqs)]
-                        if len(valid_zc) > 0:
-                            result['center_frequency'] = np.mean(valid_zc)
-                            if len(valid_zc) >= 2:
-                                result['splitting'] = valid_zc[-1] - valid_zc[0]
+                        if isinstance(zc_freqs, np.ndarray) and len(zc_freqs) > 0:
+                            valid_zc = zc_freqs[~np.isnan(zc_freqs)]
+                            if len(valid_zc) > 0:
+                                result['center_frequency'] = np.mean(valid_zc)
+                                if len(valid_zc) >= 2:
+                                    result['splitting'] = valid_zc[-1] - valid_zc[0]
 
-                    if isinstance(linewidths, np.ndarray) and len(linewidths) > 0:
-                        valid_lw = linewidths[~np.isnan(linewidths)]
-                        if len(valid_lw) > 0:
-                            result['linewidth'] = np.mean(valid_lw)
+                        if isinstance(linewidths, np.ndarray) and len(linewidths) > 0:
+                            valid_lw = linewidths[~np.isnan(linewidths)]
+                            if len(valid_lw) > 0:
+                                result['linewidth'] = np.mean(valid_lw)
+                        
+                        self.log.debug(f"Point {point_idx}: center_freq={result['center_frequency']/1e9:.6f} GHz, "
+                                      f"linewidth={result['linewidth']/1e3:.1f} kHz, "
+                                      f"n_features={result['n_features_found']}")
+                    else:
+                        self.log.warning(f"Fit returned None at point {point_idx}")
 
             except Exception as e:
                 self.log.warning(f"Fitting failed at point {point_idx}: {e}")
 
         # Fallback: extract basic stats from raw ODMR data if no fitting available
         if np.isnan(result['center_frequency']) and len(frequency_data) > 0 and signal_data:
+            self.log.debug(f"Using fallback extraction for point {point_idx}")
             try:
                 channel_name = list(signal_data.keys())[0]
                 channel_data = signal_data[channel_name]
@@ -1208,7 +1386,6 @@ class MotorScanLogic(LogicBase):
                 self.log.debug(f"Fallback extraction failed: {e}")
 
         # Update grid data
-        grid_idx = self._scan_data.point_index_to_grid_index(point_idx)
         if self._scan_data.is_2d:
             self._scan_data.center_frequency[grid_idx] = result['center_frequency']
             self._scan_data.linewidth[grid_idx] = result['linewidth']
@@ -1220,6 +1397,37 @@ class MotorScanLogic(LogicBase):
             self._scan_data.linewidth[grid_idx[0]] = result['linewidth']
             self._scan_data.splitting[grid_idx[0]] = result['splitting']
             self._scan_data.fit_quality[grid_idx[0]] = result['n_features_found']
+
+        # Store raw ODMR data for this pixel (for later saving)
+        if self._scan_data.odmr_raw_per_pixel is not None:
+            try:
+                # Extract and store raw ODMR frequency and signal data
+                raw_odmr_dict = {
+                    'target_position': position.copy(),
+                    'actual_position': actual_pos.copy(),
+                    'grid_index': grid_idx,
+                    'frequency_data': None,
+                    'signal_data': {},
+                }
+                
+                if len(frequency_data) > 0:
+                    # Store frequency data (handle list vs array)
+                    if isinstance(frequency_data, list) and len(frequency_data) > 0:
+                        raw_odmr_dict['frequency_data'] = np.array(frequency_data[0])
+                    else:
+                        raw_odmr_dict['frequency_data'] = np.array(frequency_data)
+                
+                if signal_data:
+                    for ch_name, ch_data in signal_data.items():
+                        if isinstance(ch_data, list) and len(ch_data) > 0:
+                            raw_odmr_dict['signal_data'][ch_name] = np.array(ch_data[0])
+                        else:
+                            raw_odmr_dict['signal_data'][ch_name] = np.array(ch_data)
+                
+                self._scan_data.odmr_raw_per_pixel[point_idx] = raw_odmr_dict
+                
+            except Exception as e:
+                self.log.debug(f"Failed to store raw ODMR data for point {point_idx}: {e}")
 
         return result
 
@@ -1332,7 +1540,6 @@ class MotorScanLogic(LogicBase):
         """
         # Clean up time series connection (CONTINUOUS_STREAM mode)
         if self._scan_data.scan_mode == ScanMode.CONTINUOUS_STREAM:
-            # Disconnect from sigNewRawData signal
             self._disconnect_time_series_signals()
             
             # Only stop time series reader if WE started it
@@ -1341,13 +1548,9 @@ class MotorScanLogic(LogicBase):
                 if ts_logic is not None and hasattr(ts_logic, 'stop_reading'):
                     try:
                         ts_logic.stop_reading()
-                        self.log.info("Stopped time series reader (we started it).")
-                    except Exception as e:
-                        self.log.debug(f"Error stopping time series reader: {e}")
-            else:
-                self.log.info("Time series reader left running (was already running before scan).")
+                    except Exception:
+                        pass
             
-            # Clear the raw data buffer
             self._ts_raw_data_buffer = {}
             self._ts_we_started = False
 
@@ -1380,8 +1583,21 @@ class MotorScanLogic(LogicBase):
         """
         Save current scan data to file.
         
+        Creates a dedicated folder for each XY scan containing all data files
+        and subfolders (e.g., raw ODMR data per pixel).
+        
+        Folder structure:
+            <module_data_dir>/YYYYMMDD-HHMM-SS_tag_motor_scan_MODE/
+                center_frequency.dat
+                center_frequency.pdf
+                linewidth.dat
+                ...
+                odmr_raw_per_pixel/
+                    pixel_x000_y000_odmr.dat
+                    ...
+        
         Args:
-            tag: Optional tag to include in filename.
+            tag: Optional tag to include in folder name.
         """
         with self._thread_lock:
             if self._scan_data is None:
@@ -1397,9 +1613,45 @@ class MotorScanLogic(LogicBase):
             
             try:
                 timestamp = datetime.datetime.now()
+                timestamp_str = timestamp.strftime('%Y%m%d-%H%M-%S')
                 
-                # Create storage
-                data_storage = TextDataStorage(root_dir=self.module_default_data_dir)
+                # Use existing scan folder if available (created during scan for fit plots)
+                # Otherwise create a new one
+                if self._current_scan_folder is not None and os.path.isdir(self._current_scan_folder):
+                    scan_folder = self._current_scan_folder
+                    # Optionally rename to include tag
+                    if tag:
+                        old_folder = scan_folder
+                        parent_dir = os.path.dirname(scan_folder)
+                        old_name = os.path.basename(scan_folder)
+                        # Insert tag after timestamp
+                        parts = old_name.split('_', 1)
+                        if len(parts) == 2:
+                            new_name = f'{parts[0]}_{tag}_{parts[1]}'
+                        else:
+                            new_name = f'{old_name}_{tag}'
+                        scan_folder = os.path.join(parent_dir, new_name)
+                        if old_folder != scan_folder:
+                            try:
+                                os.rename(old_folder, scan_folder)
+                                self._current_scan_folder = scan_folder
+                            except OSError:
+                                # If rename fails, use original folder
+                                scan_folder = old_folder
+                else:
+                    # Build folder name following qudi convention: YYYYMMDD-HHMM-SS_nametag
+                    nametag = f'{tag}_' if tag else ''
+                    nametag += f'motor_scan_{self._scan_data.scan_mode.name}'
+                    scan_folder_name = f'{timestamp_str}_{nametag}'
+                    
+                    # Create scan folder inside module_default_data_dir
+                    scan_folder = os.path.join(self.module_default_data_dir, scan_folder_name)
+                    os.makedirs(scan_folder, exist_ok=True)
+                
+                self.log.info(f"Saving scan data to {scan_folder}")
+                
+                # Create storage pointing to the scan folder
+                data_storage = TextDataStorage(root_dir=scan_folder)
                 
                 # Prepare metadata
                 metadata = {
@@ -1420,25 +1672,20 @@ class MotorScanLogic(LogicBase):
                     metadata[f'{axis} axis max'] = self._scan_data.scan_range[i][1]
                     metadata[f'{axis} axis resolution'] = self._scan_data.scan_resolution[i]
                 
-                # Save based on mode
-                nametag = f'{tag}_' if tag else ''
-                nametag += f'motor_scan_{self._scan_data.scan_mode.name}'
-                
                 file_path = None
                 
                 if self._scan_data.scan_mode == ScanMode.CONTINUOUS_STREAM:
                     # Save streaming data - one file per channel
                     if self._scan_data.stream_data_mean:
                         for channel, data in self._scan_data.stream_data_mean.items():
-                            channel_tag = f'{nametag}_{channel}'
                             file_path, _, _ = data_storage.save_data(
                                 data,
                                 metadata=metadata,
-                                nametag=channel_tag,
+                                nametag=channel,
                                 timestamp=timestamp,
-                                column_headers=f'{channel} data (columns is X, rows is Y)'
+                                column_headers=f'{channel} data (columns is X, rows is Y)',
+                                use_timestamp=False
                             )
-                            self.log.info(f"Channel '{channel}' data saved to: {file_path}")
                             
                             # Save thumbnail if configured
                             if self._save_thumbnails and file_path:
@@ -1446,7 +1693,6 @@ class MotorScanLogic(LogicBase):
                                 fig_path = file_path.rsplit('.', 1)[0]
                                 data_storage.save_thumbnail(fig, file_path=fig_path)
                                 plt.close(fig)
-                                self.log.info(f"Thumbnail saved for channel '{channel}'")
                     else:
                         self.log.warning("No stream data to save.")
                         
@@ -1456,13 +1702,12 @@ class MotorScanLogic(LogicBase):
                         file_path, _, _ = data_storage.save_data(
                             self._scan_data.center_frequency,
                             metadata=metadata,
-                            nametag=f'{nametag}_center_frequency',
+                            nametag='center_frequency',
                             timestamp=timestamp,
-                            column_headers='Center Frequency (Hz) (columns is X, rows is Y)'
+                            column_headers='Center Frequency (Hz) (columns is X, rows is Y)',
+                            use_timestamp=False
                         )
-                        self.log.info(f"Center frequency data saved to: {file_path}")
                         
-                        # Save thumbnail if configured
                         if self._save_thumbnails and file_path:
                             fig = self._draw_figure(
                                 self._scan_data.center_frequency, 
@@ -1472,19 +1717,17 @@ class MotorScanLogic(LogicBase):
                             fig_path = file_path.rsplit('.', 1)[0]
                             data_storage.save_thumbnail(fig, file_path=fig_path)
                             plt.close(fig)
-                            self.log.info(f"Thumbnail saved for center frequency")
                         
                     if self._scan_data.linewidth is not None:
                         file_path, _, _ = data_storage.save_data(
                             self._scan_data.linewidth,
                             metadata=metadata,
-                            nametag=f'{nametag}_linewidth',
+                            nametag='linewidth',
                             timestamp=timestamp,
-                            column_headers='Linewidth (Hz) (columns is X, rows is Y)'
+                            column_headers='Linewidth (Hz) (columns is X, rows is Y)',
+                            use_timestamp=False
                         )
-                        self.log.info(f"Linewidth data saved to: {file_path}")
                         
-                        # Save thumbnail if configured
                         if self._save_thumbnails and file_path:
                             fig = self._draw_figure(
                                 self._scan_data.linewidth,
@@ -1494,19 +1737,17 @@ class MotorScanLogic(LogicBase):
                             fig_path = file_path.rsplit('.', 1)[0]
                             data_storage.save_thumbnail(fig, file_path=fig_path)
                             plt.close(fig)
-                            self.log.info(f"Thumbnail saved for linewidth")
                         
                     if self._scan_data.splitting is not None:
                         file_path, _, _ = data_storage.save_data(
                             self._scan_data.splitting,
                             metadata=metadata,
-                            nametag=f'{nametag}_splitting',
+                            nametag='splitting',
                             timestamp=timestamp,
-                            column_headers='Splitting (Hz) (columns is X, rows is Y)'
+                            column_headers='Splitting (Hz) (columns is X, rows is Y)',
+                            use_timestamp=False
                         )
-                        self.log.info(f"Splitting data saved to: {file_path}")
                         
-                        # Save thumbnail if configured
                         if self._save_thumbnails and file_path:
                             fig = self._draw_figure(
                                 self._scan_data.splitting,
@@ -1516,19 +1757,17 @@ class MotorScanLogic(LogicBase):
                             fig_path = file_path.rsplit('.', 1)[0]
                             data_storage.save_thumbnail(fig, file_path=fig_path)
                             plt.close(fig)
-                            self.log.info(f"Thumbnail saved for splitting")
                         
                     if self._scan_data.fit_quality is not None:
                         file_path, _, _ = data_storage.save_data(
                             self._scan_data.fit_quality,
                             metadata=metadata,
-                            nametag=f'{nametag}_fit_quality',
+                            nametag='fit_quality',
                             timestamp=timestamp,
-                            column_headers='Fit Quality (columns is X, rows is Y)'
+                            column_headers='Fit Quality (columns is X, rows is Y)',
+                            use_timestamp=False
                         )
-                        self.log.info(f"Fit quality data saved to: {file_path}")
                         
-                        # Save thumbnail if configured
                         if self._save_thumbnails and file_path:
                             fig = self._draw_figure(
                                 self._scan_data.fit_quality,
@@ -1538,10 +1777,16 @@ class MotorScanLogic(LogicBase):
                             fig_path = file_path.rsplit('.', 1)[0]
                             data_storage.save_thumbnail(fig, file_path=fig_path)
                             plt.close(fig)
-                            self.log.info(f"Thumbnail saved for fit quality")
                     
-                if file_path:
-                    self.log.info(f"Scan data saved successfully.")
+                    # Save raw ODMR scans per pixel in a subfolder
+                    if self._scan_data.odmr_raw_per_pixel is not None:
+                        self._save_odmr_raw_per_pixel(
+                            scan_folder, 
+                            timestamp, 
+                            metadata
+                        )
+                    
+                self.log.info(f"Scan data saved to: {scan_folder}")
                     
             finally:
                 self.module_state.unlock()
@@ -1676,3 +1921,95 @@ class MotorScanLogic(LogicBase):
             lines.append(f"Duration: {self._scan_data.scan_duration:.1f}s")
         
         return '\n'.join(lines)
+    
+    def _save_odmr_raw_per_pixel(
+        self, 
+        scan_folder: str, 
+        timestamp: datetime.datetime,
+        metadata: Dict
+    ):
+        """
+        Save raw ODMR scans for each pixel in a subfolder.
+        
+        Creates a subfolder 'odmr_raw_per_pixel' inside the scan folder containing
+        individual ODMR data files for each pixel, enabling detailed post-analysis.
+        
+        Args:
+            scan_folder: Path to the main scan folder
+            timestamp: Timestamp of the save operation
+            metadata: Base metadata dict
+        """
+        if self._scan_data is None or self._scan_data.odmr_raw_per_pixel is None:
+            return
+        
+        # Count how many pixels have data
+        valid_pixels = [p for p in self._scan_data.odmr_raw_per_pixel if p is not None]
+        if not valid_pixels:
+            return
+        
+        try:
+            # Create subfolder inside the scan folder
+            odmr_subfolder = os.path.join(scan_folder, 'odmr_raw_per_pixel')
+            os.makedirs(odmr_subfolder, exist_ok=True)
+            
+            for point_idx, pixel_data in enumerate(self._scan_data.odmr_raw_per_pixel):
+                if pixel_data is None:
+                    continue
+                
+                grid_idx = pixel_data.get('grid_index', (point_idx,))
+                target_pos = pixel_data.get('target_position', {})
+                actual_pos = pixel_data.get('actual_position', {})
+                freq_data = pixel_data.get('frequency_data')
+                signal_data = pixel_data.get('signal_data', {})
+                
+                if freq_data is None or len(signal_data) == 0:
+                    continue
+                
+                # Create pixel-specific metadata
+                pixel_metadata = metadata.copy()
+                pixel_metadata['Pixel Index'] = point_idx
+                pixel_metadata['Grid Index'] = str(grid_idx)
+                for axis, val in target_pos.items():
+                    pixel_metadata[f'Target {axis} (m)'] = val
+                for axis, val in actual_pos.items():
+                    pixel_metadata[f'Actual {axis} (m)'] = val
+                
+                # Create filename with grid indices for easy sorting
+                if len(grid_idx) == 2:
+                    pixel_tag = f'pixel_x{grid_idx[0]:03d}_y{grid_idx[1]:03d}'
+                else:
+                    pixel_tag = f'pixel_{point_idx:04d}'
+                
+                # Build data array: frequency column + signal columns
+                n_points = len(freq_data)
+                columns = [freq_data]
+                col_headers = ['Frequency (Hz)']
+                
+                for ch_name, ch_data in signal_data.items():
+                    if len(ch_data) == n_points:
+                        columns.append(ch_data)
+                        col_headers.append(f'{ch_name} (V)')
+                
+                # Stack columns into 2D array
+                data_array = np.column_stack(columns)
+                
+                # Save to file
+                file_path = os.path.join(odmr_subfolder, f'{pixel_tag}_odmr.dat')
+                
+                # Write file manually with header
+                with open(file_path, 'w') as f:
+                    # Write metadata header
+                    f.write('# ODMR Raw Data for Motor Scan Pixel\n')
+                    f.write(f'# Saved: {timestamp.isoformat()}\n')
+                    f.write('#\n')
+                    for key, val in pixel_metadata.items():
+                        f.write(f'# {key}: {val}\n')
+                    f.write('#\n')
+                    f.write('# ' + '\t'.join(col_headers) + '\n')
+                    
+                    # Write data
+                    for row in data_array:
+                        f.write('\t'.join(f'{v:.15e}' for v in row) + '\n')
+            
+        except Exception as e:
+            self.log.error(f"Failed to save raw ODMR data per pixel: {e}")
