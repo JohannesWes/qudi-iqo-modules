@@ -87,12 +87,11 @@ class OdmrFreqLockInterface(Base):
             dict with keys:
                 - enabled (bool): Lock enabled
                 - locked (bool): Lock acquired (error < threshold)
-                - saturated (bool): Correction saturated
+                - saturated (bool): Correction saturated (any saturation)
                 - error_lsb (float): Current error signal (LSB)
                 - correction_hz (float): Current frequency correction (Hz)
                 - mu_hz_per_lsb (float): Integral gain (Hz/LSB)
-                - kp (float): Proportional gain (dimensionless, 0 if I-only)
-                - bandwidth_hz (float): Configured bandwidth (Hz)
+                - kp_hz_per_lsb (float): Proportional gain (Hz/LSB, 0 if I-only)
         """
         pass
 
