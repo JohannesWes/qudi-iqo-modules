@@ -302,22 +302,29 @@ class RedPitayaDataInStream(DataInStreamInterface):
         """
         Set streaming input source.
 
+        Can be called while streaming is active - the FPGA will switch to the new
+        input source seamlessly. There may be a brief transition in the data during
+        the switch.
+
         Args:
             input_mode: 'demod' for error signal or 'ftw_corr' for frequency correction
 
         Raises:
             ValueError: If invalid input_mode
-            RuntimeError: If stream is running
         """
         with self._thread_lock:
-            if self.module_state() == 'locked':
-                raise RuntimeError('Cannot change input while stream is running')
-
             if input_mode not in ['demod', 'ftw_corr']:
                 raise ValueError(f'Invalid input_mode: {input_mode}. Must be "demod" or "ftw_corr"')
 
             self._current_stream_input = input_mode
-            self.log.info(f'Stream input set to: {input_mode}')
+
+            # If streaming is active, update FPGA register immediately
+            # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
+            if self._running and self._scan_module is not None:
+                self._scan_module.input_select = input_mode
+                self.log.info(f'Stream input switched live to: {input_mode}')
+            else:
+                self.log.info(f'Stream input set to: {input_mode}')
 
     def configure(self,
                   active_channels: Sequence[str],

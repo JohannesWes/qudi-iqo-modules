@@ -1,69 +1,78 @@
-# Example configuration for ODMR Tracking module
+# Example configuration for ODMR Frequency Tracking module
 #
-# This file shows how to configure and use the ODMR tracking functionality.
+# This configuration shows how to set up the ODMR tracking module with
+# PyRPL-based hardware frequency locking.
+#
 # Copy the relevant sections to your actual qudi configuration file.
 
 global:
-    # Standard qudi global settings
-    startup_modules: [odmr_tracking_gui]
+    startup_modules: [odmr_tracking_gui, time_series_gui]
     remote_modules_server:
         address: 'localhost'
         port: 12345
 
 hardware:
-    # Example microwave source (replace with your actual hardware)
-    microwave_source:
-        module.Class: 'qudi.hardware.microwave.mw_source_smbv.MicrowaveSmb'
-        visa_address: 'TCPIP0::192.168.1.100::INSTR'
-        comm_timeout: 10000
+    # Red Pitaya ODMR Lock Hardware (wraps PyRPL odmr_freq_lock module)
+    redpitaya_odmr_lock:
+        module.Class: 'redpitaya.redpitaya_odmr_lock.RedPitayaOdmrLockHardware'
+        options:
+            redpitaya_config_name: 'rpy_shared_config'
+            redpitaya_hostname: '10.203.129.28'
 
-    # Example data scanner/detector (replace with your actual hardware)
-    data_scanner:
-        module.Class: 'qudi.hardware.ni_card.NationalInstrumentsXSeries'
-        device_name: 'Dev1'
-        input_channel_units:
-            PFI8: 'c/s'
-        output_channel_units: {}
-        aom_voltage_range: [0, 5]
+    # Red Pitaya Stream Hardware (for error signal streaming)
+    redpitaya_stream:
+        module.Class: 'redpitaya.redpitaya_streaming.RedPitayaStreamingHardware'
+        options:
+            redpitaya_config_name: 'rpy_shared_config'
+            redpitaya_hostname: '10.203.129.28'
+
+    # Red Pitaya Finite Sampling (for ODMR scans)
+    redpitaya_finite_sampling:
+        module.Class: 'redpitaya.redpitaya_finite_sampling.RedPitayaFiniteSamplingHardware'
+        options:
+            redpitaya_config_name: 'rpy_shared_config'
+            redpitaya_hostname: '10.203.129.28'
+
+    # Microwave source (replace with your actual hardware)
+    mw_source_synthnv:
+        module.Class: 'microwave.mw_source_synthnv.MicrowaveSynthNV'
+        options:
+            serial_port: 'COM3'
 
 logic:
-    # ODMR Tracking Logic
-    odmr_tracking_logic:
-        module.Class: 'qudi.logic.odmr_tracking_logic.OdmrTrackingLogic'
-
-        # Hardware connections
-        connect:
-            microwave: microwave_source
-            data_scanner: data_scanner
-
-        # Optional: tracking-specific configuration
-        # These can also be set via the GUI during runtime
+    # Time series reader logic (handles streaming via TSR pattern)
+    time_series_reader_logic:
+        module.Class: 'time_series_reader_logic.TimeSeriesReaderLogic'
         options:
-            # Initial tracking target: 'dip' or 'peak'
-            tracking_target: 'dip'
+            max_frame_rate: 20
+            channel_buffer_size: 100000
+        connect:
+            streamer: 'redpitaya_stream'
 
-            # Minimum contrast threshold for valid tracking
-            tracking_threshold: 0.01
-
-            # Number of data points to keep in tracking history
-            max_history_length: 1000
-
-            # Window size for feature detection (number of points)
-            tracking_window_size: 5
+    # ODMR frequency tracking logic
+    odmr_frequency_tracking_logic:
+        module.Class: 'odmr_frequency_tracking_logic.OdmrFrequencyTrackingLogic'
+        options:
+            default_lock_bandwidth: 300      # Hz
+            status_poll_interval: 0.5        # seconds (lock status only)
+        connect:
+            microwave: 'mw_source_synthnv'
+            data_scanner: 'redpitaya_finite_sampling'
+            odmr_lock_hw: 'redpitaya_odmr_lock'
+            time_series_logic: 'time_series_reader_logic'
 
 gui:
     # ODMR Tracking GUI
     odmr_tracking_gui:
-        module.Class: 'qudi.gui.odmr_tracking.odmrgui.OdmrTrackingGui'
-
-        # Connect to tracking logic
+        module.Class: 'odmr_tracking.odmr_tracking_gui.OdmrTrackingGui'
         connect:
-            odmr_logic: odmr_tracking_logic
+            odmr_logic: 'odmr_frequency_tracking_logic'
 
-        # Optional: GUI-specific settings
-        options:
-            # Maximum number of previous scans to display
-            max_shown_scans: 50
+    # Time Series GUI (for real-time error signal / frequency correction visualization)
+    time_series_gui:
+        module.Class: 'time_series.time_series_gui.TimeSeriesGui'
+        connect:
+            time_series_logic: 'time_series_reader_logic'
 
 
 # ==============================================================================
@@ -78,27 +87,30 @@ gui:
 #    - Data fitting
 #    - Data saving
 #
-# 2. Additional tracking features:
-#    - Automatic peak/dip frequency tracking
-#    - Frequency range adjustment to follow drifting features
-#    - Tracking history visualization
-#    - Tracking quality monitoring
+# 2. Additional frequency tracking features:
+#    - Linear fit extraction (slope measurement for lock configuration)
+#    - Hardware-based frequency locking (PyRPL FPGA, integral or PI control)
+#    - Independent stream and lock control
+#    - Stream mode selection (error signal vs frequency correction)
 #
-# 3. To use:
+# 3. Workflow:
 #    a) Start qudi with this configuration
-#    b) The ODMR Tracking GUI will open with standard ODMR controls
-#       plus an additional "Tracking Controls" dock widget
-#    c) Start a normal ODMR scan first
-#    d) Once signal is visible, enable tracking via the tracking controls
-#    e) The scan range will automatically adjust to follow the tracked feature
+#    b) ODMR Tracking GUI opens with standard ODMR controls plus tracking docks
+#    c) Run an ODMR scan first to see the resonance
+#    d) Drag the fit region to select the linear slope region
+#    e) Click "Fit Resonance" to extract the slope
+#    f) Configure lock parameters (bandwidth, mode)
+#    g) Click "Configure" then "Enable Lock" to start tracking
+#    h) Open Time Series GUI to monitor error signal or frequency correction
 #
-# 4. The tracking algorithm is a placeholder - you'll need to implement
-#    your specific tracking logic in the following methods:
-#    - _find_tracking_feature(): Detect the feature to track
-#    - _calculate_contrast(): Compute tracking quality metric
-#    - _should_adjust_scan_range(): Decide when to adjust scan range
+# 4. Time Series Visualization:
+#    The ODMR Tracking GUI delegates real-time data visualization to the
+#    Time Series GUI. Both GUIs share the same TimeSeriesReaderLogic,
+#    allowing you to see streaming data while controlling the lock.
 #
-# 5. Both standard ODMR and ODMR-tracking modules can be configured
-#    simultaneously if you want both available in the same qudi instance.
+# 5. Stream Mode Selection:
+#    - Error Signal (LSB): Raw demodulated error signal for diagnostics
+#    - Frequency Correction (Hz): Applied frequency offset for drift monitoring
+#    Mode can only be changed when streaming is stopped.
 #
 # ==============================================================================

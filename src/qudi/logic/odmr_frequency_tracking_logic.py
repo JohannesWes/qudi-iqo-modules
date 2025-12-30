@@ -53,16 +53,26 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
     Example config:
 
+        # Time series reader logic (handles streaming via TSR pattern)
+        time_series_reader_logic:
+            module.Class: 'time_series_reader_logic.TimeSeriesReaderLogic'
+            options:
+                max_frame_rate: 20
+                channel_buffer_size: 100000
+            connect:
+                streamer: 'redpitaya_stream'
+
+        # ODMR frequency tracking logic
         odmr_frequency_tracking_logic:
             module.Class: 'odmr_frequency_tracking_logic.OdmrFrequencyTrackingLogic'
             options:
                 default_lock_bandwidth: 300  # Hz
-                error_buffer_size: 10000     # samples
+                status_poll_interval: 0.5    # seconds (lock status only)
             connect:
                 microwave: 'mw_source_synthnv'
                 data_scanner: 'redpitaya_finite_sampling'
                 odmr_lock_hw: 'redpitaya_odmr_lock'
-                error_streamer: 'redpitaya_stream'
+                time_series_logic: 'time_series_reader_logic'
     """
 
     # =========================================================================
@@ -85,15 +95,14 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
     # =========================================================================
 
     _odmr_lock_hw = Connector(name='odmr_lock_hw', interface='OdmrFreqLockInterface')
-    _error_streamer = Connector(name='error_streamer', interface='DataInStreamInterface')
+    _time_series_logic = Connector(name='time_series_logic', interface='TimeSeriesReaderLogic')
 
     # =========================================================================
     # Additional Config Options (tracking-specific)
     # =========================================================================
 
     _default_lock_bandwidth = ConfigOption('default_lock_bandwidth', default=300, missing='info')
-    _error_buffer_size = ConfigOption('error_buffer_size', default=10000, missing='info')
-    _status_poll_interval = ConfigOption('status_poll_interval', default=0.1, missing='info')  # seconds
+    _status_poll_interval = ConfigOption('status_poll_interval', default=0.5, missing='info')  # seconds (lock status only)
 
     # =========================================================================
     # Additional Status Variables (tracking-specific)
@@ -113,12 +122,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         self._status_polling_active = False
         self._last_fit_result = None  # {slope, offset, ...}
 
-        # Error stream management
-        self._error_buffer = None  # Circular buffer for error data
-        self._error_times = None   # Time axis for error data
-        self._error_write_pos = 0
-
-        # Status polling timer
+        # Status polling timer (for lock status only - streaming handled by TSR)
         self._status_timer = QtCore.QTimer()
         self._status_timer.timeout.connect(self._poll_lock_status)
 
@@ -126,11 +130,15 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         """Initialize module and connect hardware"""
         # Call parent activation (connects microwave and data scanner)
         super().on_activate()
-        
-        # Initialize error buffer
-        self._error_buffer = np.zeros(self._error_buffer_size, dtype=np.float64)
-        self._error_times = np.zeros(self._error_buffer_size, dtype=np.float64)
-        self._error_write_pos = 0
+
+        # Connect to TimeSeriesReaderLogic signals for data updates
+        ts_logic = self._time_series_logic()
+        ts_logic.sigNewRawData.connect(self._on_tsr_raw_data, QtCore.Qt.QueuedConnection)
+        ts_logic.sigDataChanged.connect(self._on_tsr_data_changed, QtCore.Qt.QueuedConnection)
+        ts_logic.sigStatusChanged.connect(self._on_tsr_status_changed, QtCore.Qt.QueuedConnection)
+
+        # Set initial stream input mode on hardware (via TSR's streamer)
+        self._apply_stream_mode_to_hardware()
 
         # Apply saved lock bandwidth
         if self._lock_bandwidth != self._default_lock_bandwidth:
@@ -150,6 +158,16 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
         # Stop status polling
         self._status_timer.stop()
+
+        # Disconnect from TSR signals
+        try:
+            ts_logic = self._time_series_logic()
+            ts_logic.sigNewRawData.disconnect(self._on_tsr_raw_data)
+            ts_logic.sigDataChanged.disconnect(self._on_tsr_data_changed)
+            ts_logic.sigStatusChanged.disconnect(self._on_tsr_status_changed)
+        except (RuntimeError, TypeError):
+            # Signals may already be disconnected or TSR may be deactivated
+            pass
 
         # Call parent deactivation
         super().on_deactivate()
@@ -270,6 +288,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self._lock_bandwidth = bandwidth_hz
 
         # Configure hardware lock
+        # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
         lock_hw = self._odmr_lock_hw()
         lock_hw.set_bandwidth(bandwidth_hz, slope_lsb_per_hz)
 
@@ -307,6 +326,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self._lock_bandwidth = bandwidth_hz
 
         # Configure hardware lock (PI mode)
+        # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
         lock_hw = self._odmr_lock_hw()
         lock_hw.set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)
 
@@ -320,32 +340,47 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
     # Error Stream Control (Independent of Lock)
     # =========================================================================
 
+    def _apply_stream_mode_to_hardware(self):
+        """
+        Apply current stream mode to hardware via TSR's underlying streamer.
+
+        Can be called while streaming is active - the FPGA will switch to the
+        new input source seamlessly. Thread-safe via MonitorClient RLock.
+        """
+        ts_logic = self._time_series_logic()
+        streamer = ts_logic._streamer()
+
+        input_mode = 'demod' if self._stream_mode == 'error' else 'ftw_corr'
+        streamer.set_stream_input(input_mode)
+
+        self.log.debug(f'Hardware stream input set to: {input_mode}')
+
     def set_stream_mode(self, mode: str):
         """
         Set stream mode: 'error' or 'correction'.
+
+        Can be called while streaming is active - the FPGA will switch to the
+        new input source seamlessly. There may be a brief transition in the
+        displayed data during the switch.
 
         Args:
             mode: 'error' for demod error signal, 'correction' for FTW frequency correction
 
         Raises:
             ValueError: If invalid mode
-            RuntimeError: If stream is active
         """
         if mode not in ['error', 'correction']:
             raise ValueError(f'Invalid stream mode: {mode}. Must be "error" or "correction"')
 
-        if self._stream_active:
-            raise RuntimeError('Cannot change stream mode while streaming is active. Stop stream first.')
-
-        # Update hardware input
-        streamer = self._error_streamer()
-        input_mode = 'demod' if mode == 'error' else 'ftw_corr'
-        streamer.set_stream_input(input_mode)
-
         # Store mode
         self._stream_mode = mode
+
+        # Apply to hardware via TSR's streamer (works during active streaming)
+        self._apply_stream_mode_to_hardware()
+
         self.sigStreamModeChanged.emit(mode)
 
+        input_mode = 'demod' if mode == 'error' else 'ftw_corr'
         self.log.info(f'Stream mode set to: {mode} (hardware input: {input_mode})')
 
     def start_error_stream(self):
@@ -358,30 +393,36 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
         Allows monitoring for diagnostics and verification
         before or during lock operation.
+
+        Uses TimeSeriesReaderLogic for thread-safe, buffered data acquisition.
         """
         if self._stream_active:
             self.log.warning('Stream already active')
             return
 
         try:
-            # Ensure hardware input matches current mode
-            streamer = self._error_streamer()
-            input_mode = 'demod' if self._stream_mode == 'error' else 'ftw_corr'
-            streamer.set_stream_input(input_mode)
+            ts_logic = self._time_series_logic()
 
-            # Start streaming
-            streamer.start_stream()
+            # Ensure TSR is stopped before changing hardware input
+            if ts_logic.module_state() == 'locked':
+                ts_logic.stop_reading()
+
+            # Ensure hardware input matches current mode
+            self._apply_stream_mode_to_hardware()
+
+            # Start TSR streaming (handles buffering, thread safety, etc.)
+            ts_logic.start_reading()
 
             # Mark stream as active
             self._stream_active = True
             self.sigStreamStateChanged.emit(True)
 
-            # Start status polling timer if not already running
+            # Start status polling timer if not already running (for lock status only)
             if not self._status_polling_active:
                 self._status_timer.start(int(self._status_poll_interval * 1000))
                 self._status_polling_active = True
 
-            self.log.info('Error signal streaming started')
+            self.log.info(f'Error signal streaming started (mode: {self._stream_mode})')
 
         except Exception as e:
             self.log.error(f'Failed to start error stream: {e}')
@@ -399,9 +440,10 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             return
 
         try:
-            # Stop error signal streaming
-            streamer = self._error_streamer()
-            streamer.stop_stream()
+            # Stop TSR streaming
+            ts_logic = self._time_series_logic()
+            if ts_logic.module_state() == 'locked':
+                ts_logic.stop_reading()
 
             # Mark stream as inactive
             self._stream_active = False
@@ -433,17 +475,22 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             return
 
         try:
-            # Ensure error stream is running (required for lock operation)
-            if not self._stream_active:
-                self.log.warning('Error stream not active, starting automatically')
-                self.start_error_stream()
-
-            # Enable hardware lock
+            # Enable hardware lock (single register write to FPGA)
+            # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
             lock_hw = self._odmr_lock_hw()
             lock_hw.enable_lock(True)
 
             # Mark lock as enabled
             self._lock_enabled = True
+
+            # Start streaming if not already active
+            if not self._stream_active:
+                ts_logic = self._time_series_logic()
+                if ts_logic.module_state() != 'locked':
+                    ts_logic.start_reading()
+                self._stream_active = True
+                self.sigStreamStateChanged.emit(True)
+
             self.sigLockStateChanged.emit(True)
 
             # Ensure status polling is active
@@ -454,7 +501,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.log.info('Frequency lock enabled')
 
         except Exception as e:
-            self.log.error(f'Failed to enable lock: {e}')
+            self.log.error(f'Failed to enable lock: {e}', exc_info=True)
             self._lock_enabled = False
             self.sigLockStateChanged.emit(False)
             raise
@@ -471,11 +518,13 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
         try:
             # Disable hardware lock
+            # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
             lock_hw = self._odmr_lock_hw()
             lock_hw.enable_lock(False)
 
             # Mark lock as disabled
             self._lock_enabled = False
+
             self.sigLockStateChanged.emit(False)
 
             # Stop status polling timer only if stream is also inactive
@@ -486,7 +535,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.log.info('Frequency lock disabled')
 
         except Exception as e:
-            self.log.error(f'Error disabling lock: {e}')
+            self.log.error(f'Error disabling lock: {e}', exc_info=True)
 
     def clear_integrator(self):
         """
@@ -495,69 +544,112 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         Useful for re-acquiring lock after disturbances or when error
         signal has drifted far from zero.
         """
+        # Clear integrator
+        # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
         lock_hw = self._odmr_lock_hw()
         lock_hw.clear()
         self.log.info('Lock integrator cleared')
 
     # =========================================================================
-    # Error Stream Management
+    # Lock Status Polling (independent of data streaming)
     # =========================================================================
 
     @QtCore.Slot()
     def _poll_lock_status(self):
         """
-        Poll lock status and/or read error stream (called by timer).
+        Poll lock status only (called by timer).
 
-        Handles independent operation of lock and stream subsystems.
+        Data streaming is handled by TimeSeriesReaderLogic signals.
+        This timer only monitors the lock hardware status for GUI display.
+
+        Thread-safe: MonitorClient uses RLock to serialize TCP socket access,
+        so polling can occur concurrently with streaming without conflicts.
         """
-        # Read lock status if lock is enabled
-        if self._lock_enabled:
-            try:
-                lock_hw = self._odmr_lock_hw()
-                status = lock_hw.get_status()
-                self.sigLockStatusUpdated.emit(status)
-            except Exception as e:
-                self.log.error(f'Error polling lock status: {e}')
-
-        # Read error stream if streaming is active
-        if self._stream_active:
-            try:
-                streamer = self._error_streamer()
-                data, times = streamer.read_data()  # Non-blocking
-
-                if data is not None and len(data) > 0:
-                    self._add_to_error_buffer(data.ravel(), times)
-            except Exception as e:
-                self.log.error(f'Error reading error stream: {e}')
-
-    def _add_to_error_buffer(self, data: np.ndarray, times: Optional[np.ndarray]):
-        """Add new error data to circular buffer"""
-        n_samples = len(data)
-        if n_samples == 0:
+        if not self._lock_enabled:
             return
 
-        # Generate times if not provided (constant sample rate)
+        try:
+            lock_hw = self._odmr_lock_hw()
+            status = lock_hw.get_status()
+            self.sigLockStatusUpdated.emit(status)
+        except Exception as e:
+            # Catch all exceptions to prevent timer from stopping
+            self.log.debug(f'Lock status poll failed: {e}')
+
+    # =========================================================================
+    # TSR Signal Handlers (data streaming via TimeSeriesReaderLogic)
+    # =========================================================================
+
+    @QtCore.Slot(object, object)
+    def _on_tsr_raw_data(self, data, times):
+        """
+        Handle raw data from TimeSeriesReaderLogic.
+
+        Forwards data to tracking GUI via sigErrorDataUpdated.
+        This replaces the old polling-based data acquisition.
+
+        Args:
+            data: Raw samples from streamer (1D numpy array)
+            times: Optional timestamp array (may be None for constant sample rate)
+        """
+        if not self._stream_active:
+            return
+
+        # Get time axis from TSR if not provided
         if times is None:
-            streamer = self._error_streamer()
-            dt = 1.0 / streamer.sample_rate
-            if self._error_write_pos > 0:
-                t_start = self._error_times[self._error_write_pos - 1] + dt
-            else:
-                t_start = 0.0
-            times = t_start + np.arange(n_samples) * dt
+            ts_logic = self._time_series_logic()
+            trace_times, _ = ts_logic.trace_data
+            times = trace_times
 
-        # Write to circular buffer
-        buffer_size = self._error_buffer_size
-        for i in range(n_samples):
-            self._error_buffer[self._error_write_pos] = data[i]
-            self._error_times[self._error_write_pos] = times[i]
-            self._error_write_pos = (self._error_write_pos + 1) % buffer_size
+        # Forward to GUI
+        # Note: TSR already handles buffering, so we emit the trace data
+        ts_logic = self._time_series_logic()
+        trace_times, trace_data = ts_logic.trace_data
 
-        # Emit updated data (last N samples for display)
-        self.sigErrorDataUpdated.emit(
-            self._error_times.copy(),
-            self._error_buffer.copy()
-        )
+        if trace_data:
+            # Get first channel data
+            channel_name = list(trace_data.keys())[0]
+            self.sigErrorDataUpdated.emit(trace_times, trace_data[channel_name])
+
+    @QtCore.Slot(object, object, object, object)
+    def _on_tsr_data_changed(self, trace_times, trace_data, avg_times, avg_data):
+        """
+        Handle processed trace data from TimeSeriesReaderLogic.
+
+        This signal provides the full trace window with moving average applied.
+        Can be used for GUI display if processed data is preferred.
+
+        Args:
+            trace_times: Time axis array
+            trace_data: Dictionary of {channel_name: data_array}
+            avg_times: Time axis for averaged data
+            avg_data: Dictionary of averaged data (may be None)
+        """
+        if not self._stream_active:
+            return
+
+        # Forward processed data to GUI
+        if trace_data:
+            channel_name = list(trace_data.keys())[0]
+            self.sigErrorDataUpdated.emit(trace_times, trace_data[channel_name])
+
+    @QtCore.Slot(bool, bool)
+    def _on_tsr_status_changed(self, is_running, is_recording):
+        """
+        Handle status changes from TimeSeriesReaderLogic.
+
+        Synchronizes our stream_active state with TSR's actual state.
+
+        Args:
+            is_running: True if TSR is actively streaming
+            is_recording: True if TSR is recording to file
+        """
+        # Update our stream state to match TSR
+        if self._stream_active and not is_running:
+            # TSR stopped unexpectedly
+            self.log.warning('TimeSeriesReaderLogic stopped unexpectedly')
+            self._stream_active = False
+            self.sigStreamStateChanged.emit(False)
 
     # =========================================================================
     # Properties
@@ -585,8 +677,17 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
     @property
     def last_scan_data(self) -> Optional[Dict]:
-        """Most recent ODMR scan data"""
-        return self._last_scan_data.copy() if self._last_scan_data else None
+        """Most recent ODMR scan data (from parent OdmrLogic)"""
+        # Access scan data from parent OdmrLogic class
+        try:
+            if self.frequency_data is not None and self.signal_data:
+                return {
+                    'frequency': self.frequency_data,
+                    'signal': self.signal_data
+                }
+        except (AttributeError, KeyError):
+            pass
+        return None
 
     @property
     def last_fit_result(self) -> Optional[Dict]:

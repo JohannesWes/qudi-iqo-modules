@@ -28,7 +28,6 @@ qudi. If not, see <https://www.gnu.org/licenses/>.
 __all__ = ['OdmrTrackingGui']
 
 import pyqtgraph as pg
-import numpy as np
 from PySide2 import QtCore, QtWidgets, QtGui
 
 from qudi.core.connector import Connector
@@ -84,13 +83,9 @@ class OdmrTrackingGui(OdmrGui):
         # Tracking-specific widgets (add to parent's widgets)
         self._fit_region = None
         self._tracking_fit_curve = None
-        self._error_plot_widget = None
-        self._freq_plot_widget = None
-        self._error_curve = None
-        self._freq_curve = None
         self._fit_controls_dock = None
         self._lock_controls_dock = None
-        self._time_series_dock = None
+        self._stream_mode_dock = None
         self._status_labels = {}
 
     def on_activate(self):
@@ -154,7 +149,7 @@ class OdmrTrackingGui(OdmrGui):
         # Create tracking control dock widgets
         self._create_fit_controls_dock()
         self._create_lock_controls_dock()
-        self._create_time_series_dock()
+        self._create_stream_mode_dock()
 
     def _add_fit_region_to_plot(self):
         """Add fit region indicator to the inherited ODMR plot"""
@@ -348,12 +343,17 @@ class OdmrTrackingGui(OdmrGui):
         self._lock_controls_dock.setWidget(widget)
         self._mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._lock_controls_dock)
 
-    def _create_time_series_dock(self):
-        """Create time series plots dock widget"""
+    def _create_stream_mode_dock(self):
+        """Create stream mode selection dock widget.
+        
+        Note: Time-series visualization is delegated to the Time Series GUI which
+        connects to the same TimeSeriesReaderLogic. Use that GUI to view the
+        streaming data (error signal or frequency correction).
+        """
         from qudi.util.widgets.advanced_dockwidget import AdvancedDockWidget
 
-        self._time_series_dock = AdvancedDockWidget('Time Series', parent=self._mw)
-        self._time_series_dock.setFeatures(
+        self._stream_mode_dock = AdvancedDockWidget('Stream Mode', parent=self._mw)
+        self._stream_mode_dock.setFeatures(
             QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable
         )
 
@@ -362,9 +362,9 @@ class OdmrTrackingGui(OdmrGui):
         layout = QtWidgets.QVBoxLayout()
         widget.setLayout(layout)
 
-        # Add stream mode selection controls
-        mode_group = QtWidgets.QGroupBox('Stream Mode')
-        mode_layout = QtWidgets.QHBoxLayout()
+        # Stream mode selection controls
+        mode_group = QtWidgets.QGroupBox('Stream Input Selection')
+        mode_layout = QtWidgets.QVBoxLayout()
 
         self._error_mode_radio = QtWidgets.QRadioButton('Error Signal (LSB)')
         self._correction_mode_radio = QtWidgets.QRadioButton('Frequency Correction (Hz)')
@@ -373,30 +373,21 @@ class OdmrTrackingGui(OdmrGui):
 
         mode_layout.addWidget(self._error_mode_radio)
         mode_layout.addWidget(self._correction_mode_radio)
-        mode_group.setLayout(mode_layout)
-
-        layout.addWidget(mode_group)
-
-        # Signal plot (dynamically labeled based on mode)
-        self._error_plot_widget = pg.PlotWidget()
-        self._error_plot_widget.setLabel('bottom', 'Time', units='s')
-        self._error_plot_widget.setLabel('left', 'Signal')  # Dynamic label
-        self._error_plot_widget.showGrid(x=True, y=True)
-        self._error_plot_widget.setMinimumHeight(150)
-
-        self._error_curve = pg.PlotCurveItem(
-            pen=pg.mkPen(palette.c3, width=2),
-            clipToView=True,
-            downsampleMethod='subsample',
-            autoDownsample=True
+        
+        # Add hint about using Time Series GUI for visualization
+        hint_label = QtWidgets.QLabel(
+            '<i>Tip: Use the Time Series GUI to view<br>'
+            'the streaming data in real-time.</i>'
         )
-        self._error_plot_widget.addItem(self._error_curve)
+        hint_label.setStyleSheet('color: gray; font-size: 10px;')
+        mode_layout.addWidget(hint_label)
+        
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+        layout.addStretch()
 
-        # Add plot to layout
-        layout.addWidget(self._error_plot_widget)
-
-        self._time_series_dock.setWidget(widget)
-        self._mw.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._time_series_dock)
+        self._stream_mode_dock.setWidget(widget)
+        self._mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._stream_mode_dock)
 
     # =========================================================================
     # Signal Connections
@@ -425,10 +416,6 @@ class OdmrTrackingGui(OdmrGui):
         )
         logic.sigLockStatusUpdated.connect(
             self._update_lock_status,
-            QtCore.Qt.QueuedConnection
-        )
-        logic.sigErrorDataUpdated.connect(
-            self._update_error_plot,
             QtCore.Qt.QueuedConnection
         )
         logic.sigStreamModeChanged.connect(
@@ -471,7 +458,6 @@ class OdmrTrackingGui(OdmrGui):
             logic.sigStreamStateChanged.disconnect(self._update_stream_state)
             logic.sigLockStateChanged.disconnect(self._update_lock_state)
             logic.sigLockStatusUpdated.disconnect(self._update_lock_status)
-            logic.sigErrorDataUpdated.disconnect(self._update_error_plot)
             logic.sigStreamModeChanged.disconnect(self._update_stream_mode_ui)
 
             self.sigDoFit.disconnect()
@@ -620,12 +606,6 @@ class OdmrTrackingGui(OdmrGui):
         is_error = self._error_mode_radio.isChecked()
         mode = 'error' if is_error else 'correction'
 
-        # Update plot label
-        if is_error:
-            self._error_plot_widget.setLabel('left', 'Error Signal', units='LSB')
-        else:
-            self._error_plot_widget.setLabel('left', 'Frequency Correction', units='Hz')
-
         # Store selection
         self._stream_mode = mode
 
@@ -723,20 +703,6 @@ class OdmrTrackingGui(OdmrGui):
         except Exception as e:
             self.log.error(f'Error updating lock status: {e}')
 
-    @QtCore.Slot(object, object)
-    def _update_error_plot(self, times, error_data):
-        """Update error signal time series plot"""
-        try:
-            if times is not None and error_data is not None:
-                # Only show non-zero portion of circular buffer
-                if len(times) > 0 and len(error_data) > 0:
-                    # Shift time axis to show relative time
-                    if times[-1] > 0:
-                        rel_times = times - times[-1]
-                        self._error_curve.setData(x=rel_times, y=error_data)
-        except Exception as e:
-            self.log.error(f'Error updating error plot: {e}')
-
     @QtCore.Slot(str)
     def _handle_set_stream_mode(self, mode):
         """Handle stream mode change in logic thread"""
@@ -764,10 +730,8 @@ class OdmrTrackingGui(OdmrGui):
 
         if mode == 'error':
             self._error_mode_radio.setChecked(True)
-            self._error_plot_widget.setLabel('left', 'Error Signal', units='LSB')
         else:
             self._correction_mode_radio.setChecked(True)
-            self._error_plot_widget.setLabel('left', 'Frequency Correction', units='Hz')
 
         self._error_mode_radio.blockSignals(False)
         self._correction_mode_radio.blockSignals(False)
@@ -794,17 +758,20 @@ class OdmrTrackingGui(OdmrGui):
             if self._fit_controls_dock is not None:
                 self._mw.tabifyDockWidget(self._fit_controls_dock, self._lock_controls_dock)
             
-        if self._time_series_dock is not None:
-            self._time_series_dock.setFloating(False)
-            self._mw.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self._time_series_dock)
+        if self._stream_mode_dock is not None:
+            self._stream_mode_dock.setFloating(False)
+            self._mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._stream_mode_dock)
+            # Tabify stream mode with lock controls
+            if self._lock_controls_dock is not None:
+                self._mw.tabifyDockWidget(self._lock_controls_dock, self._stream_mode_dock)
         
         # Ensure all dock widgets are visible
         if self._fit_controls_dock is not None:
             self._fit_controls_dock.show()
         if self._lock_controls_dock is not None:
             self._lock_controls_dock.show()
-        if self._time_series_dock is not None:
-            self._time_series_dock.show()
+        if self._stream_mode_dock is not None:
+            self._stream_mode_dock.show()
 
     def _restore_tracking_settings(self):
         """Restore saved tracking settings to GUI"""

@@ -12,21 +12,26 @@ The ODMR Frequency Tracking module **inherits all functionality** from the stand
 OdmrFrequencyTrackingLogic (inherits from OdmrLogic)
     └─ Inherits: ODMR scanning, CW control, data storage, fitting framework
     └─ Adds: Linear fit extraction, lock control, error signal streaming
+    └─ Uses: TimeSeriesReaderLogic for buffered streaming (via TSR pattern)
 
 OdmrTrackingGui (inherits from OdmrGui)
     └─ Inherits: All ODMR controls (scan, CW, menu, toolbar, fit dock)
-    └─ Adds: Fit Controls Dock, Lock Controls Dock, Time Series Dock
+    └─ Adds: Fit Controls Dock, Lock Controls Dock, Stream Mode Dock
+    └─ Note: Time-series visualization delegated to Time Series GUI
 ```
 
 ## Files
 
+**GUI files (this directory):**
 - **`odmr_tracking_gui.py`**: Main GUI module, extends standard ODMR GUI with tracking features
+- **`tracking_control_dockwidget.py`**: Legacy dock widget (not used in current implementation)
+- **`config_example.yaml`**: Example configuration (see updated config below)
 - **`README.md`**: This documentation
 
-The logic module is located at:
+**Logic module:**
 - **`qudi-iqo-modules/src/qudi/logic/odmr_frequency_tracking_logic.py`**
 
-The hardware interface and implementation:
+**Hardware interface and implementation:**
 - **`qudi-iqo-modules/src/qudi/interface/odmr_freq_lock_interface.py`** - Abstract interface
 - **`qudi-iqo-modules/src/qudi/hardware/redpitaya/redpitaya_odmr_lock.py`** - PyRPL wrapper
 
@@ -51,49 +56,75 @@ The hardware interface and implementation:
 - **Independent Stream/Lock Control**: Error streaming and frequency lock operate independently
 - **Stream Mode Selection**: Switch between error signal (LSB) and frequency correction (Hz) streaming
 - **Real-Time Monitoring**:
-  - Error signal or frequency correction time series plot (~30.5 kHz update rate)
-  - Lock status indicators (locked, saturated, correction)
+  - Lock status indicators (locked, saturated, error, correction)
   - Selectable stream content (error vs correction)
+  - **Time series visualization via separate Time Series GUI** (connects to same TSR)
 - **Dock Widget Interface**:
   - Fit Controls Dock (fit region, slope results)
   - Lock Controls Dock (mode, parameters, stream/lock enable/disable)
-  - Time Series Dock (error or correction plots with mode selection)
+  - Stream Mode Dock (input selection: error signal or frequency correction)
 
 ## Usage
 
 ### 1. Configuration
 
-Add to your qudi configuration file (see example in config folder):
+Add to your qudi configuration file:
 
 ```yaml
-logic:
-    odmr_frequency_tracking_logic:
-        module.Class: 'odmr_frequency_tracking_logic.OdmrFrequencyTrackingLogic'
-        options:
-            default_scan_mode: 'EQUIDISTANT_SWEEP'
-            oversampling_factor: 5
-            default_lock_bandwidth: 300  # Hz
-            error_buffer_size: 10000
-            status_poll_interval: 0.1    # seconds
-        connect:
-            microwave: 'mw_source_synthnv'        # Inherited from OdmrLogic
-            data_scanner: 'redpitaya_scanner'     # Inherited from OdmrLogic
-            odmr_lock_hw: 'redpitaya_odmr_lock'   # New: lock hardware
-            error_streamer: 'redpitaya_stream'    # New: error streaming
-
 hardware:
+    # Red Pitaya ODMR Lock Hardware (wraps PyRPL odmr_freq_lock module)
     redpitaya_odmr_lock:
         module.Class: 'redpitaya.redpitaya_odmr_lock.RedPitayaOdmrLockHardware'
         options:
             redpitaya_config_name: 'rpy_shared_config'
             redpitaya_hostname: '10.203.129.28'
 
+    # Red Pitaya Stream Hardware (for error signal streaming)
+    redpitaya_stream:
+        module.Class: 'redpitaya.redpitaya_streaming.RedPitayaStreamingHardware'
+        options:
+            redpitaya_config_name: 'rpy_shared_config'
+            redpitaya_hostname: '10.203.129.28'
+
+logic:
+    # Time series reader logic (handles streaming via TSR pattern)
+    time_series_reader_logic:
+        module.Class: 'time_series_reader_logic.TimeSeriesReaderLogic'
+        options:
+            max_frame_rate: 20
+            channel_buffer_size: 100000
+        connect:
+            streamer: 'redpitaya_stream'
+
+    # ODMR frequency tracking logic
+    odmr_frequency_tracking_logic:
+        module.Class: 'odmr_frequency_tracking_logic.OdmrFrequencyTrackingLogic'
+        options:
+            default_lock_bandwidth: 300      # Hz
+            status_poll_interval: 0.5        # seconds (lock status only)
+        connect:
+            microwave: 'mw_source_synthnv'           # Inherited from OdmrLogic
+            data_scanner: 'redpitaya_finite_sampling' # Inherited from OdmrLogic
+            odmr_lock_hw: 'redpitaya_odmr_lock'      # Lock hardware
+            time_series_logic: 'time_series_reader_logic'  # TSR for streaming
+
 gui:
+    # ODMR Tracking GUI
     odmr_tracking_gui:
         module.Class: 'odmr_tracking.odmr_tracking_gui.OdmrTrackingGui'
         connect:
             odmr_logic: 'odmr_frequency_tracking_logic'
+
+    # Time Series GUI (optional, for real-time data visualization)
+    time_series_gui:
+        module.Class: 'time_series.time_series_gui.TimeSeriesGui'
+        connect:
+            time_series_logic: 'time_series_reader_logic'
 ```
+
+**Note:** The time series visualization is handled by a separate Time Series GUI that
+connects to the same `TimeSeriesReaderLogic`. This follows the standard qudi TSR
+pattern for streaming data acquisition.
 
 ### 2. Workflow
 
@@ -125,7 +156,7 @@ gui:
      - **Error [LSB]**: Current demodulated error signal
      - **Correction [Hz]**: Frequency offset being applied
 10. **Monitor tracking**:
-    - Time Series plot shows error signal or frequency correction
+    - Open Time Series GUI for real-time signal visualization
     - Adjust bandwidth if needed for stability
 11. **Disable lock**:
     - Click "Disable Lock" when done (streaming continues)
@@ -229,14 +260,17 @@ Reset lock integrator to zero.
 - Fit curve overlay (PlotDataItem)
 - Fit Controls Dock (fit range, button, results)
 - Lock Controls Dock (mode, parameters, buttons, status)
-- Time Series Dock (error/correction plot with mode selection)
+- Stream Mode Dock (input selection: error signal or frequency correction)
 - Stream mode radio buttons (Error Signal / Frequency Correction)
 - Independent Start/Stop Stream buttons
 - Independent Enable/Disable Lock buttons
 
-**Key override:**
+**Key overrides:**
 - `restore_default_view()`: Adds tracking docks to window layout
 - `_hide_unused_parent_elements()`: Hides ODMR fit dock and matrix plot
+
+**Note:** Time series visualization is delegated to the Time Series GUI which connects
+to the same `TimeSeriesReaderLogic`. The Stream Mode Dock provides a hint about this.
 
 ### Hardware Interface
 
@@ -251,14 +285,14 @@ Defines required methods:
 - `get_constraints()` - Returns hardware limits
 
 **RedPitayaOdmrLockHardware** (implementation):
-- Wraps PyRPL `odmrfreqlock` module
+- Wraps PyRPL `odmrfreqlock` module (PyRPL naming: `odmr_freq_lock.OdmrFreqLock`)
 - Manages PyRPL instance via resource manager
 - Thread-safe (runs on main thread)
-- Constraints:
-  - Bandwidth range: 10-10000 Hz
-  - Slope range: 1e-6 to 1e6 LSB/Hz
-  - Zero ratio range: 2.0-4.0
-  - Max correction: 62.5 MHz (Nyquist limit)
+- Constraints (from `get_constraints()`):
+  - `bandwidth_range`: (10.0, 10000.0) Hz
+  - `slope_range`: (1e-6, 1e6) LSB/Hz
+  - `damping_range`: (0.5, 1.0) - dimensionless
+  - `max_correction_hz`: 62.5 MHz (Nyquist limit)
 
 ## Dock Widget Layout
 
@@ -271,35 +305,43 @@ Default layout after `restore_default_view()`:
 │ Toolbar: [Start] [Stop] [Resume] [Save] [CW]          │
 ├────────────────────────────────────────────────────────┤
 │  ┌──────────────────────┐  ┌─────────────────────┐    │
-│  │                      │  │ Fit Controls        │    │
-│  │   ODMR Plot          │  │ Freq Min:           │    │
-│  │   (with fit region)  │  │ Freq Max:           │    │
+│  │                      │  │ [Fit] [Lock] [Mode] │    │  ← Tabbed docks
+│  │   ODMR Plot          │  ├─────────────────────┤    │
+│  │   (with fit region   │  │ Fit Controls        │    │
+│  │    and fit curve)    │  │ Freq Min:           │    │
+│  │                      │  │ Freq Max:           │    │
 │  │                      │  │ [Fit Resonance]     │    │
 │  │                      │  │ Slope: --           │    │
 │  │                      │  │ R²: --              │    │
-│  │                      │  ├─────────────────────┤    │
+│  │                      │  └─────────────────────┘    │
+│  │                      │  ┌─────────────────────┐    │
 │  │                      │  │ Lock Controls       │    │
-│  └──────────────────────┘  │ ○ Integral ○ PI    │    │
-│                            │ BW: 300 Hz          │    │
-│                            │ Zero Ratio (α): 3.0 │    │
-│                            │ [Configure] [Clear] │    │
-│                            │ Stream (independent):    │
-│                            │ [Start] [Stop]      │    │
-│                            │ Lock:               │    │
-│                            │ [Enable] [Disable]  │    │
+│  │                      │  │ ○ Integral ○ PI     │    │
+│  │                      │  │ BW: 300 Hz          │    │
+│  │                      │  │ Zero Ratio (α): 3.0 │    │
+│  │                      │  │ [Configure] [Clear] │    │
+│  │                      │  │ Stream: [Start/Stop]│    │
+│  └──────────────────────┘  │ Lock: [Enable/Dis]  │    │
 │                            │ Locked: OFF         │    │
 │                            │ Saturated: --       │    │
 │                            │ Error [LSB]: --     │    │
 │                            │ Correction [Hz]: -- │    │
 │                            └─────────────────────┘    │
+│                            ┌─────────────────────┐    │
+│                            │ Stream Mode         │    │
+│                            │ ○ Error Signal (LSB)│    │
+│                            │ ○ Freq Corr (Hz)    │    │
+│                            │ Tip: Use Time Series│    │
+│                            │ GUI to view data    │    │
+│                            └─────────────────────┘    │
 ├────────────────────────────────────────────────────────┤
-│  Time Series Dock                                      │
-│  Stream Mode: ○ Error Signal (LSB) ○ Freq Corr (Hz)   │
-│  [Plot showing selected signal vs time]                │
-└────────────────────────────────────────────────────────┘
 │ Status Bar: Elapsed Time: 0:00:00 | Scans: 0          │
 └────────────────────────────────────────────────────────┘
 ```
+
+**Note:** The Fit Controls, Lock Controls, and Stream Mode docks are tabbed on the
+right side. Time series visualization is handled by the separate Time Series GUI
+which connects to the same TimeSeriesReaderLogic instance.
 
 ## Troubleshooting
 
@@ -332,7 +374,8 @@ Default layout after `restore_default_view()`:
 
 **Error signal not updating**:
 - Click "Start Stream" to begin data acquisition
-- Check error_streamer is configured correctly
+- Open Time Series GUI to view streaming data
+- Check `time_series_logic` connector is configured correctly
 - Verify scan module is in streaming mode in PyRPL
 - Check that IQ demodulator output is routed to scan module
 
@@ -352,15 +395,20 @@ Default layout after `restore_default_view()`:
 - [x] Integral and PI lock mode configuration with zero placement
 - [x] Independent stream and lock control
 - [x] Stream mode selection (error signal vs frequency correction)
-- [x] Real-time error signal plotting
-- [x] Real-time frequency correction plotting
-- [x] Lock status monitoring
+- [x] Lock status monitoring (locked, saturated, error, correction)
 - [x] Hardware abstraction via interface
 - [x] PyRPL integration via resource manager
 - [x] StatusVar persistence for user settings
-- [x] Complete dock widget layout
+- [x] Complete dock widget layout (Fit, Lock, Stream Mode)
+- [x] TimeSeriesReaderLogic integration for streaming (TSR pattern)
+
+**Architecture Notes**:
+- Time series visualization is delegated to the separate Time Series GUI
+- Streaming uses TSR pattern: Logic → TSR Logic → Streamer Hardware
+- Lock status polling skipped during active streaming to avoid TCP conflicts
 
 **Future Enhancements**:
+- [ ] Embedded time series plot in tracking GUI (optional)
 - [ ] Auto-calibration (polarity detection, slope measurement)
 - [ ] Data export (tracking history, error time series)
 - [ ] Advanced diagnostics (PSD, Allan variance)
