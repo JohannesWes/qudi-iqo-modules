@@ -883,6 +883,21 @@ class SensitivitySweepLogic(LogicBase):
             ts_logic = self._time_series_logic()
             streamer = ts_logic._streamer()
 
+            # CRITICAL: Ensure stream input is set to 'demod' for sensitivity measurements
+            # This protects against mode changes from other modules (e.g., ODMR tracking
+            # might have switched to 'ftw_corr' mode)
+            if hasattr(streamer, 'set_stream_input') and hasattr(streamer, 'stream_input'):
+                current_mode = streamer.stream_input
+                if current_mode != 'demod':
+                    self.log.warning(
+                        f'Stream input was "{current_mode}", switching to "demod" for sensitivity measurement'
+                    )
+                    # TSR must be stopped to change mode
+                    if ts_logic.module_state() == 'locked':
+                        ts_logic.stop_reading()
+                    streamer.set_stream_input('demod')
+                    self.log.info('Stream input set to "demod"')
+
             # Access pyrpl instance from streamer
             if not hasattr(streamer, '_pyrpl') or streamer._pyrpl is None:
                 self.log.warning('Cannot access pyrpl instance from streamer - lock-in filters not configured')
