@@ -30,24 +30,36 @@ def patch_pyrpl_logging():
 
         # Create a fixed emit method that handles both signatures
         def fixed_emit(self, record, *args, **kwargs):
-            """Fixed emit method that accepts extra arguments gracefully."""
+            """
+            Fixed emit method that validates input and prevents recursion.
+
+            The PyRPL LogHandler can receive strings instead of LogRecord objects
+            when there's a logging error, causing AttributeError when trying to
+            call record.getMessage(). We validate the input type here.
+            """
+            import logging
+
+            # Validate that record is actually a LogRecord
+            if not isinstance(record, logging.LogRecord):
+                # Skip invalid records to prevent recursion and crashes
+                # This can happen when the logging system itself has an error
+                return
+
             try:
                 # Try calling with just the record (correct signature)
                 original_emit(self, record)
-            except TypeError as e:
-                if "takes 2 positional arguments" in str(e):
-                    # If there's still a type error, just format and skip the signal
-                    try:
-                        msg = self.format(record)
-                        # Try to emit the signal if possible
-                        if hasattr(self, 'log_signal'):
-                            self.log_signal.emit([msg])
-                    except:
-                        # If all else fails, just ignore the log
-                        pass
-                else:
-                    # Re-raise if it's a different error
-                    raise
+            except (TypeError, AttributeError) as e:
+                # If emit fails (e.g., 'str' object has no attribute 'getMessage'),
+                # just format the message and drop the signal emission to prevent recursion
+                try:
+                    msg = self.format(record)
+                    # Don't emit signal here - that causes recursion!
+                    # Just print to stderr as fallback
+                    import sys
+                    print(msg, file=sys.stderr)
+                except:
+                    # If formatting also fails, silently ignore
+                    pass
 
         # Replace the emit method
         pyrpl_widget.LogHandler.emit = fixed_emit
