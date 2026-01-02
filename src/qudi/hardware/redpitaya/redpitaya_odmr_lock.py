@@ -142,3 +142,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface):
             'damping_range': (0.5, 1.0),  # Dimensionless
             'max_correction_hz': 62.5e6,  # Half of 125 MHz (Nyquist)
         }
+
+    def set_max_correction_hz(self, max_correction_hz: float) -> None:
+        """Set maximum frequency correction (FTW saturation limit)."""
+        if max_correction_hz <= 0:
+            raise ValueError(f'Max correction must be positive, got {max_correction_hz}')
+        if max_correction_hz > 62.5e6:
+            raise ValueError(f'Max correction cannot exceed 62.5 MHz (Nyquist), got {max_correction_hz}')
+
+        self._lock.max_correction_hz = max_correction_hz
+
+        self.log.info(f'Lock max correction set to {max_correction_hz/1e6:.3f} MHz')
+
+    def get_max_correction_hz(self) -> float:
+        """Get current maximum frequency correction setting."""
+        return self._lock.max_correction_hz

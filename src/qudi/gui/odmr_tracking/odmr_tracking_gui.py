@@ -65,6 +65,7 @@ class OdmrTrackingGui(OdmrGui):
     _lock_zero_ratio = StatusVar('lock_zero_ratio', default=3.0)
     _lock_mode = StatusVar('lock_mode', default='integral')  # 'integral' or 'pi'
     _stream_mode = StatusVar('stream_mode', default='error')  # 'error' or 'correction'
+    _max_correction_hz = StatusVar('max_correction_hz', default=1e6)  # FTW saturation limit
 
     # =========================================================================
     # Signals (tracking-specific)
@@ -76,6 +77,7 @@ class OdmrTrackingGui(OdmrGui):
     sigSetStreamEnabled = QtCore.Signal(bool)  # stream control (independent of lock)
     sigSetStreamMode = QtCore.Signal(str)  # 'error' or 'correction'
     sigSetLockEnabled = QtCore.Signal(bool)
+    sigSetMaxCorrectionHz = QtCore.Signal(float)  # FTW saturation limit
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -272,8 +274,23 @@ class OdmrTrackingGui(OdmrGui):
             '  4.0: Conservative (slower, stable)'
         )
 
+        # Max correction (FTW saturation) spinbox
+        self._max_correction_spinbox = ScienDSpinBox()
+        self._max_correction_spinbox.setRange(1e3, 62.5e6)  # 1 kHz to 62.5 MHz (Nyquist)
+        self._max_correction_spinbox.setSuffix('Hz')
+        self._max_correction_spinbox.setValue(1e6)  # Default 1 MHz
+        self._max_correction_spinbox.setDecimals(0)
+        self._max_correction_spinbox.setMinimumWidth(120)
+        self._max_correction_spinbox.setToolTip(
+            'Maximum frequency correction (FTW saturation limit)\n'
+            'Lock integrator output is clamped to ±this value.\n'
+            'Typical: 100 kHz - 10 MHz depending on expected drift.'
+        )
+        self._max_correction_spinbox.valueChanged.connect(self._on_max_correction_changed)
+
         params_layout.addRow('Bandwidth:', self._bandwidth_spinbox)
         params_layout.addRow('Zero Ratio (α):', self._zero_ratio_spinbox)
+        params_layout.addRow('Max Correction:', self._max_correction_spinbox)
 
         # Control buttons
         button_layout = QtWidgets.QHBoxLayout()
@@ -448,6 +465,10 @@ class OdmrTrackingGui(OdmrGui):
             self._handle_set_lock_enabled,
             QtCore.Qt.QueuedConnection
         )
+        self.sigSetMaxCorrectionHz.connect(
+            self._handle_set_max_correction_hz,
+            QtCore.Qt.QueuedConnection
+        )
 
     def _disconnect_tracking_signals(self):
         """Disconnect signals from tracking logic"""
@@ -466,6 +487,7 @@ class OdmrTrackingGui(OdmrGui):
             self.sigSetStreamEnabled.disconnect()
             self.sigSetStreamMode.disconnect()
             self.sigSetLockEnabled.disconnect()
+            self.sigSetMaxCorrectionHz.disconnect()
         except (TypeError, RuntimeError):
             pass
 
@@ -541,17 +563,26 @@ class OdmrTrackingGui(OdmrGui):
 
     @QtCore.Slot(str, float, float)
     def _handle_configure_lock(self, mode, bandwidth, zero_ratio):
-        """Handle lock configuration in logic thread"""
+        """Handle lock configuration in logic thread.
+
+        Can be called while lock is active - new parameters take effect
+        immediately. Integrator state is preserved (use Clear if reset needed).
+        """
         logic = self._odmr_logic()
         try:
+            was_locked = logic.lock_enabled
             if mode == 'pi':
                 logic.configure_lock_pi(bandwidth, zero_ratio=zero_ratio)
             else:
                 logic.configure_lock(bandwidth_hz=bandwidth)
-            self.log.info(
+
+            config_msg = (
                 f'Lock configured: mode={mode}, bandwidth={bandwidth} Hz' +
                 (f', α={zero_ratio:.1f}' if mode == 'pi' else '')
             )
+            if was_locked:
+                config_msg += ' (applied to active lock, integrator preserved)'
+            self.log.info(config_msg)
         except Exception as e:
             self.log.error(f'Failed to configure lock: {e}')
 
@@ -599,6 +630,22 @@ class OdmrTrackingGui(OdmrGui):
         """Handle lock mode radio button change"""
         is_pi = self._pi_radio.isChecked()
         self._zero_ratio_spinbox.setEnabled(is_pi)
+
+    @QtCore.Slot()
+    def _on_max_correction_changed(self):
+        """Handle max correction spinbox change"""
+        value_hz = self._max_correction_spinbox.value()
+        self._max_correction_hz = value_hz
+        self.sigSetMaxCorrectionHz.emit(value_hz)
+
+    @QtCore.Slot(float)
+    def _handle_set_max_correction_hz(self, max_correction_hz):
+        """Handle max correction change in logic thread"""
+        logic = self._odmr_logic()
+        try:
+            logic.set_max_correction_hz(max_correction_hz)
+        except Exception as e:
+            self.log.error(f'Failed to set max correction: {e}')
 
     @QtCore.Slot()
     def _on_stream_mode_changed(self):
@@ -652,35 +699,40 @@ class OdmrTrackingGui(OdmrGui):
 
     @QtCore.Slot(bool)
     def _update_stream_state(self, streaming):
-        """Update stream state indicators"""
+        """Update stream state indicators.
+
+        Stream mode can be changed while streaming is active - the FPGA
+        switches input sources seamlessly (thread-safe via MonitorClient RLock).
+        """
         if streaming:
             self._start_stream_button.setEnabled(False)
             self._stop_stream_button.setEnabled(True)
-            # Disable mode selection while streaming
-            self._error_mode_radio.setEnabled(False)
-            self._correction_mode_radio.setEnabled(False)
         else:
             self._start_stream_button.setEnabled(True)
             self._stop_stream_button.setEnabled(False)
-            # Re-enable mode selection
-            self._error_mode_radio.setEnabled(True)
-            self._correction_mode_radio.setEnabled(True)
+        # Stream mode radio buttons always enabled - live switching supported
 
     @QtCore.Slot(bool)
     def _update_lock_state(self, locked):
-        """Update lock state indicators"""
+        """Update lock state indicators.
+
+        Lock parameters (bandwidth, mode, zero_ratio) can be reconfigured while
+        the lock is active - the FPGA applies new gains immediately (thread-safe
+        via MonitorClient RLock). The integrator state is preserved; use Clear
+        button if a reset is desired after reconfiguration.
+        """
         if locked:
             self._status_labels['locked'].setText('ON')
             self._status_labels['locked'].setStyleSheet('QLabel { color: green; font-weight: bold; }')
             self._enable_button.setEnabled(False)
             self._disable_button.setEnabled(True)
-            self._configure_button.setEnabled(False)
+            # Configure button stays enabled - live reconfiguration supported
         else:
             self._status_labels['locked'].setText('OFF')
             self._status_labels['locked'].setStyleSheet('QLabel { color: red; }')
             self._enable_button.setEnabled(True)
             self._disable_button.setEnabled(False)
-            self._configure_button.setEnabled(True)
+        # Configure button always enabled - can reconfigure while locked
 
     @QtCore.Slot(dict)
     def _update_lock_status(self, status):
@@ -705,20 +757,18 @@ class OdmrTrackingGui(OdmrGui):
 
     @QtCore.Slot(str)
     def _handle_set_stream_mode(self, mode):
-        """Handle stream mode change in logic thread"""
+        """Handle stream mode change in logic thread.
+
+        Can be called while streaming is active - the FPGA switches input
+        sources seamlessly (thread-safe via MonitorClient RLock). There may
+        be a brief transition in the displayed data during the switch.
+        """
         logic = self._odmr_logic()
         try:
+            was_streaming = logic.stream_active
             logic.set_stream_mode(mode)
-        except RuntimeError as e:
-            # Stream is active - warn user
-            self.log.warning(f'Cannot change mode while streaming: {e}')
-            QtWidgets.QMessageBox.warning(
-                self._mw,
-                'Stream Active',
-                'Cannot change stream mode while streaming is active. Stop stream first.'
-            )
-            # Revert radio button to current mode
-            self._update_stream_mode_ui(logic.stream_mode)
+            if was_streaming:
+                self.log.info(f'Stream mode switched live to: {mode}')
         except Exception as e:
             self.log.error(f'Failed to set stream mode: {e}')
 
@@ -783,6 +833,7 @@ class OdmrTrackingGui(OdmrGui):
         # Restore lock parameters
         self._bandwidth_spinbox.setValue(self._lock_bandwidth)
         self._zero_ratio_spinbox.setValue(self._lock_zero_ratio)
+        self._max_correction_spinbox.setValue(self._max_correction_hz)
 
         # Restore lock mode
         if self._lock_mode == 'pi':

@@ -117,3 +117,31 @@ class OdmrFreqLockInterface(Base):
                 - max_correction_hz (float): Maximum frequency correction
         """
         pass
+
+    @abstractmethod
+    def set_max_correction_hz(self, max_correction_hz: float) -> None:
+        """
+        Set maximum frequency correction (FTW saturation limit).
+
+        The lock integrator output is clamped to ±max_correction_hz.
+        When the correction hits this limit, the 'saturated' status flag is set.
+
+        Args:
+            max_correction_hz: Maximum correction magnitude in Hz (default: 1e6)
+                              Typical range: 100 kHz to 10 MHz depending on
+                              expected drift and tuning range.
+
+        Raises:
+            ValueError: If value out of hardware-supported range
+        """
+        pass
+
+    @abstractmethod
+    def get_max_correction_hz(self) -> float:
+        """
+        Get current maximum frequency correction setting.
+
+        Returns:
+            float: Maximum correction magnitude in Hz
+        """
+        pass

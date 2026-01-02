@@ -126,6 +126,89 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         self._status_timer = QtCore.QTimer()
         self._status_timer.timeout.connect(self._poll_lock_status)
 
+    # =========================================================================
+    # ODMR Scan Preparation (ensure proper hardware state before scanning)
+    # =========================================================================
+
+    def _prepare_for_odmr_scan(self):
+        """
+        Prepare hardware state for ODMR scanning.
+
+        ODMR scans require:
+        1. Lock disabled - so DDS output is not being corrected during measurement
+        2. Input set to DEMOD - to measure the raw demodulated lock-in signal,
+           not the FTW frequency correction
+
+        This method updates the internal state and emits signals to synchronize
+        the GUI with the actual hardware state. The GUI will reflect these changes
+        in the streaming/lock control panels.
+        """
+        changes_made = False
+
+        # Stop streaming if active (ODMR scan and streaming share hardware)
+        if self._stream_active:
+            self.log.info('Stopping error stream for ODMR scan')
+            try:
+                ts_logic = self._time_series_logic()
+                if ts_logic.module_state() == 'locked':
+                    ts_logic.stop_reading()
+            except Exception as e:
+                self.log.warning(f'Error stopping stream: {e}')
+            self._stream_active = False
+            self.sigStreamStateChanged.emit(False)
+            changes_made = True
+
+        # Disable lock if enabled (prevents frequency corrections during scan)
+        if self._lock_enabled:
+            self.log.info('Disabling frequency lock for ODMR scan')
+            try:
+                lock_hw = self._odmr_lock_hw()
+                lock_hw.enable_lock(False)
+            except Exception as e:
+                self.log.error(f'Failed to disable lock: {e}')
+            self._lock_enabled = False
+            self.sigLockStateChanged.emit(False)
+            changes_made = True
+
+        # Ensure input is set to DEMOD (required for ODMR scan data)
+        # This is critical: the scan module's input_select is shared between
+        # scan mode and stream mode. If streaming was using FTW_CORR, we must
+        # reset to DEMOD for proper ODMR measurements.
+        if self._stream_mode != 'error':
+            self.log.info('Setting stream mode to "error" (DEMOD input) for ODMR scan')
+            self._stream_mode = 'error'
+            self.sigStreamModeChanged.emit('error')
+            changes_made = True
+
+        # Always apply DEMOD input to hardware regardless of stream_mode change
+        # This ensures the hardware register is set correctly even if mode was
+        # already 'error' but hardware was in different state
+        self._apply_stream_mode_to_hardware()
+
+        if changes_made:
+            self.log.info('Hardware state updated for ODMR scan (lock disabled, input=DEMOD)')
+        else:
+            self.log.debug('Hardware already in correct state for ODMR scan')
+
+    @QtCore.Slot()
+    def start_odmr_scan(self):
+        """
+        Override parent to prepare hardware before ODMR scan.
+
+        Before starting the scan, this method ensures:
+        1. Frequency lock is disabled (no corrections applied to DDS)
+        2. Streaming is stopped (shared hardware resource)
+        3. Input is set to DEMOD (not FTW_CORR which is for streaming only)
+
+        The GUI is automatically updated via signals to reflect these changes,
+        so the user sees the actual hardware state in the control panels.
+        """
+        # Prepare hardware state before scan
+        self._prepare_for_odmr_scan()
+
+        # Call parent implementation to run the actual ODMR scan
+        super().start_odmr_scan()
+
     def on_activate(self):
         """Initialize module and connect hardware"""
         # Call parent activation (connects microwave and data scanner)
@@ -335,6 +418,32 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             f'slope={slope_lsb_per_hz:.3e} LSB/Hz, α={zero_ratio:.2f} '
             f'(zero at {bandwidth_hz/zero_ratio:.1f} Hz)'
         )
+
+    def set_max_correction_hz(self, max_correction_hz: float) -> None:
+        """
+        Set maximum frequency correction (FTW saturation limit).
+
+        The lock integrator output is clamped to ±max_correction_hz.
+        When the correction hits this limit, the 'saturated' status flag is set.
+
+        Args:
+            max_correction_hz: Maximum correction magnitude in Hz (default: 1e6)
+                              Typical range: 100 kHz to 10 MHz depending on
+                              expected drift and tuning range.
+        """
+        lock_hw = self._odmr_lock_hw()
+        lock_hw.set_max_correction_hz(max_correction_hz)
+        self.log.info(f'Lock max correction set to {max_correction_hz/1e6:.3f} MHz')
+
+    def get_max_correction_hz(self) -> float:
+        """
+        Get current maximum frequency correction setting.
+
+        Returns:
+            float: Maximum correction magnitude in Hz
+        """
+        lock_hw = self._odmr_lock_hw()
+        return lock_hw.get_max_correction_hz()
 
     # =========================================================================
     # Error Stream Control (Independent of Lock)
