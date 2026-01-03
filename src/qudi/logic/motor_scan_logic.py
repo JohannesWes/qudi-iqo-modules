@@ -1603,14 +1603,27 @@ class MotorScanLogic(LogicBase):
             if self._scan_data is None:
                 self.log.warning("No scan data to save.")
                 return
-            
-            if self.module_state() == 'locked':
-                self.log.error('Unable to save scan data. Scan or save still in progress...')
+
+            # Block save only if scan is actively running or stopping (not paused)
+            # Allow saving when:
+            # - Scan state is IDLE (no scan in progress)
+            # - Scan state is PAUSED (data is stable, safe to save)
+            if self._scan_state == ScanState.RUNNING:
+                self.log.error('Unable to save scan data. Scan actively running. '
+                               'Pause the scan first to save.')
                 return
-            
+            if self._scan_state == ScanState.STOPPING:
+                self.log.warning('Unable to save scan data. Scan is stopping, please wait.')
+                return
+
+            # Track if we're already locked (e.g., from a paused scan)
+            # to avoid double-lock/unlock issues
+            already_locked = (self.module_state() == 'locked')
+
             self.sigSaveStateChanged.emit(True)
-            self.module_state.lock()
-            
+            if not already_locked:
+                self.module_state.lock()
+
             try:
                 timestamp = datetime.datetime.now()
                 timestamp_str = timestamp.strftime('%Y%m%d-%H%M-%S')
@@ -1787,9 +1800,11 @@ class MotorScanLogic(LogicBase):
                         )
                     
                 self.log.info(f"Scan data saved to: {scan_folder}")
-                    
+
             finally:
-                self.module_state.unlock()
+                # Only unlock if we locked it ourselves
+                if not already_locked:
+                    self.module_state.unlock()
                 self.sigSaveStateChanged.emit(False)
     
     def _draw_figure(self, data: np.ndarray, data_label: str, unit: str = '') -> plt.Figure:
