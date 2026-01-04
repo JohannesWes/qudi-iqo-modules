@@ -157,3 +157,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface):
     def get_max_correction_hz(self) -> float:
         """Get current maximum frequency correction setting."""
         return self._lock.max_correction_hz
+
+    def set_invert(self, inverted: bool) -> None:
+        """
+        Set error signal polarity inversion.
+
+        For LSB (f_RF = f_LO - f_IF): set inverted=True
+        For USB (f_RF = f_LO + f_IF): set inverted=False
+        """
+        self._lock.invert = bool(inverted)
+        sideband = 'LSB' if inverted else 'USB'
+        self.log.info(f'Error inversion set to {inverted} (for {sideband} operation)')
+
+    def get_invert(self) -> bool:
+        """Get current error signal inversion setting."""
+        return self._lock.invert

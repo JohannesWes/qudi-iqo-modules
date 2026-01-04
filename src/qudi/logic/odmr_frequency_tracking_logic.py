@@ -320,10 +320,30 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         ss_tot = np.sum((signal_fit - signal_fit.mean()) ** 2)
         r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
+        # Calculate zero-crossing frequency from linear fit
+        # Linear fit: signal = slope * freq + offset
+        # At zero-crossing: 0 = slope * f_zero + offset
+        # Therefore: f_zero = -offset / slope
+        if abs(slope) > 1e-12:  # Avoid division by zero
+            zero_crossing_freq = -offset / slope
+        else:
+            zero_crossing_freq = None
+            self.log.warning('Fit slope is near zero - cannot calculate zero-crossing frequency')
+
+        # Validate zero-crossing is within fit range (sanity check)
+        if zero_crossing_freq is not None:
+            if not (freq_min <= zero_crossing_freq <= freq_max):
+                self.log.warning(
+                    f'Zero-crossing frequency {zero_crossing_freq/1e9:.6f} GHz is outside '
+                    f'fit range [{freq_min/1e9:.6f}, {freq_max/1e9:.6f}] GHz. '
+                    f'This may indicate a poor fit or wrong region selected.'
+                )
+
         # Store result
         self._last_fit_result = {
             'slope': slope,
             'offset': offset,
+            'zero_crossing_freq': zero_crossing_freq,
             'freq_min': freq_min,
             'freq_max': freq_max,
             'fit_frequency': freq_fit,
@@ -338,9 +358,10 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         # Emit success signal
         self.sigFitCompleted.emit(self._last_fit_result.copy())
 
+        zc_str = f', zero-crossing={zero_crossing_freq/1e9:.6f} GHz' if zero_crossing_freq else ''
         self.log.info(
             f'Resonance fit completed: slope={slope:.3e} LSB/Hz, '
-            f'R²={r_squared:.4f}, range=[{freq_min/1e9:.4f}, {freq_max/1e9:.4f}] GHz'
+            f'R²={r_squared:.4f}, range=[{freq_min/1e9:.4f}, {freq_max/1e9:.4f}] GHz{zc_str}'
         )
 
         return self._last_fit_result.copy()
@@ -444,6 +465,101 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         """
         lock_hw = self._odmr_lock_hw()
         return lock_hw.get_max_correction_hz()
+
+    def set_invert_error(self, inverted: bool) -> None:
+        """
+        Set error signal polarity inversion for correct lock operation.
+
+        This setting is critical for correct feedback polarity depending on
+        which sideband is used in IQ mixing:
+
+        - Lower Sideband (LSB): f_RF = f_LO - f_IF
+          Set inverted=True because increasing f_IF decreases f_RF.
+
+        - Upper Sideband (USB): f_RF = f_LO + f_IF
+          Set inverted=False because increasing f_IF increases f_RF.
+
+        With wrong polarity, the loop will have positive feedback and either
+        oscillate or push the frequency away from resonance.
+
+        Args:
+            inverted: True for LSB operation, False for USB operation
+        """
+        lock_hw = self._odmr_lock_hw()
+        lock_hw.set_invert(inverted)
+        sideband = 'LSB' if inverted else 'USB'
+        self.log.info(f'Error signal inversion set to {inverted} (for {sideband} operation)')
+
+    def get_invert_error(self) -> bool:
+        """
+        Get current error signal inversion setting.
+
+        Returns:
+            bool: True if error is inverted (LSB mode), False otherwise (USB mode)
+        """
+        lock_hw = self._odmr_lock_hw()
+        return lock_hw.get_invert()
+
+    def set_cw_to_zero_crossing(self, enable_output: bool = False) -> float:
+        """
+        Set CW frequency to the fitted zero-crossing frequency.
+
+        This is essential for proper lock operation: the microwave must be
+        parked at the zero-crossing of the error signal (where the demodulated
+        lock-in output is zero) for the frequency lock to work correctly.
+
+        The RF frequency calculation (LO - IF) is handled internally by the
+        microwave hardware module, so the zero-crossing frequency from the fit
+        (which is in RF units) will be correctly applied.
+
+        Args:
+            enable_output: If True, also enables CW output (calls toggle_cw_output).
+                          If False (default), only sets the parameters without
+                          enabling output - user must click "Toggle CW" button.
+
+        Returns:
+            float: The zero-crossing frequency in Hz
+
+        Raises:
+            ValueError: If no fit result available or zero-crossing invalid
+        """
+        if self._last_fit_result is None:
+            raise ValueError('No fit result available. Run fit_resonance() first.')
+
+        zero_crossing_freq = self._last_fit_result.get('zero_crossing_freq')
+        if zero_crossing_freq is None:
+            raise ValueError('Zero-crossing frequency not available (fit slope too small?)')
+
+        # Use parent class method to set CW parameters (stores freq/power)
+        # Keep current power, just change frequency
+        current_power = self._cw_power
+        self.set_cw_parameters(zero_crossing_freq, current_power)
+
+        if enable_output:
+            # Also enable the CW output (configures hardware and turns on)
+            self.toggle_cw_output(True)
+            self.log.info(
+                f'CW output enabled at zero-crossing: {zero_crossing_freq/1e9:.6f} GHz'
+            )
+        else:
+            self.log.info(
+                f'CW frequency set to zero-crossing: {zero_crossing_freq/1e9:.6f} GHz '
+                f'(output not enabled - click "Toggle CW" to enable)'
+            )
+
+        return zero_crossing_freq
+
+    @property
+    def zero_crossing_frequency(self) -> Optional[float]:
+        """
+        Get the zero-crossing frequency from the last fit.
+
+        Returns:
+            float: Zero-crossing frequency in Hz, or None if not available
+        """
+        if self._last_fit_result is None:
+            return None
+        return self._last_fit_result.get('zero_crossing_freq')
 
     # =========================================================================
     # Error Stream Control (Independent of Lock)

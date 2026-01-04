@@ -66,6 +66,7 @@ class OdmrTrackingGui(OdmrGui):
     _lock_mode = StatusVar('lock_mode', default='integral')  # 'integral' or 'pi'
     _stream_mode = StatusVar('stream_mode', default='error')  # 'error' or 'correction'
     _max_correction_hz = StatusVar('max_correction_hz', default=1e6)  # FTW saturation limit
+    _invert_error = StatusVar('invert_error', default=False)  # invert error for LSB mixing
 
     # =========================================================================
     # Signals (tracking-specific)
@@ -78,6 +79,8 @@ class OdmrTrackingGui(OdmrGui):
     sigSetStreamMode = QtCore.Signal(str)  # 'error' or 'correction'
     sigSetLockEnabled = QtCore.Signal(bool)
     sigSetMaxCorrectionHz = QtCore.Signal(float)  # FTW saturation limit
+    sigSetCwToZeroCrossing = QtCore.Signal(bool)  # set CW freq to fitted zero-crossing (enable_output)
+    sigSetInvertError = QtCore.Signal(bool)  # invert error signal polarity (for LSB mixing)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -213,6 +216,28 @@ class OdmrTrackingGui(OdmrGui):
         # Fit results display
         self._fit_slope_label = QtWidgets.QLabel('--')
         self._fit_r2_label = QtWidgets.QLabel('--')
+        self._fit_zero_crossing_label = QtWidgets.QLabel('--')
+        self._fit_zero_crossing_label.setToolTip(
+            'Zero-crossing frequency where error signal = 0.\n'
+            'The CW frequency must be set to this value for lock to work.'
+        )
+
+        # Set CW to zero-crossing button and checkbox
+        self._set_cw_zero_crossing_button = QtWidgets.QPushButton('Set CW to Zero-Crossing')
+        self._set_cw_zero_crossing_button.clicked.connect(self._set_cw_to_zero_crossing)
+        self._set_cw_zero_crossing_button.setEnabled(False)  # Enable after fit
+        self._set_cw_zero_crossing_button.setToolTip(
+            'Set CW frequency to the fitted zero-crossing.\n'
+            'This is required for the frequency lock to work correctly.'
+        )
+
+        self._enable_cw_checkbox = QtWidgets.QCheckBox('Enable CW output')
+        self._enable_cw_checkbox.setChecked(True)  # Default: enable output when setting frequency
+        self._enable_cw_checkbox.setToolTip(
+            'When checked, also enables CW output after setting frequency.\n'
+            'When unchecked, only updates the frequency parameter\n'
+            '(you must manually click "Toggle CW" to enable output).'
+        )
 
         # Layout
         layout.addRow('Freq Min:', self._freq_min_spinbox)
@@ -220,6 +245,9 @@ class OdmrTrackingGui(OdmrGui):
         layout.addRow(self._fit_button)
         layout.addRow('Slope [LSB/Hz]:', self._fit_slope_label)
         layout.addRow('R²:', self._fit_r2_label)
+        layout.addRow('Zero-Crossing:', self._fit_zero_crossing_label)
+        layout.addRow(self._set_cw_zero_crossing_button)
+        layout.addRow(self._enable_cw_checkbox)
 
         self._fit_controls_dock.setWidget(widget)
         self._mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._fit_controls_dock)
@@ -288,9 +316,23 @@ class OdmrTrackingGui(OdmrGui):
         )
         self._max_correction_spinbox.valueChanged.connect(self._on_max_correction_changed)
 
+        # Invert error checkbox (for LSB mixing)
+        self._invert_error_checkbox = QtWidgets.QCheckBox('Invert Error Signal')
+        self._invert_error_checkbox.setChecked(False)  # Default: no inversion (USB assumption)
+        self._invert_error_checkbox.setToolTip(
+            'Invert error signal polarity for correct lock direction.\n\n'
+            'IMPORTANT for IQ mixing sideband selection:\n'
+            '• Lower Sideband (LSB): f_RF = f_LO - f_IF → CHECK this box\n'
+            '• Upper Sideband (USB): f_RF = f_LO + f_IF → UNCHECK this box\n\n'
+            'With LSB, increasing f_IF decreases f_RF, so the feedback\n'
+            'loop sign must be inverted for stable lock operation.'
+        )
+        self._invert_error_checkbox.stateChanged.connect(self._on_invert_error_changed)
+
         params_layout.addRow('Bandwidth:', self._bandwidth_spinbox)
         params_layout.addRow('Zero Ratio (α):', self._zero_ratio_spinbox)
         params_layout.addRow('Max Correction:', self._max_correction_spinbox)
+        params_layout.addRow(self._invert_error_checkbox)
 
         # Control buttons
         button_layout = QtWidgets.QHBoxLayout()
@@ -469,6 +511,14 @@ class OdmrTrackingGui(OdmrGui):
             self._handle_set_max_correction_hz,
             QtCore.Qt.QueuedConnection
         )
+        self.sigSetCwToZeroCrossing.connect(
+            self._handle_set_cw_to_zero_crossing,
+            QtCore.Qt.QueuedConnection
+        )
+        self.sigSetInvertError.connect(
+            self._handle_set_invert_error,
+            QtCore.Qt.QueuedConnection
+        )
 
     def _disconnect_tracking_signals(self):
         """Disconnect signals from tracking logic"""
@@ -488,6 +538,8 @@ class OdmrTrackingGui(OdmrGui):
             self.sigSetStreamMode.disconnect()
             self.sigSetLockEnabled.disconnect()
             self.sigSetMaxCorrectionHz.disconnect()
+            self.sigSetCwToZeroCrossing.disconnect()
+            self.sigSetInvertError.disconnect()
         except (TypeError, RuntimeError):
             pass
 
@@ -638,6 +690,13 @@ class OdmrTrackingGui(OdmrGui):
         self._max_correction_hz = value_hz
         self.sigSetMaxCorrectionHz.emit(value_hz)
 
+    @QtCore.Slot(int)
+    def _on_invert_error_changed(self, state):
+        """Handle invert error checkbox change"""
+        inverted = (state == QtCore.Qt.Checked)
+        self._invert_error = inverted  # Save for persistence
+        self.sigSetInvertError.emit(inverted)
+
     @QtCore.Slot(float)
     def _handle_set_max_correction_hz(self, max_correction_hz):
         """Handle max correction change in logic thread"""
@@ -646,6 +705,23 @@ class OdmrTrackingGui(OdmrGui):
             logic.set_max_correction_hz(max_correction_hz)
         except Exception as e:
             self.log.error(f'Failed to set max correction: {e}')
+
+    @QtCore.Slot(bool)
+    def _handle_set_invert_error(self, inverted):
+        """Handle invert error change in logic thread.
+
+        Sets the error signal polarity inversion for correct lock operation
+        with different IQ mixing sidebands:
+        - LSB (f_RF = f_LO - f_IF): inverted=True
+        - USB (f_RF = f_LO + f_IF): inverted=False
+        """
+        logic = self._odmr_logic()
+        try:
+            logic.set_invert_error(inverted)
+            sideband = 'LSB' if inverted else 'USB'
+            self.log.info(f'Error signal inversion set to {inverted} (for {sideband} operation)')
+        except Exception as e:
+            self.log.error(f'Failed to set error inversion: {e}')
 
     @QtCore.Slot()
     def _on_stream_mode_changed(self):
@@ -659,6 +735,30 @@ class OdmrTrackingGui(OdmrGui):
         # Emit signal to logic (will check if stream is stopped)
         self.sigSetStreamMode.emit(mode)
 
+    @QtCore.Slot()
+    def _set_cw_to_zero_crossing(self):
+        """Set CW frequency to the fitted zero-crossing"""
+        enable_output = self._enable_cw_checkbox.isChecked()
+        self.sigSetCwToZeroCrossing.emit(enable_output)
+
+    @QtCore.Slot(bool)
+    def _handle_set_cw_to_zero_crossing(self, enable_output):
+        """Handle set CW to zero-crossing in logic thread"""
+        logic = self._odmr_logic()
+        try:
+            zc_freq = logic.set_cw_to_zero_crossing(enable_output=enable_output)
+            if enable_output:
+                self.log.info(f'CW output enabled at zero-crossing: {zc_freq/1e9:.6f} GHz')
+            else:
+                self.log.info(f'CW frequency set to zero-crossing: {zc_freq/1e9:.6f} GHz (output not enabled)')
+        except Exception as e:
+            self.log.error(f'Failed to set CW to zero-crossing: {e}')
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                'Set CW Failed',
+                f'Failed to set CW frequency to zero-crossing:\n{e}'
+            )
+
     # =========================================================================
     # Logic Slots (Updates from Logic)
     # =========================================================================
@@ -671,6 +771,7 @@ class OdmrTrackingGui(OdmrGui):
             r_squared = fit_result.get('r_squared')
             fit_freq = fit_result.get('fit_frequency')
             fit_data = fit_result.get('fit_data')
+            zero_crossing_freq = fit_result.get('zero_crossing_freq')
 
             # Update labels
             if slope is not None:
@@ -678,11 +779,20 @@ class OdmrTrackingGui(OdmrGui):
             if r_squared is not None:
                 self._fit_r2_label.setText(f'{r_squared:.4f}')
 
+            # Update zero-crossing display and enable button
+            if zero_crossing_freq is not None:
+                self._fit_zero_crossing_label.setText(f'{zero_crossing_freq/1e9:.6f} GHz')
+                self._set_cw_zero_crossing_button.setEnabled(True)
+            else:
+                self._fit_zero_crossing_label.setText('N/A')
+                self._set_cw_zero_crossing_button.setEnabled(False)
+
             # Update fit curve overlay on ODMR plot
             if fit_freq is not None and fit_data is not None:
                 self._tracking_fit_curve.setData(x=fit_freq, y=fit_data)
 
-            self.log.info(f'Fit completed: slope={slope:.3e}, R²={r_squared:.4f}')
+            zc_str = f', zero-crossing={zero_crossing_freq/1e9:.6f} GHz' if zero_crossing_freq else ''
+            self.log.info(f'Fit completed: slope={slope:.3e}, R²={r_squared:.4f}{zc_str}')
 
         except Exception as e:
             self.log.error(f'Error updating fit display: {e}')
@@ -834,6 +944,14 @@ class OdmrTrackingGui(OdmrGui):
         self._bandwidth_spinbox.setValue(self._lock_bandwidth)
         self._zero_ratio_spinbox.setValue(self._lock_zero_ratio)
         self._max_correction_spinbox.setValue(self._max_correction_hz)
+
+        # Restore invert error setting
+        self._invert_error_checkbox.blockSignals(True)
+        self._invert_error_checkbox.setChecked(self._invert_error)
+        self._invert_error_checkbox.blockSignals(False)
+        # Apply to hardware on restore
+        if self._invert_error:
+            self.sigSetInvertError.emit(self._invert_error)
 
         # Restore lock mode
         if self._lock_mode == 'pi':

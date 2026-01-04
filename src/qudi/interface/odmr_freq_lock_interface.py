@@ -145,3 +145,35 @@ class OdmrFreqLockInterface(Base):
             float: Maximum correction magnitude in Hz
         """
         pass
+
+    @abstractmethod
+    def set_invert(self, inverted: bool) -> None:
+        """
+        Set error signal polarity inversion for correct lock operation.
+
+        This setting is critical for correct feedback polarity depending on
+        which sideband is used in IQ mixing:
+
+        - Lower Sideband (LSB): f_RF = f_LO - f_IF
+          Set inverted=True because increasing f_IF decreases f_RF.
+
+        - Upper Sideband (USB): f_RF = f_LO + f_IF
+          Set inverted=False because increasing f_IF increases f_RF.
+
+        With wrong polarity, the loop will have positive feedback and either
+        oscillate or push the frequency away from resonance.
+
+        Args:
+            inverted: True for LSB operation, False for USB operation
+        """
+        pass
+
+    @abstractmethod
+    def get_invert(self) -> bool:
+        """
+        Get current error signal inversion setting.
+
+        Returns:
+            bool: True if error is inverted (LSB mode), False otherwise (USB mode)
+        """
+        pass
