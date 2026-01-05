@@ -64,11 +64,16 @@ qudi_core_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '
 if qudi_core_root not in sys.path:
     sys.path.insert(0, qudi_core_root)
 
+# FTW (Frequency Tuning Word) conversion constant for Red Pitaya @ 125 MHz
+# FTW = frequency_hz * FTW_PER_HZ; frequency_hz = ftw / FTW_PER_HZ
+FTW_PER_HZ = (2**32) / 125e6  # ≈ 34.359738
+
 
 class ScanMode(Enum):
     """Enumeration of available scan modes."""
-    CONTINUOUS_STREAM = 0  # Motors move continuously, data binned by position
-    STEP_ODMR = 1          # Motors stop at each point, ODMR scan taken
+    CONTINUOUS_STREAM = 0     # Motors move continuously, data binned by position
+    STEP_ODMR = 1             # Motors stop at each point, ODMR scan taken
+    CONTINUOUS_FREQ_TRACK = 2 # Motors move continuously, absolute frequency from lock
 
 
 class ScanPattern(Enum):
@@ -92,9 +97,10 @@ class ScanPattern(Enum):
 class ScanState(Enum):
     """Enumeration of scan states."""
     IDLE = 0
-    RUNNING = 1
-    PAUSED = 2
-    STOPPING = 3
+    INITIALIZING = 1  # Homing and moving to start position
+    RUNNING = 2
+    PAUSED = 3
+    STOPPING = 4
 
 
 @dataclass
@@ -290,6 +296,11 @@ class MotorScanData:
         self.target_positions = self.get_flat_target_positions()
         self.total_points = len(self.target_positions)
         
+        # Initialize actual positions array - same shape as target_positions
+        # Will be populated during scanning with encoder feedback
+        n_axes = len(self.scan_axes)
+        self.actual_positions = np.full((self.total_points, n_axes), np.nan)
+        
         if self.is_2d:
             # Use matrix indexing convention (ij): shape = (nx, ny)
             # First index is X, second index is Y
@@ -442,6 +453,11 @@ class MotorScanLogic(LogicBase):
     _odmr_logic = Connector(interface='LogicBase', name='odmr_logic', optional=True)
     _time_series_logic = Connector(interface='LogicBase',
                                    name='time_series_logic', optional=True)
+    _odmr_frequency_tracking_logic = Connector(
+        interface='LogicBase',
+        name='odmr_frequency_tracking_logic',
+        optional=True
+    )
     
     # Config options
     _default_scan_mode = ConfigOption(
@@ -492,7 +508,12 @@ class MotorScanLogic(LogicBase):
         default=False,
         missing='info'
     )
-    
+    _lock_status_poll_interval = ConfigOption(
+        name='lock_status_poll_interval',
+        default=0.5,  # 500 ms - poll lock status during CONTINUOUS_FREQ_TRACK mode
+        missing='info'
+    )
+
     # Status variables (persistent across sessions)
     _scan_ranges = StatusVar(
         name='scan_ranges',
@@ -514,10 +535,16 @@ class MotorScanLogic(LogicBase):
     sigScanSettingsChanged = QtCore.Signal(dict)
     sigSaveStateChanged = QtCore.Signal(bool)  # True when saving, False when done
     sigHomingStateChanged = QtCore.Signal(bool)  # True when homing, False when done
-    
-    # Internal signal for scan loop
+    sigMovementStateChanged = QtCore.Signal(bool)  # True when moving to position, False when done
+    sigLockLostDuringScan = QtCore.Signal()  # Emitted when lock is lost during CONTINUOUS_FREQ_TRACK
+    sigLockStatusUpdated = QtCore.Signal(bool)  # Emitted with current lock status (for GUI indicator)
+
+    # Internal signals for async operations (run on logic thread via QueuedConnection)
     _sigNextPoint = QtCore.Signal()
-    
+    _sigDoHoming = QtCore.Signal(object)  # axes list, invokes homing on logic thread
+    _sigDoStartScan = QtCore.Signal(object)  # axes list, invokes scan start on logic thread
+    _sigDoMove = QtCore.Signal(dict)  # position dict, invokes move on logic thread
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -552,7 +579,23 @@ class MotorScanLogic(LogicBase):
         self._ts_we_started = False  # True if we started the time series reader
         self._ts_raw_data_buffer = {}  # Buffer for incoming raw data per channel
         self._ts_connected = False  # Track if we're connected to sigNewRawData
-    
+
+        # CONTINUOUS_FREQ_TRACK mode state
+        self._tracking_zero_crossing = None  # Hz, baseline from tracking logic at scan start
+        self._tracking_zero_crossing_history = []  # List of (point_idx, zero_crossing) for segments
+        self._paused_due_to_lock_loss = False  # Distinguish auto-pause from user pause
+        self._lock_status_timer = None  # Timer for polling lock status
+
+        # Non-blocking homing state
+        self._homing_poll_timer = None
+        self._homing_in_progress = False
+        self._homing_axes = []
+        self._homing_start_time = 0.0
+        self._homing_timeout = 120.0  # seconds
+
+        # Non-blocking manual movement state
+        self._moving_in_progress = False
+
     def on_activate(self):
         """Initialize the module."""
         # Validate connectors
@@ -572,8 +615,11 @@ class MotorScanLogic(LogicBase):
         # Try to load fit function
         self._load_fit_function()
         
-        # Connect internal signal
+        # Connect internal signals
         self._sigNextPoint.connect(self._process_next_point, QtCore.Qt.QueuedConnection)
+        self._sigDoHoming.connect(self._do_homing_async, QtCore.Qt.QueuedConnection)
+        self._sigDoStartScan.connect(self._do_start_scan_async, QtCore.Qt.QueuedConnection)
+        self._sigDoMove.connect(self._do_move_async, QtCore.Qt.QueuedConnection)
 
         # Initialize motor poll timer (non-blocking motor movement check)
         self._motor_poll_timer = QtCore.QTimer()
@@ -584,6 +630,20 @@ class MotorScanLogic(LogicBase):
         self._position_timer = QtCore.QTimer()
         self._position_timer.setSingleShot(True)
         self._position_timer.timeout.connect(self._on_position_poll_timeout, QtCore.Qt.QueuedConnection)
+
+        # Initialize lock status polling timer (for CONTINUOUS_FREQ_TRACK mode)
+        self._lock_status_timer = QtCore.QTimer()
+        self._lock_status_timer.setSingleShot(False)  # Repeating timer
+        self._lock_status_timer.timeout.connect(
+            self._on_lock_status_poll_timeout, QtCore.Qt.QueuedConnection
+        )
+
+        # Initialize homing poll timer (non-blocking homing check)
+        self._homing_poll_timer = QtCore.QTimer()
+        self._homing_poll_timer.setSingleShot(True)
+        self._homing_poll_timer.timeout.connect(
+            self._on_homing_poll_timeout, QtCore.Qt.QueuedConnection
+        )
 
         self.log.info("MotorScanLogic activated.")
     
@@ -598,6 +658,10 @@ class MotorScanLogic(LogicBase):
             self._motor_poll_timer.stop()
         if self._position_timer is not None:
             self._position_timer.stop()
+        if self._lock_status_timer is not None:
+            self._lock_status_timer.stop()
+        if self._homing_poll_timer is not None:
+            self._homing_poll_timer.stop()
 
         # Disconnect ODMR signals if connected
         odmr = self._odmr_logic()
@@ -613,6 +677,18 @@ class MotorScanLogic(LogicBase):
         # Disconnect signals
         try:
             self._sigNextPoint.disconnect()
+        except:
+            pass
+        try:
+            self._sigDoHoming.disconnect()
+        except:
+            pass
+        try:
+            self._sigDoStartScan.disconnect()
+        except:
+            pass
+        try:
+            self._sigDoMove.disconnect()
         except:
             pass
 
@@ -664,42 +740,107 @@ class MotorScanLogic(LogicBase):
         """
         if self._scan_state != ScanState.RUNNING:
             return
-        
-        if self._scan_data is None or self._scan_data.scan_mode != ScanMode.CONTINUOUS_STREAM:
+
+        if self._scan_data is None:
             return
-        
+
+        mode = self._scan_data.scan_mode
+
+        # Only process data for continuous streaming modes
+        if mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK):
+            return
+
         # Get channel information from time series logic
         ts_logic = self._time_series_logic()
         if ts_logic is None:
             return
-        
+
         try:
+            if mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+                # For frequency tracking, we receive FTW values and convert to absolute frequency
+                self._process_freq_track_data(data_buffer)
+            else:
+                # Standard CONTINUOUS_STREAM processing
+                channel_names = ts_logic.active_channel_names
+                if not channel_names:
+                    return
+
+                # Parse the flattened data buffer into per-channel data
+                # data_buffer is flattened: [ch1_s1, ch2_s1, ch1_s2, ch2_s2, ...]
+                n_channels = len(channel_names)
+                if data_buffer is None or len(data_buffer) == 0:
+                    return
+
+                n_samples = len(data_buffer) // n_channels
+                if n_samples == 0:
+                    return
+
+                # Reshape to (n_samples, n_channels) then transpose to (n_channels, n_samples)
+                data_reshaped = data_buffer[:n_samples * n_channels].reshape(n_samples, n_channels).T
+
+                # Buffer the data for each channel
+                for i, ch_name in enumerate(channel_names):
+                    if ch_name not in self._ts_raw_data_buffer:
+                        self._ts_raw_data_buffer[ch_name] = []
+                    self._ts_raw_data_buffer[ch_name].extend(data_reshaped[i].tolist())
+
+        except Exception as e:
+            self.log.debug(f"Error processing raw data: {e}")
+
+    def _process_freq_track_data(self, data_buffer):
+        """
+        Process FTW data for CONTINUOUS_FREQ_TRACK mode.
+
+        Converts raw FTW (Frequency Tuning Word) values from the FPGA to
+        absolute frequency by adding the zero-crossing baseline.
+
+        Args:
+            data_buffer: Raw data array from streamer (FTW values, signed 32-bit)
+        """
+        import numpy as np
+
+        if data_buffer is None or len(data_buffer) == 0:
+            return
+
+        if self._tracking_zero_crossing is None:
+            self.log.warning("No zero-crossing baseline set for frequency tracking")
+            return
+
+        # Get time series logic for channel info
+        ts_logic = self._time_series_logic()
+        if ts_logic is None:
+            return
+
+        try:
+            # Time series may have multiple channels, but we only use the first (FTW correction)
             channel_names = ts_logic.active_channel_names
-            if not channel_names:
-                return
-            
-            # Parse the flattened data buffer into per-channel data
-            # data_buffer is flattened: [ch1_s1, ch2_s1, ch1_s2, ch2_s2, ...]
-            n_channels = len(channel_names)
-            if data_buffer is None or len(data_buffer) == 0:
-                return
-            
+            n_channels = len(channel_names) if channel_names else 1
             n_samples = len(data_buffer) // n_channels
             if n_samples == 0:
                 return
-            
-            # Reshape to (n_samples, n_channels) then transpose to (n_channels, n_samples)
-            data_reshaped = data_buffer[:n_samples * n_channels].reshape(n_samples, n_channels).T
-            
-            # Buffer the data for each channel
-            for i, ch_name in enumerate(channel_names):
-                if ch_name not in self._ts_raw_data_buffer:
-                    self._ts_raw_data_buffer[ch_name] = []
-                self._ts_raw_data_buffer[ch_name].extend(data_reshaped[i].tolist())
-                
+
+            # Extract first channel data (FTW values)
+            if n_channels > 1:
+                ftw_data = data_buffer[:n_samples * n_channels].reshape(n_samples, n_channels)[:, 0]
+            else:
+                ftw_data = data_buffer[:n_samples]
+
+            # Convert FTW to frequency correction in Hz
+            # FTW is a signed 32-bit value representing frequency in FPGA units
+            ftw_array = np.asarray(ftw_data, dtype=np.float64)
+            correction_hz = ftw_array / FTW_PER_HZ
+
+            # Calculate absolute frequency = zero-crossing + correction
+            absolute_freq_hz = self._tracking_zero_crossing + correction_hz
+
+            # Buffer for the 'absolute_frequency' channel
+            if 'absolute_frequency' not in self._ts_raw_data_buffer:
+                self._ts_raw_data_buffer['absolute_frequency'] = []
+            self._ts_raw_data_buffer['absolute_frequency'].extend(absolute_freq_hz.tolist())
+
         except Exception as e:
-            self.log.debug(f"Error processing raw data: {e}")
-    
+            self.log.debug(f"Error processing frequency tracking data: {e}")
+
     def _load_fit_function(self):
         """Load the ODMR fit function from my_software.tools.fitting."""
         try:
@@ -724,8 +865,8 @@ class MotorScanLogic(LogicBase):
     
     @property
     def is_scanning(self) -> bool:
-        """True if a scan is in progress."""
-        return self._scan_state in (ScanState.RUNNING, ScanState.PAUSED)
+        """True if a scan is in progress (including initialization phase)."""
+        return self._scan_state in (ScanState.INITIALIZING, ScanState.RUNNING, ScanState.PAUSED)
     
     @property
     def scan_data(self) -> Optional[MotorScanData]:
@@ -863,31 +1004,115 @@ class MotorScanLogic(LogicBase):
     # =========================================================================
     
     @QtCore.Slot(dict)
-    def move_to_position(self, position: Dict[str, float], blocking: bool = False):
+    def move_to_position(self, position: Dict[str, float]):
         """
-        Move motors to specified position.
-        
+        Move motors to specified position (non-blocking).
+
+        This method returns immediately. The actual movement runs asynchronously
+        on the logic thread. Emits sigMovementStateChanged(True) when starting
+        and sigMovementStateChanged(False) when complete.
+
         Args:
-            position: Dict mapping axis name to target position.
-            blocking: If True, wait for movement to complete.
+            position: Dict mapping axis name to target position (in meters).
         """
         with self._thread_lock:
             if self.is_scanning:
                 self.log.warning("Cannot move during scan.")
                 return
-            
+
+            if self._homing_in_progress:
+                self.log.warning("Cannot move while homing is in progress.")
+                return
+
+            if self._moving_in_progress:
+                self.log.warning("Movement already in progress.")
+                return
+
             motor = self._motor_hardware()
-            try:
-                if blocking and hasattr(motor, 'move_abs_sync'):
-                    motor.move_abs_sync(position)
-                else:
-                    motor.move_abs(position)
-                    if blocking and hasattr(motor, 'wait_for_idle'):
-                        motor.wait_for_idle()
-                
-                self.sigPositionUpdated.emit(self.current_position)
-            except Exception as e:
-                self.log.error(f"Move failed: {e}")
+            if motor is None:
+                self.log.error("Motor hardware not available.")
+                return
+
+            self.log.info(f"Moving to position: {position}")
+            self._moving_in_progress = True
+            self.sigMovementStateChanged.emit(True)
+
+            # Emit signal to run move asynchronously on logic thread
+            self._sigDoMove.emit(position)
+
+    @QtCore.Slot(dict)
+    def _do_move_async(self, position: Dict[str, float]):
+        """
+        Perform the actual move operation (runs on logic thread via signal).
+
+        This method is invoked via _sigDoMove with QueuedConnection to ensure
+        it runs on the logic's thread, not blocking the GUI thread.
+
+        Args:
+            position: Dict mapping axis name to target position (in meters).
+        """
+        motor = self._motor_hardware()
+        if motor is None:
+            self.log.error("Motor hardware not available.")
+            self._moving_in_progress = False
+            self.sigMovementStateChanged.emit(False)
+            return
+
+        try:
+            # Use synchronous move with position verification
+            if hasattr(motor, 'move_abs_sync'):
+                motor.move_abs_sync(position)
+            else:
+                motor.move_abs(position)
+                if hasattr(motor, 'wait_for_idle'):
+                    motor.wait_for_idle()
+
+            # Read and verify actual position from hardware
+            actual_pos = self.current_position
+            if actual_pos:
+                # Log achieved position
+                pos_str = ', '.join(f'{k}={v*1000:.3f}mm' for k, v in actual_pos.items())
+                self.log.info(f"Movement completed. Position: {pos_str}")
+
+                # Check for position errors
+                for axis, target in position.items():
+                    if axis in actual_pos:
+                        error = abs(actual_pos[axis] - target)
+                        if error > 100e-6:  # 100 µm threshold for warning
+                            self.log.warning(
+                                f"{axis}-axis position error: target={target*1000:.3f}mm, "
+                                f"actual={actual_pos[axis]*1000:.3f}mm, error={error*1e6:.1f}µm"
+                            )
+            else:
+                self.log.info("Movement completed (position readback unavailable).")
+
+            self.sigPositionUpdated.emit(actual_pos)
+
+        except Exception as e:
+            self.log.error(f"Move failed: {e}", exc_info=True)
+        finally:
+            self._moving_in_progress = False
+            self.sigMovementStateChanged.emit(False)
+
+    @QtCore.Slot()
+    def stop_movement(self):
+        """
+        Stop current movement and reset state.
+
+        Can be called to abort an in-progress move operation.
+        """
+        with self._thread_lock:
+            if not self._moving_in_progress:
+                return
+
+            motor = self._motor_hardware()
+            if motor is not None:
+                motor.abort()
+
+            self._moving_in_progress = False
+            self.sigMovementStateChanged.emit(False)
+            self.sigPositionUpdated.emit(self.current_position)
+            self.log.info("Movement stopped by user.")
     
     @QtCore.Slot()
     def _on_position_poll_timeout(self):
@@ -895,14 +1120,53 @@ class MotorScanLogic(LogicBase):
         pos = self.current_position
         if pos:
             self.sigPositionUpdated.emit(pos)
-    
+
+    @QtCore.Slot()
+    def _on_lock_status_poll_timeout(self):
+        """
+        Poll lock status during CONTINUOUS_FREQ_TRACK mode.
+
+        Auto-pauses the scan if lock is lost, emitting sigLockLostDuringScan.
+        Emits sigLockStatusUpdated for GUI indicator updates.
+        """
+        if self._scan_state != ScanState.RUNNING:
+            return
+
+        if self._active_scan_mode != ScanMode.CONTINUOUS_FREQ_TRACK.value:
+            return
+
+        tracking_logic = self._odmr_frequency_tracking_logic()
+        if tracking_logic is None:
+            return
+
+        # Get current lock status
+        try:
+            lock_enabled = tracking_logic.lock_enabled
+        except Exception as e:
+            self.log.warning(f"Could not read lock status: {e}")
+            return
+
+        # Emit status update for GUI
+        self.sigLockStatusUpdated.emit(lock_enabled)
+
+        # Check for lock loss
+        if not lock_enabled:
+            self.log.warning("Lock lost during frequency tracking scan - pausing scan")
+            self._paused_due_to_lock_loss = True
+            self._scan_state = ScanState.PAUSED
+            self._lock_status_timer.stop()
+            self.sigScanStateChanged.emit(self._scan_state.name)
+            self.sigLockLostDuringScan.emit()
+
     @QtCore.Slot()
     def home_stages(self, axes: List[str] = None):
         """
-        Home (calibrate) the motor stages.
+        Home (calibrate) the motor stages (non-blocking).
         
         Moves all stages to their home position and establishes zero reference.
-        Cannot be called during a scan.
+        Cannot be called during a scan. This method returns immediately and
+        emits sigHomingStateChanged(True) when starting and sigHomingStateChanged(False)
+        when complete.
         
         Args:
             axes: Optional list of axes to home. If None, homes all available axes.
@@ -910,6 +1174,10 @@ class MotorScanLogic(LogicBase):
         with self._thread_lock:
             if self.is_scanning:
                 self.log.error("Cannot home stages during a scan.")
+                return
+            
+            if self._homing_in_progress:
+                self.log.warning("Homing already in progress.")
                 return
             
             motor = self._motor_hardware()
@@ -921,24 +1189,61 @@ class MotorScanLogic(LogicBase):
                 axes = self.available_axes
             
             self.log.info(f"Homing stages: {axes}")
+            self._homing_in_progress = True
+            self._homing_axes = list(axes) if axes else []
             self.sigHomingStateChanged.emit(True)
-            start_time = time.time()
             
-            try:
-                result = motor.calibrate(list(axes) if axes else None)
-                elapsed = time.time() - start_time
-                
-                if result == 0:
-                    self.log.info(f"Homing completed in {elapsed:.1f}s")
-                else:
-                    self.log.warning(f"Homing returned error code: {result}")
-                
-                self.sigPositionUpdated.emit(self.current_position)
-                
-            except Exception as e:
-                self.log.error(f"Homing failed: {e}", exc_info=True)
-            finally:
-                self.sigHomingStateChanged.emit(False)
+            # Emit signal to run homing asynchronously on logic thread
+            self._sigDoHoming.emit(self._homing_axes)
+
+    @QtCore.Slot(object)
+    def _do_homing_async(self, axes: List[str]):
+        """
+        Perform the actual homing operation (runs on logic thread via signal).
+        
+        This method is invoked via _sigDoHoming with QueuedConnection to ensure
+        it runs on the logic's thread, not blocking the GUI thread.
+        
+        Args:
+            axes: List of axes to home.
+        """
+        motor = self._motor_hardware()
+        if motor is None:
+            self.log.error("Motor hardware not available.")
+            self._homing_in_progress = False
+            self.sigHomingStateChanged.emit(False)
+            return
+        
+        self._homing_start_time = time.time()
+        
+        try:
+            result = motor.calibrate(list(axes) if axes else None)
+            elapsed = time.time() - self._homing_start_time
+            
+            if result == 0:
+                self.log.info(f"Homing completed in {elapsed:.1f}s")
+            else:
+                self.log.warning(f"Homing returned error code: {result}")
+            
+            self.sigPositionUpdated.emit(self.current_position)
+            
+        except Exception as e:
+            self.log.error(f"Homing failed: {e}", exc_info=True)
+        finally:
+            self._homing_in_progress = False
+            self._homing_axes = []
+            self.sigHomingStateChanged.emit(False)
+
+    @QtCore.Slot()
+    def _on_homing_poll_timeout(self):
+        """
+        Poll homing status (placeholder for future async homing implementations).
+        
+        Note: Currently not used since motor.calibrate() blocks internally.
+        This method is available for future use if hardware supports truly
+        async homing where we can poll is_moving() separately.
+        """
+        pass
     
     # =========================================================================
     # Scan Control Methods  
@@ -947,10 +1252,11 @@ class MotorScanLogic(LogicBase):
     @QtCore.Slot(list)
     def start_scan(self, axes: List[str] = None):
         """
-        Start a new scan.
+        Start a new scan (non-blocking).
         
-        If home_before_scan is enabled, homes the stages before starting the scan
-        to ensure accurate positioning.
+        This method returns immediately. The actual scan setup and execution
+        runs asynchronously on the logic thread. If home_before_scan is enabled,
+        homes the stages before starting the scan.
         
         Args:
             axes: List of axes to scan. Defaults to ['x', 'y'] or ['x'] based on config.
@@ -960,16 +1266,39 @@ class MotorScanLogic(LogicBase):
                 self.log.error("Scan already in progress.")
                 return
             
+            if self._homing_in_progress:
+                self.log.error("Cannot start scan while homing is in progress.")
+                return
+            
             # Default to available axes
             if axes is None:
                 axes = [a for a in ['x', 'y'] if a in self._scan_ranges]
             
-            # Validate axes
+            # Quick validation of axes
             for axis in axes:
                 if axis not in self._scan_ranges:
                     self.log.error(f"Axis '{axis}' not configured. Available: {list(self._scan_ranges.keys())}")
                     return
             
+            # Mark as initializing (prevents double-start, disables UI)
+            self._scan_state = ScanState.INITIALIZING
+            self.sigScanStateChanged.emit(self._scan_state)
+            
+            # Emit signal to run scan setup asynchronously on logic thread
+            self._sigDoStartScan.emit(list(axes))
+
+    @QtCore.Slot(object)
+    def _do_start_scan_async(self, axes: List[str]):
+        """
+        Perform the actual scan setup and start (runs on logic thread via signal).
+        
+        This method is invoked via _sigDoStartScan with QueuedConnection to ensure
+        it runs on the logic's thread, not blocking the GUI thread.
+        
+        Args:
+            axes: List of axes to scan.
+        """
+        try:
             # Home stages before scan if configured
             if self._home_before_scan:
                 self.log.info("Homing stages before scan...")
@@ -981,9 +1310,13 @@ class MotorScanLogic(LogicBase):
                             self.log.warning(f"Homing returned error code {result}. Proceeding anyway.")
                     except Exception as e:
                         self.log.error(f"Homing failed: {e}. Aborting scan.")
+                        self._scan_state = ScanState.IDLE
+                        self.sigScanStateChanged.emit(self._scan_state)
                         return
                 else:
                     self.log.error("Motor hardware not available. Aborting scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
                     return
             
             # Determine scan mode
@@ -993,11 +1326,51 @@ class MotorScanLogic(LogicBase):
             if mode == ScanMode.STEP_ODMR:
                 if self._odmr_logic() is None:
                     self.log.error("ODMR logic not connected. Cannot perform STEP_ODMR scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
                     return
             elif mode == ScanMode.CONTINUOUS_STREAM:
                 if self._time_series_logic() is None:
                     self.log.error("Time series logic not connected. Cannot perform CONTINUOUS_STREAM scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
                     return
+            elif mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+                # Validate all required components for frequency tracking
+                tracking_logic = self._odmr_frequency_tracking_logic()
+                if tracking_logic is None:
+                    self.log.error("ODMR frequency tracking logic not connected. "
+                                   "Cannot perform CONTINUOUS_FREQ_TRACK scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                if self._time_series_logic() is None:
+                    self.log.error("Time series logic not connected. "
+                                   "Cannot perform CONTINUOUS_FREQ_TRACK scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                # Check lock is enabled
+                if not tracking_logic.lock_enabled:
+                    self.log.error("Lock not enabled. Enable frequency tracking in the "
+                                   "ODMR Tracking GUI before starting scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                # Check zero-crossing is available
+                zero_crossing = tracking_logic.zero_crossing_frequency
+                if zero_crossing is None:
+                    self.log.error("No zero-crossing frequency available. Perform ODMR fit "
+                                   "in Tracking GUI first.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                # Store baseline for this scan
+                self._tracking_zero_crossing = zero_crossing
+                self._tracking_zero_crossing_history = [(0, zero_crossing)]
+                self._paused_due_to_lock_loss = False
+                self.log.info(f"Frequency tracking scan with zero-crossing: "
+                              f"{zero_crossing / 1e9:.6f} GHz")
             
             # Create scan configuration
             scan_axes = tuple(axes)
@@ -1022,13 +1395,13 @@ class MotorScanLogic(LogicBase):
                 ts_logic = self._time_series_logic()
                 channel_names = ts_logic.active_channel_names if ts_logic else []
                 self._scan_data.initialize_data_arrays(channel_names)
-                
+
                 # Clear raw data buffer
                 self._ts_raw_data_buffer = {ch: [] for ch in channel_names}
-                
+
                 # Check if time series is already running (e.g., from time_series GUI)
                 ts_already_running = ts_logic.module_state() == 'locked' if ts_logic else False
-                
+
                 if ts_already_running:
                     # Time series already running - just connect to its signals
                     self._ts_we_started = False
@@ -1037,10 +1410,44 @@ class MotorScanLogic(LogicBase):
                     self._ts_we_started = True
                     if ts_logic is not None:
                         ts_logic.start_reading()
-                
+
                 # Connect to sigNewRawData for non-blocking data reception
                 self._connect_time_series_signals()
                 self._current_scan_folder = None  # Will be set on save
+            elif mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+                # Initialize with absolute frequency channel
+                channel_names = ['absolute_frequency']
+                self._scan_data.initialize_data_arrays(channel_names)
+
+                # Clear raw data buffer (will receive FTW values, convert to frequency)
+                self._ts_raw_data_buffer = {ch: [] for ch in channel_names}
+
+                # Configure tracking logic for FTW streaming
+                tracking_logic = self._odmr_frequency_tracking_logic()
+                if tracking_logic is not None:
+                    try:
+                        tracking_logic.set_stream_mode('correction')
+                        self.log.debug("Set tracking stream mode to 'correction' (FTW output)")
+                    except Exception as e:
+                        self.log.warning(f"Could not set stream mode: {e}")
+
+                # Connect to time series for data (same as CONTINUOUS_STREAM)
+                ts_logic = self._time_series_logic()
+                ts_already_running = ts_logic.module_state() == 'locked' if ts_logic else False
+
+                if ts_already_running:
+                    self._ts_we_started = False
+                else:
+                    self._ts_we_started = True
+                    if ts_logic is not None:
+                        ts_logic.start_reading()
+
+                self._connect_time_series_signals()
+                self._current_scan_folder = None
+
+                # Start lock status polling
+                poll_interval_ms = int(self._lock_status_poll_interval * 1000)
+                self._lock_status_timer.start(poll_interval_ms)
             else:
                 self._scan_data.initialize_data_arrays()
                 # Create scan folder now for STEP_ODMR mode so fit plots can be saved during scan
@@ -1054,10 +1461,10 @@ class MotorScanLogic(LogicBase):
                 else:
                     self._current_scan_folder = None
             
-            # Set state
+            # Set state to RUNNING now that initialization is complete
             self._stop_requested = False
-            self._scan_state = ScanState.RUNNING
             self._scan_start_time = time.time()
+            self._scan_state = ScanState.RUNNING
             
             self.module_state.lock()
             self.sigScanStateChanged.emit(self._scan_state)
@@ -1067,6 +1474,11 @@ class MotorScanLogic(LogicBase):
             
             # Start the scan loop
             self._sigNextPoint.emit()
+            
+        except Exception as e:
+            self.log.error(f"Failed to start scan: {e}", exc_info=True)
+            self._scan_state = ScanState.IDLE
+            self.sigScanStateChanged.emit(self._scan_state)
     
     @QtCore.Slot()
     def stop_scan(self):
@@ -1097,7 +1509,41 @@ class MotorScanLogic(LogicBase):
         with self._thread_lock:
             if self._scan_state != ScanState.PAUSED:
                 return
-            
+
+            mode = ScanMode(self._active_scan_mode) if isinstance(self._active_scan_mode, int) else self._active_scan_mode
+
+            # For CONTINUOUS_FREQ_TRACK mode, validate lock and update zero-crossing
+            if mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+                tracking_logic = self._odmr_frequency_tracking_logic()
+                if tracking_logic is None:
+                    self.log.error("Tracking logic not available. Cannot resume.")
+                    return
+
+                # Validate lock is re-enabled
+                if not tracking_logic.lock_enabled:
+                    self.log.error("Lock not enabled. Re-enable tracking in ODMR Tracking GUI before resuming.")
+                    return
+
+                # Get current zero-crossing (may have changed after re-locking)
+                new_zero_crossing = tracking_logic.zero_crossing_frequency
+                if new_zero_crossing is None:
+                    self.log.error("No zero-crossing frequency. Perform ODMR fit before resuming.")
+                    return
+
+                # Check if zero-crossing changed and record in history
+                if new_zero_crossing != self._tracking_zero_crossing:
+                    current_point = self._scan_data.current_point_index if self._scan_data else 0
+                    old_zc = self._tracking_zero_crossing
+                    self.log.info(f"Zero-crossing updated: {old_zc / 1e9:.6f} GHz → "
+                                  f"{new_zero_crossing / 1e9:.6f} GHz")
+                    self._tracking_zero_crossing_history.append((current_point, new_zero_crossing))
+                    self._tracking_zero_crossing = new_zero_crossing
+
+                # Reset lock loss flag and restart lock status polling
+                self._paused_due_to_lock_loss = False
+                poll_interval_ms = int(self._lock_status_poll_interval * 1000)
+                self._lock_status_timer.start(poll_interval_ms)
+
             self._scan_state = ScanState.RUNNING
             self.sigScanStateChanged.emit(self._scan_state)
             self.log.info("Scan resumed.")
@@ -1109,6 +1555,10 @@ class MotorScanLogic(LogicBase):
         with self._thread_lock:
             # Check if we should stop
             if self._stop_requested or self._scan_state == ScanState.STOPPING:
+                # Stop the motor when aborting scan
+                motor = self._motor_hardware()
+                if motor is not None:
+                    motor.abort()
                 self._finalize_scan(completed=False)
                 return
 
@@ -1143,6 +1593,10 @@ class MotorScanLogic(LogicBase):
         with self._thread_lock:
             if self._stop_requested or self._scan_state == ScanState.STOPPING:
                 self._waiting_for_motor = False
+                # Stop the motor when aborting scan to prevent issues with subsequent homing
+                motor = self._motor_hardware()
+                if motor is not None:
+                    motor.abort()
                 self._finalize_scan(completed=False)
                 return
 
@@ -1486,6 +1940,14 @@ class MotorScanLogic(LogicBase):
     def _advance_to_next_point(self, result: Dict):
         """Advance to the next scan point after completing current one."""
         with self._thread_lock:
+            # Store actual position in the scan data array
+            actual_pos = result.get('actual_position', {})
+            if actual_pos and self._scan_data.actual_positions is not None:
+                point_idx = self._current_point_idx
+                for i, axis in enumerate(self._scan_data.scan_axes):
+                    if axis in actual_pos:
+                        self._scan_data.actual_positions[point_idx, i] = actual_pos[axis]
+            
             # Update progress
             self._scan_data.current_point_index += 1
 
@@ -1538,10 +2000,10 @@ class MotorScanLogic(LogicBase):
         Args:
             completed: True if scan finished normally, False if stopped.
         """
-        # Clean up time series connection (CONTINUOUS_STREAM mode)
-        if self._scan_data.scan_mode == ScanMode.CONTINUOUS_STREAM:
+        # Clean up time series connection (CONTINUOUS_STREAM and CONTINUOUS_FREQ_TRACK modes)
+        if self._scan_data.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK):
             self._disconnect_time_series_signals()
-            
+
             # Only stop time series reader if WE started it
             if self._ts_we_started:
                 ts_logic = self._time_series_logic()
@@ -1550,9 +2012,27 @@ class MotorScanLogic(LogicBase):
                         ts_logic.stop_reading()
                     except Exception:
                         pass
-            
+
             self._ts_raw_data_buffer = {}
             self._ts_we_started = False
+
+        # Additional cleanup for CONTINUOUS_FREQ_TRACK mode
+        if self._scan_data.scan_mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+            # Stop lock status polling
+            if self._lock_status_timer is not None:
+                self._lock_status_timer.stop()
+
+            # Restore stream mode to 'demod' (error signal) for normal tracking GUI use
+            tracking_logic = self._odmr_frequency_tracking_logic()
+            if tracking_logic is not None:
+                try:
+                    tracking_logic.set_stream_mode('demod')
+                    self.log.debug("Restored tracking stream mode to 'demod'")
+                except Exception as e:
+                    self.log.debug(f"Could not restore stream mode: {e}")
+
+            # Reset tracking state
+            self._paused_due_to_lock_loss = False
 
         # Update scan data
         self._scan_data.completed = completed
@@ -1699,7 +2179,7 @@ class MotorScanLogic(LogicBase):
                                 column_headers=f'{channel} data (columns is X, rows is Y)',
                                 use_timestamp=False
                             )
-                            
+
                             # Save thumbnail if configured
                             if self._save_thumbnails and file_path:
                                 fig = self._draw_figure(data, channel, unit='V')
@@ -1708,7 +2188,47 @@ class MotorScanLogic(LogicBase):
                                 plt.close(fig)
                     else:
                         self.log.warning("No stream data to save.")
-                        
+
+                elif self._scan_data.scan_mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+                    # Save absolute frequency data
+                    # Add frequency tracking metadata
+                    metadata['Zero-crossing History'] = str(self._tracking_zero_crossing_history)
+                    if self._tracking_zero_crossing is not None:
+                        metadata['Final Zero-crossing (Hz)'] = self._tracking_zero_crossing
+
+                    if self._scan_data.stream_data_mean:
+                        for channel, data in self._scan_data.stream_data_mean.items():
+                            # Determine unit based on channel name
+                            if channel == 'absolute_frequency':
+                                unit = 'Hz'
+                                header = 'Absolute Frequency (Hz) (columns is X, rows is Y)'
+                            else:
+                                unit = ''
+                                header = f'{channel} data (columns is X, rows is Y)'
+
+                            file_path, _, _ = data_storage.save_data(
+                                data,
+                                metadata=metadata,
+                                nametag=channel,
+                                timestamp=timestamp,
+                                column_headers=header,
+                                use_timestamp=False
+                            )
+
+                            # Save thumbnail - display in GHz for readability
+                            if self._save_thumbnails and file_path:
+                                if channel == 'absolute_frequency':
+                                    # Convert Hz to GHz for display
+                                    data_ghz = data / 1e9
+                                    fig = self._draw_figure(data_ghz, 'Absolute Frequency', unit='GHz')
+                                else:
+                                    fig = self._draw_figure(data, channel, unit=unit)
+                                fig_path = file_path.rsplit('.', 1)[0]
+                                data_storage.save_thumbnail(fig, file_path=fig_path)
+                                plt.close(fig)
+                    else:
+                        self.log.warning("No frequency tracking data to save.")
+
                 elif self._scan_data.scan_mode == ScanMode.STEP_ODMR:
                     # Save ODMR fit result arrays
                     if self._scan_data.center_frequency is not None:
@@ -1798,6 +2318,9 @@ class MotorScanLogic(LogicBase):
                             timestamp, 
                             metadata
                         )
+                
+                # Save positions data (for all modes)
+                self._save_positions_data(scan_folder, timestamp, metadata)
                     
                 self.log.info(f"Scan data saved to: {scan_folder}")
 
@@ -2028,3 +2551,125 @@ class MotorScanLogic(LogicBase):
             
         except Exception as e:
             self.log.error(f"Failed to save raw ODMR data per pixel: {e}")
+
+    def _save_positions_data(
+        self,
+        scan_folder: str,
+        timestamp: datetime.datetime,
+        metadata: Dict
+    ):
+        """
+        Save target and actual positions for all scan points.
+        
+        Creates a 'positions.dat' file in the scan folder containing a table with:
+        - Point index and grid indices
+        - Target positions for each axis
+        - Actual (measured) positions for each axis
+        - Position errors (actual - target) for each axis
+        
+        This enables post-scan analysis of positioning accuracy.
+        
+        Args:
+            scan_folder: Path to the main scan folder
+            timestamp: Timestamp of the save operation
+            metadata: Base metadata dict
+        """
+        if self._scan_data is None:
+            return
+        
+        if self._scan_data.target_positions is None:
+            return
+        
+        try:
+            file_path = os.path.join(scan_folder, 'positions.dat')
+            axes = self._scan_data.scan_axes
+            n_axes = len(axes)
+            n_points = self._scan_data.total_points
+            
+            # Build column headers
+            col_headers = ['Point_Index']
+            if self._scan_data.is_2d:
+                col_headers.extend(['Grid_X', 'Grid_Y'])
+            else:
+                col_headers.append('Grid_Index')
+            
+            for axis in axes:
+                col_headers.append(f'Target_{axis} (m)')
+            for axis in axes:
+                col_headers.append(f'Actual_{axis} (m)')
+            for axis in axes:
+                col_headers.append(f'Error_{axis} (m)')
+            
+            with open(file_path, 'w') as f:
+                # Write header
+                f.write('# Motor Scan Position Data\n')
+                f.write(f'# Saved: {timestamp.isoformat()}\n')
+                f.write('#\n')
+                for key, val in metadata.items():
+                    f.write(f'# {key}: {val}\n')
+                f.write('#\n')
+                
+                # Compute position statistics
+                if self._scan_data.actual_positions is not None:
+                    valid_mask = ~np.isnan(self._scan_data.actual_positions).any(axis=1)
+                    if valid_mask.any():
+                        errors = self._scan_data.actual_positions[valid_mask] - self._scan_data.target_positions[valid_mask]
+                        mean_error = np.mean(np.abs(errors), axis=0)
+                        max_error = np.max(np.abs(errors), axis=0)
+                        rms_error = np.sqrt(np.mean(errors**2, axis=0))
+                        
+                        f.write('# Position Statistics:\n')
+                        for i, axis in enumerate(axes):
+                            f.write(f'#   {axis}-axis: mean_abs_error={mean_error[i]*1e6:.2f}um, '
+                                    f'max_abs_error={max_error[i]*1e6:.2f}um, '
+                                    f'rms_error={rms_error[i]*1e6:.2f}um\n')
+                        f.write('#\n')
+                
+                # Write column headers
+                f.write('# ' + '\t'.join(col_headers) + '\n')
+                
+                # Write data rows
+                for point_idx in range(n_points):
+                    row = [str(point_idx)]
+                    
+                    # Grid indices
+                    grid_idx = self._scan_data.point_index_to_grid_index(point_idx)
+                    if self._scan_data.is_2d:
+                        row.extend([str(grid_idx[0]), str(grid_idx[1])])
+                    else:
+                        row.append(str(grid_idx[0]))
+                    
+                    # Target positions
+                    target = self._scan_data.target_positions[point_idx]
+                    for i in range(n_axes):
+                        row.append(f'{target[i]:.9e}')
+                    
+                    # Actual positions
+                    if self._scan_data.actual_positions is not None:
+                        actual = self._scan_data.actual_positions[point_idx]
+                        for i in range(n_axes):
+                            if np.isnan(actual[i]):
+                                row.append('nan')
+                            else:
+                                row.append(f'{actual[i]:.9e}')
+                        
+                        # Errors
+                        for i in range(n_axes):
+                            if np.isnan(actual[i]):
+                                row.append('nan')
+                            else:
+                                error = actual[i] - target[i]
+                                row.append(f'{error:.9e}')
+                    else:
+                        # No actual positions recorded
+                        for i in range(n_axes):
+                            row.append('nan')
+                        for i in range(n_axes):
+                            row.append('nan')
+                    
+                    f.write('\t'.join(row) + '\n')
+            
+            self.log.debug(f"Saved positions data to {file_path}")
+            
+        except Exception as e:
+            self.log.error(f"Failed to save positions data: {e}")

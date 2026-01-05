@@ -46,6 +46,7 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self._create_toolbar()
         self._create_scan_display()
         self._create_control_panel()
+        self._create_stage_control_panel()
         self._create_status_bar()
     
     def _create_toolbar(self):
@@ -110,7 +111,12 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.mode_label = QtWidgets.QLabel(' Mode: ')
         self.toolbar.addWidget(self.mode_label)
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM'])
+        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK'])
+        self.mode_combo.setToolTip(
+            'STEP_ODMR: Stop at each point, take ODMR spectrum\n'
+            'CONTINUOUS_STREAM: Continuous movement, stream channel data\n'
+            'CONTINUOUS_FREQ_TRACK: Continuous movement, record absolute frequency from lock'
+        )
         self.toolbar.addWidget(self.mode_combo)
         
         # Scan pattern selector
@@ -217,16 +223,60 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         control_layout.addWidget(self.progress_bar, 2, 1, 1, 3)
         
         self.main_layout.addWidget(control_group, stretch=1)
-    
+
+    def _create_stage_control_panel(self):
+        """Create the stage control panel for manual positioning."""
+        stage_group = QtWidgets.QGroupBox('Stage Control')
+        stage_layout = QtWidgets.QGridLayout(stage_group)
+
+        # Target X position
+        stage_layout.addWidget(QtWidgets.QLabel('Target X (mm):'), 0, 0)
+        self.move_x_spinbox = QtWidgets.QDoubleSpinBox()
+        self.move_x_spinbox.setRange(0, 50)
+        self.move_x_spinbox.setDecimals(3)
+        self.move_x_spinbox.setValue(0)
+        self.move_x_spinbox.setSuffix(' mm')
+        stage_layout.addWidget(self.move_x_spinbox, 0, 1)
+
+        # Target Y position
+        stage_layout.addWidget(QtWidgets.QLabel('Target Y (mm):'), 0, 2)
+        self.move_y_spinbox = QtWidgets.QDoubleSpinBox()
+        self.move_y_spinbox.setRange(0, 50)
+        self.move_y_spinbox.setDecimals(3)
+        self.move_y_spinbox.setValue(0)
+        self.move_y_spinbox.setSuffix(' mm')
+        stage_layout.addWidget(self.move_y_spinbox, 0, 3)
+
+        # Buttons row
+        self.move_to_start_button = QtWidgets.QPushButton('Go to Scan Start')
+        self.move_to_start_button.setToolTip('Move stages to the scan start position (X Start, Y Start)')
+        stage_layout.addWidget(self.move_to_start_button, 1, 0, 1, 2)
+
+        self.move_button = QtWidgets.QPushButton('Move to Position')
+        self.move_button.setToolTip('Move stages to the target position specified above')
+        stage_layout.addWidget(self.move_button, 1, 2)
+
+        self.stop_move_button = QtWidgets.QPushButton('Stop')
+        self.stop_move_button.setToolTip('Stop current movement')
+        self.stop_move_button.setEnabled(False)  # Disabled until movement starts
+        stage_layout.addWidget(self.stop_move_button, 1, 3)
+
+        self.main_layout.addWidget(stage_group, stretch=0)
+
     def _create_status_bar(self):
         """Create the status bar."""
         self.statusbar = QtWidgets.QStatusBar()
         self.setStatusBar(self.statusbar)
-        
+
         # Position display
         self.position_label = QtWidgets.QLabel('Position: X=0.000mm, Y=0.000mm')
         self.statusbar.addPermanentWidget(self.position_label)
-        
+
+        # Lock status indicator (for CONTINUOUS_FREQ_TRACK mode)
+        self.lock_status_label = QtWidgets.QLabel('')
+        self.lock_status_label.setVisible(False)  # Hidden by default
+        self.statusbar.addPermanentWidget(self.lock_status_label)
+
         # Scan status
         self.scan_status_label = QtWidgets.QLabel('Idle')
         self.statusbar.addWidget(self.scan_status_label)
@@ -270,7 +320,10 @@ class MotorScanGui(GuiBase):
         self._logic.sigScanCompleted.connect(self._on_scan_completed)
         self._logic.sigSaveStateChanged.connect(self._on_save_state_changed)
         self._logic.sigHomingStateChanged.connect(self._on_homing_state_changed)
-        
+        self._logic.sigMovementStateChanged.connect(self._on_movement_state_changed)
+        self._logic.sigLockLostDuringScan.connect(self._on_lock_lost)
+        self._logic.sigLockStatusUpdated.connect(self._on_lock_status_updated)
+
         # Connect GUI signals
         self._mw.action_start_scan.triggered.connect(self._toggle_scan)
         self._mw.action_pause_scan.triggered.connect(self._toggle_pause)
@@ -280,7 +333,12 @@ class MotorScanGui(GuiBase):
         self._mw.mode_combo.currentTextChanged.connect(self._mode_changed)
         self._mw.pattern_combo.currentTextChanged.connect(self._pattern_changed)
         self._mw.display_combo.currentTextChanged.connect(self._display_channel_changed)
-        
+
+        # Connect stage control signals
+        self._mw.move_button.clicked.connect(self._move_to_position)
+        self._mw.move_to_start_button.clicked.connect(self._move_to_scan_start)
+        self._mw.stop_move_button.clicked.connect(self._logic.stop_movement)
+
         # Initialize display from logic
         self._restore_settings_from_logic()
         
@@ -297,7 +355,10 @@ class MotorScanGui(GuiBase):
         self._logic.sigScanCompleted.disconnect(self._on_scan_completed)
         self._logic.sigSaveStateChanged.disconnect(self._on_save_state_changed)
         self._logic.sigHomingStateChanged.disconnect(self._on_homing_state_changed)
-        
+        self._logic.sigMovementStateChanged.disconnect(self._on_movement_state_changed)
+        self._logic.sigLockLostDuringScan.disconnect(self._on_lock_lost)
+        self._logic.sigLockStatusUpdated.disconnect(self._on_lock_status_updated)
+
         # Close window
         if self._mw is not None:
             self._mw.close()
@@ -418,26 +479,30 @@ class MotorScanGui(GuiBase):
         if reply == QtWidgets.QMessageBox.Yes:
             self._mw.scan_status_label.setText('Homing...')
             self._mw.action_home_stages.setEnabled(False)
-            # Use QTimer.singleShot to call on next event loop iteration
-            # This ensures the GUI updates before the blocking call
-            QtCore.QTimer.singleShot(100, self._do_home_stages)
-    
-    def _do_home_stages(self):
-        """Actually perform the homing (called after GUI update)."""
-        self._logic.home_stages()
+            # Call home_stages which now runs asynchronously on the logic thread
+            self._logic.home_stages()
     
     def _mode_changed(self, mode_text: str):
         """Handle scan mode change."""
         self._logic.set_scan_mode(mode_text)
-        
+
         # Update display options based on mode
         self._mw.display_combo.clear()
         if mode_text == 'STEP_ODMR':
             self._mw.display_combo.addItems([
                 'Center Frequency', 'Linewidth', 'Splitting', 'Fit Quality'
             ])
+        elif mode_text == 'CONTINUOUS_FREQ_TRACK':
+            self._mw.display_combo.addItems(['Absolute Frequency'])
         else:
             self._mw.display_combo.addItems(['Mean Value'])
+
+        # Show/hide lock status indicator based on mode
+        show_lock_status = (mode_text == 'CONTINUOUS_FREQ_TRACK')
+        self._mw.lock_status_label.setVisible(show_lock_status)
+        if show_lock_status:
+            self._mw.lock_status_label.setText('🔓 Unlocked')
+            self._mw.lock_status_label.setStyleSheet('color: gray;')
     
     def _pattern_changed(self, pattern_text: str):
         """Handle scan pattern change."""
@@ -451,27 +516,44 @@ class MotorScanGui(GuiBase):
         """Handle scan state change from logic."""
         from qudi.logic.motor_scan_logic import ScanState
         
+        # Check if we're in any active state (initializing, running, or paused)
+        is_busy = state in (ScanState.INITIALIZING, ScanState.RUNNING, ScanState.PAUSED)
         is_running = state in (ScanState.RUNNING, ScanState.PAUSED)
         is_paused = state == ScanState.PAUSED
+        is_initializing = state == ScanState.INITIALIZING
         
-        self._mw.action_start_scan.setChecked(is_running)
+        # Start button: checked when running/paused, but also when initializing
+        self._mw.action_start_scan.setChecked(is_busy)
+        # Disable start button during initialization (can't stop during init)
+        self._mw.action_start_scan.setEnabled(not is_initializing)
+        
         self._mw.action_pause_scan.setChecked(is_paused)
         self._mw.action_pause_scan.setEnabled(is_running)
         
-        # Disable settings and home button during scan
-        self._mw.x_start_spinbox.setEnabled(not is_running)
-        self._mw.x_stop_spinbox.setEnabled(not is_running)
-        self._mw.y_start_spinbox.setEnabled(not is_running)
-        self._mw.y_stop_spinbox.setEnabled(not is_running)
-        self._mw.x_points_spinbox.setEnabled(not is_running)
-        self._mw.y_points_spinbox.setEnabled(not is_running)
-        self._mw.mode_combo.setEnabled(not is_running)
-        self._mw.pattern_combo.setEnabled(not is_running)
-        self._mw.apply_settings_button.setEnabled(not is_running)
-        self._mw.action_home_stages.setEnabled(not is_running)
-        
-        # Update status
-        self._mw.scan_status_label.setText(state.name)
+        # Disable all settings during any busy state
+        self._mw.x_start_spinbox.setEnabled(not is_busy)
+        self._mw.x_stop_spinbox.setEnabled(not is_busy)
+        self._mw.y_start_spinbox.setEnabled(not is_busy)
+        self._mw.y_stop_spinbox.setEnabled(not is_busy)
+        self._mw.x_points_spinbox.setEnabled(not is_busy)
+        self._mw.y_points_spinbox.setEnabled(not is_busy)
+        self._mw.mode_combo.setEnabled(not is_busy)
+        self._mw.pattern_combo.setEnabled(not is_busy)
+        self._mw.apply_settings_button.setEnabled(not is_busy)
+        self._mw.action_home_stages.setEnabled(not is_busy)
+
+        # Disable stage control during scan
+        self._mw.move_x_spinbox.setEnabled(not is_busy)
+        self._mw.move_y_spinbox.setEnabled(not is_busy)
+        self._mw.move_button.setEnabled(not is_busy)
+        self._mw.move_to_start_button.setEnabled(not is_busy)
+        self._mw.stop_move_button.setEnabled(False)  # Stop button only for manual moves
+
+        # Update status label with user-friendly text
+        if is_initializing:
+            self._mw.scan_status_label.setText('Initializing (homing/positioning)...')
+        else:
+            self._mw.scan_status_label.setText(state.name)
     
     def _on_scan_data_updated(self):
         """Handle scan data update from logic."""
@@ -506,13 +588,109 @@ class MotorScanGui(GuiBase):
     
     def _on_homing_state_changed(self, is_homing: bool):
         """Handle homing state change from logic."""
+        # Disable all controls during homing (same as during scan initialization)
         self._mw.action_home_stages.setEnabled(not is_homing)
         self._mw.action_start_scan.setEnabled(not is_homing)
+        self._mw.action_pause_scan.setEnabled(False)  # Can't pause during homing
+        
+        # Disable all settings during homing
+        self._mw.x_start_spinbox.setEnabled(not is_homing)
+        self._mw.x_stop_spinbox.setEnabled(not is_homing)
+        self._mw.y_start_spinbox.setEnabled(not is_homing)
+        self._mw.y_stop_spinbox.setEnabled(not is_homing)
+        self._mw.x_points_spinbox.setEnabled(not is_homing)
+        self._mw.y_points_spinbox.setEnabled(not is_homing)
+        self._mw.mode_combo.setEnabled(not is_homing)
+        self._mw.pattern_combo.setEnabled(not is_homing)
+        self._mw.apply_settings_button.setEnabled(not is_homing)
+
+        # Disable stage control during homing
+        self._mw.move_x_spinbox.setEnabled(not is_homing)
+        self._mw.move_y_spinbox.setEnabled(not is_homing)
+        self._mw.move_button.setEnabled(not is_homing)
+        self._mw.move_to_start_button.setEnabled(not is_homing)
+        self._mw.stop_move_button.setEnabled(False)  # Can't stop homing with this button
+
+        # Update status label
         if is_homing:
-            self._mw.scan_status_label.setText('Homing...')
+            self._mw.scan_status_label.setText('Homing stages...')
         else:
             self._mw.scan_status_label.setText('Homing complete')
-    
+
+    def _on_movement_state_changed(self, is_moving: bool):
+        """Handle movement state change from logic."""
+        # Disable all controls during movement (same as during homing)
+        self._mw.action_home_stages.setEnabled(not is_moving)
+        self._mw.action_start_scan.setEnabled(not is_moving)
+        self._mw.action_pause_scan.setEnabled(False)  # Can't pause during movement
+
+        # Disable all scan settings during movement
+        self._mw.x_start_spinbox.setEnabled(not is_moving)
+        self._mw.x_stop_spinbox.setEnabled(not is_moving)
+        self._mw.y_start_spinbox.setEnabled(not is_moving)
+        self._mw.y_stop_spinbox.setEnabled(not is_moving)
+        self._mw.x_points_spinbox.setEnabled(not is_moving)
+        self._mw.y_points_spinbox.setEnabled(not is_moving)
+        self._mw.mode_combo.setEnabled(not is_moving)
+        self._mw.pattern_combo.setEnabled(not is_moving)
+        self._mw.apply_settings_button.setEnabled(not is_moving)
+
+        # Disable stage control inputs during movement
+        self._mw.move_x_spinbox.setEnabled(not is_moving)
+        self._mw.move_y_spinbox.setEnabled(not is_moving)
+        self._mw.move_button.setEnabled(not is_moving)
+        self._mw.move_to_start_button.setEnabled(not is_moving)
+
+        # Stop button is ONLY enabled during movement
+        self._mw.stop_move_button.setEnabled(is_moving)
+
+        # Update status label
+        if is_moving:
+            self._mw.scan_status_label.setText('Moving to position...')
+        else:
+            self._mw.scan_status_label.setText('Ready')
+
+    def _move_to_position(self):
+        """Move stages to the target position specified in spinboxes."""
+        x = self._mw.move_x_spinbox.value() / 1000  # mm to m
+        y = self._mw.move_y_spinbox.value() / 1000  # mm to m
+        self._logic.move_to_position({'x': x, 'y': y})
+
+    def _move_to_scan_start(self):
+        """Move stages to the scan start position."""
+        x = self._mw.x_start_spinbox.value() / 1000  # mm to m
+        y = self._mw.y_start_spinbox.value() / 1000  # mm to m
+        self._logic.move_to_position({'x': x, 'y': y})
+
+    @QtCore.Slot()
+    def _on_lock_lost(self):
+        """Handle lock lost during CONTINUOUS_FREQ_TRACK scan."""
+        # Show warning dialog
+        QtWidgets.QMessageBox.warning(
+            self._mw,
+            'Lock Lost',
+            'Frequency lock was lost during scan.\n\n'
+            'The scan has been paused. Please:\n'
+            '1. Check the ODMR Tracking GUI\n'
+            '2. Re-enable the frequency lock\n'
+            '3. Click Resume to continue scanning\n\n'
+            'Note: Zero-crossing may update if you perform a new ODMR fit.',
+            QtWidgets.QMessageBox.Ok
+        )
+        # Update lock status indicator
+        self._mw.lock_status_label.setText('🔓 Lock LOST')
+        self._mw.lock_status_label.setStyleSheet('color: red; font-weight: bold;')
+
+    @QtCore.Slot(bool)
+    def _on_lock_status_updated(self, locked: bool):
+        """Handle lock status update from logic."""
+        if locked:
+            self._mw.lock_status_label.setText('🔒 Locked')
+            self._mw.lock_status_label.setStyleSheet('color: green;')
+        else:
+            self._mw.lock_status_label.setText('🔓 Unlocked')
+            self._mw.lock_status_label.setStyleSheet('color: orange;')
+
     def _update_display(self):
         """Update the scan image display."""
         scan_data = self._logic.scan_data
@@ -537,6 +715,13 @@ class MotorScanGui(GuiBase):
             elif display_channel == 'Fit Quality' and scan_data.fit_quality is not None:
                 data = scan_data.fit_quality
                 unit = ''
+            else:
+                return
+        elif scan_data.scan_mode == ScanMode.CONTINUOUS_FREQ_TRACK:
+            # Frequency tracking mode - display in GHz for readability
+            if scan_data.stream_data_mean and 'absolute_frequency' in scan_data.stream_data_mean:
+                data = scan_data.stream_data_mean['absolute_frequency'] / 1e9  # Hz to GHz
+                unit = 'GHz'
             else:
                 return
         else:

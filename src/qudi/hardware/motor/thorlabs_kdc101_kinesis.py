@@ -49,7 +49,7 @@ Example config:
                     serial: '27500002'
                     pos_min: 0
                     pos_max: 0.05
-            default_velocity: 2.0e-3  # m/s
+            default_velocity: 2.0e-3  # m/s (used for all movements, including homing)
             settle_time: 0.01         # seconds
             auto_home: false
 
@@ -63,7 +63,7 @@ For 1D mode, omit the 'y' axis from axis_config:
                     serial: '27500001'
                     pos_min: 0
                     pos_max: 0.05
-            default_velocity: 2.0e-3
+            default_velocity: 2.0e-3  # used for all movements, including homing
 """
 
 import time
@@ -132,6 +132,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         name='default_velocity',
         default=SPECS.DEFAULT_VELOCITY
     )
+
     _settle_time = ConfigOption(
         name='settle_time',
         default=SPECS.DEFAULT_SETTLE_TIME
@@ -500,6 +501,8 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         and establishes the zero reference. After homing, the stage stays
         at the home offset position (typically ~1mm from the limit).
 
+        Uses the 'default_velocity' config option for homing speed.
+
         Args:
             param_list: Optional list of axis labels to home. If None, homes all.
 
@@ -509,6 +512,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         try:
             axes_to_home = param_list if param_list is not None else list(self._stages.keys())
             self.log.info(f"Homing axes: {axes_to_home}")
+            self.log.info(f"Homing velocity: {self._default_velocity*1000:.2f} mm/s")
 
             for axis_label in axes_to_home:
                 if axis_label not in self._stages:
@@ -516,6 +520,13 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                     continue
                     
                 stage = self._stages[axis_label]
+                
+                # Set homing velocity to default_velocity
+                try:
+                    stage.setup_homing(velocity=self._default_velocity)
+                except Exception as e:
+                    self.log.warning(f"Could not set homing velocity for {axis_label}-axis: {e}")
+                
                 pos_before = stage.get_position()
                 self.log.info(f"Homing {axis_label}-axis (from {pos_before*1000:.1f}mm)...")
                 
@@ -546,8 +557,28 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                     self.log.error(f"{axis_label}-axis homing timed out after {timeout}s")
                     return -1
                 
+                # After homing completes, encoder has been reset by firmware.
+                # Small delay to ensure encoder state is synchronized before reading position.
+                time.sleep(0.5)
                 pos_after = stage.get_position()
                 elapsed = time.time() - start_time
+                
+                # Verify homing actually happened: position should be near home (~-2mm to +2mm)
+                # and if we started far from home, it should have taken significant time
+                home_position_ok = abs(pos_after) < 2e-3  # Within 2mm of zero
+                time_plausible = elapsed > 2.0 or abs(pos_before) < 5e-3  # >2s unless started near home
+                
+                if not home_position_ok:
+                    self.log.warning(
+                        f"{axis_label}-axis homing may have failed: position {pos_after*1000:.1f}mm "
+                        f"is not near home. Expected ~0mm (within ±2mm)."
+                    )
+                elif not time_plausible:
+                    self.log.warning(
+                        f"{axis_label}-axis homing completed unusually fast ({elapsed:.1f}s) "
+                        f"from {pos_before*1000:.1f}mm. Homing may not have executed properly."
+                    )
+                
                 self.log.info(f"{axis_label}-axis homed in {elapsed:.1f}s (position: {pos_after*1000:.1f}mm)")
 
             self._is_homed = True
