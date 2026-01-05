@@ -25,6 +25,7 @@ from qudi.core.connector import Connector
 from qudi.util.paths import get_artwork_dir
 from qudi.util.colordefs import QudiPalettePale as palette
 from qudi.util.widgets.plotting.image_widget import RubberbandZoomSelectionImageWidget
+from qudi.gui.motor_scan.pixel_odmr_widget import PixelOdmrSpectrumWidget
 
 
 class MotorScanMainWindow(QtWidgets.QMainWindow):
@@ -142,11 +143,14 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.display_combo)
     
     def _create_scan_display(self):
-        """Create the main scan image display."""
-        # Scan image widget
+        """Create the main scan image display with optional pixel spectrum viewer."""
+        # Create splitter to hold scan image and spectrum viewer
+        self.display_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        # Scan image widget (left side)
         self.scan_groupbox = QtWidgets.QGroupBox('Scan Image')
         scan_layout = QtWidgets.QVBoxLayout(self.scan_groupbox)
-        
+
         self.image_widget = RubberbandZoomSelectionImageWidget(
             allow_tracking_outside_data=True,
             xy_region_selection_crosshair=True,
@@ -156,9 +160,24 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.image_widget.set_axis_label('bottom', label='X Position', unit='m')
         self.image_widget.set_axis_label('left', label='Y Position', unit='m')
         self.image_widget.set_data_label(label='Value', unit='')
-        
+
         scan_layout.addWidget(self.image_widget)
-        self.main_layout.addWidget(self.scan_groupbox, stretch=3)
+        self.display_splitter.addWidget(self.scan_groupbox)
+
+        # Pixel ODMR spectrum viewer (right side) - only for STEP_ODMR mode
+        self.pixel_spectrum_groupbox = QtWidgets.QGroupBox('Pixel ODMR Spectrum')
+        spectrum_layout = QtWidgets.QVBoxLayout(self.pixel_spectrum_groupbox)
+        self.pixel_spectrum_widget = PixelOdmrSpectrumWidget()
+        spectrum_layout.addWidget(self.pixel_spectrum_widget)
+        self.display_splitter.addWidget(self.pixel_spectrum_groupbox)
+
+        # Set initial sizes (60% scan image, 40% spectrum)
+        self.display_splitter.setSizes([600, 400])
+
+        # Hide spectrum panel initially (shown only in STEP_ODMR mode)
+        self.pixel_spectrum_groupbox.setVisible(False)
+
+        self.main_layout.addWidget(self.display_splitter, stretch=3)
     
     def _create_control_panel(self):
         """Create the scan control panel."""
@@ -303,6 +322,7 @@ class MotorScanGui(GuiBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._mw = None
+        self._selected_pixel = None  # Tuple (ix, iy) or None for pixel spectrum viewer
     
     def on_activate(self):
         """Initialize the GUI."""
@@ -339,6 +359,12 @@ class MotorScanGui(GuiBase):
         self._mw.move_to_start_button.clicked.connect(self._move_to_scan_start)
         self._mw.stop_move_button.clicked.connect(self._logic.stop_movement)
 
+        # Connect pixel click signal for ODMR spectrum viewer
+        # Connect to pyqtgraph scene's sigMouseClicked for reliable click detection
+        self._mw.image_widget.plot_widget.scene().sigMouseClicked.connect(
+            self._on_scene_mouse_clicked
+        )
+
         # Initialize display from logic
         self._restore_settings_from_logic()
         
@@ -358,6 +384,11 @@ class MotorScanGui(GuiBase):
         self._logic.sigMovementStateChanged.disconnect(self._on_movement_state_changed)
         self._logic.sigLockLostDuringScan.disconnect(self._on_lock_lost)
         self._logic.sigLockStatusUpdated.disconnect(self._on_lock_status_updated)
+
+        # Disconnect pixel click signal
+        self._mw.image_widget.plot_widget.scene().sigMouseClicked.disconnect(
+            self._on_scene_mouse_clicked
+        )
 
         # Close window
         if self._mw is not None:
@@ -398,7 +429,7 @@ class MotorScanGui(GuiBase):
         if 'scan_mode' in settings:
             mode_val = settings['scan_mode']
             if isinstance(mode_val, int):
-                from qudi.logic.motor_scan_logic import ScanMode
+                from qudi.logic.motor_scan import ScanMode
                 mode_name = ScanMode(mode_val).name
             else:
                 mode_name = str(mode_val)
@@ -412,12 +443,16 @@ class MotorScanGui(GuiBase):
             if isinstance(pattern_val, str):
                 pattern_name = pattern_val
             else:
-                from qudi.logic.motor_scan_logic import ScanPattern
+                from qudi.logic.motor_scan import ScanPattern
                 pattern_name = ScanPattern(pattern_val).name
             index = self._mw.pattern_combo.findText(pattern_name)
             if index >= 0:
                 self._mw.pattern_combo.setCurrentIndex(index)
-    
+
+        # Ensure pixel spectrum panel visibility matches current mode
+        current_mode = self._mw.mode_combo.currentText()
+        self._mw.pixel_spectrum_groupbox.setVisible(current_mode == 'STEP_ODMR')
+
     def _apply_settings(self):
         """Apply current GUI settings to logic."""
         # Block settings changed signal to avoid restoring values while we're updating
@@ -503,6 +538,15 @@ class MotorScanGui(GuiBase):
         if show_lock_status:
             self._mw.lock_status_label.setText('🔓 Unlocked')
             self._mw.lock_status_label.setStyleSheet('color: gray;')
+
+        # Show/hide pixel spectrum panel based on mode (only for STEP_ODMR)
+        is_step_odmr = (mode_text == 'STEP_ODMR')
+        self._mw.pixel_spectrum_groupbox.setVisible(is_step_odmr)
+
+        # Clear spectrum when switching away from STEP_ODMR
+        if not is_step_odmr:
+            self._selected_pixel = None
+            self._mw.pixel_spectrum_widget.clear()
     
     def _pattern_changed(self, pattern_text: str):
         """Handle scan pattern change."""
@@ -514,14 +558,19 @@ class MotorScanGui(GuiBase):
     
     def _on_scan_state_changed(self, state):
         """Handle scan state change from logic."""
-        from qudi.logic.motor_scan_logic import ScanState
-        
+        from qudi.logic.motor_scan import ScanState
+
         # Check if we're in any active state (initializing, running, or paused)
         is_busy = state in (ScanState.INITIALIZING, ScanState.RUNNING, ScanState.PAUSED)
         is_running = state in (ScanState.RUNNING, ScanState.PAUSED)
         is_paused = state == ScanState.PAUSED
         is_initializing = state == ScanState.INITIALIZING
-        
+
+        # Clear pixel spectrum when a new scan starts
+        if is_initializing:
+            self._selected_pixel = None
+            self._mw.pixel_spectrum_widget.clear()
+
         # Start button: checked when running/paused, but also when initializing
         self._mw.action_start_scan.setChecked(is_busy)
         # Disable start button during initialization (can't stop during init)
@@ -559,6 +608,10 @@ class MotorScanGui(GuiBase):
         """Handle scan data update from logic."""
         self._update_display()
         self._update_progress()
+
+        # Refresh pixel spectrum if a pixel is selected (updates with new fit data)
+        if self._selected_pixel is not None:
+            self._refresh_selected_pixel_spectrum()
     
     def _on_position_updated(self, position: Dict[str, float]):
         """Handle position update from logic."""
@@ -700,7 +753,7 @@ class MotorScanGui(GuiBase):
         display_channel = self._mw.display_combo.currentText()
         
         # Get the appropriate data array based on display selection
-        from qudi.logic.motor_scan_logic import ScanMode
+        from qudi.logic.motor_scan import ScanMode
         
         if scan_data.scan_mode == ScanMode.STEP_ODMR:
             if display_channel == 'Center Frequency' and scan_data.center_frequency is not None:
@@ -749,3 +802,236 @@ class MotorScanGui(GuiBase):
         if scan_data is not None:
             progress = int(scan_data.progress * 100)
             self._mw.progress_bar.setValue(progress)
+
+    def _on_scene_mouse_clicked(self, event) -> None:
+        """
+        Handle mouse click on scan image scene.
+
+        Uses pyqtgraph scene's sigMouseClicked for reliable click detection
+        that works regardless of zoom level or view transformations.
+
+        Args:
+            event: MouseClickEvent from pyqtgraph scene
+        """
+        # Only handle left clicks
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+
+        # Get the ViewBox to convert coordinates
+        view_box = self._mw.image_widget.plot_widget.getViewBox()
+
+        # Check if click is within the ViewBox
+        scene_pos = event.scenePos()
+        if not view_box.sceneBoundingRect().contains(scene_pos):
+            return
+
+        # Map scene coordinates to data coordinates
+        data_pos = view_box.mapSceneToView(scene_pos)
+        x_pos = data_pos.x()
+        y_pos = data_pos.y()
+
+        # Handle the pixel click
+        self._handle_pixel_click(x_pos, y_pos)
+
+    def _handle_pixel_click(self, x_pos: float, y_pos: float) -> None:
+        """
+        Handle a pixel click at the given data coordinates.
+
+        Args:
+            x_pos: X position in meters
+            y_pos: Y position in meters
+        """
+        from qudi.logic.motor_scan import ScanMode
+
+        # Only handle in STEP_ODMR mode
+        scan_data = self._logic.scan_data
+        if scan_data is None or scan_data.scan_mode != ScanMode.STEP_ODMR:
+            return
+
+        # Convert position to grid index
+        grid_idx = self._position_to_grid_index(x_pos, y_pos)
+        if grid_idx is None:
+            return
+
+        ix, iy = grid_idx
+        self._selected_pixel = grid_idx
+
+        # Get ODMR data for this pixel
+        linear_idx = self._grid_index_to_linear_index(ix, iy)
+
+        # Check if data exists for this pixel
+        if scan_data.odmr_raw_per_pixel is None:
+            self._mw.pixel_spectrum_widget.clear()
+            return
+
+        if linear_idx >= len(scan_data.odmr_raw_per_pixel):
+            self._mw.pixel_spectrum_widget.clear()
+            return
+
+        raw_data = scan_data.odmr_raw_per_pixel[linear_idx]
+        if raw_data is None:
+            self._mw.pixel_spectrum_widget.clear()
+            return
+
+        # Get fit result (may be None if not fitted yet)
+        fit_result = None
+        if scan_data.odmr_fit_results is not None:
+            if ix < len(scan_data.odmr_fit_results):
+                if iy < len(scan_data.odmr_fit_results[ix]):
+                    fit_result = scan_data.odmr_fit_results[ix][iy]
+
+        # Prepare pixel info
+        pixel_info = {
+            'grid_index': (ix, iy),
+            'position_mm': (x_pos * 1000, y_pos * 1000),  # m to mm
+        }
+
+        # Update spectrum widget
+        self._mw.pixel_spectrum_widget.set_pixel_data(
+            frequency_data=raw_data.get('frequency_data'),
+            signal_data=raw_data.get('signal_data'),
+            fit_result=fit_result,
+            pixel_info=pixel_info
+        )
+
+    def _position_to_grid_index(self, x_pos: float, y_pos: float) -> Optional[Tuple[int, int]]:
+        """
+        Convert data coordinates (meters) to grid indices (ix, iy).
+
+        Args:
+            x_pos: X position in meters
+            y_pos: Y position in meters
+
+        Returns:
+            Tuple (ix, iy) or None if position is far out of bounds
+        """
+        scan_data = self._logic.scan_data
+        if scan_data is None:
+            return None
+
+        x_range = scan_data.scan_range[0]  # (start, stop) in meters
+        y_range = scan_data.scan_range[1]
+        nx, ny = scan_data.scan_resolution
+
+        # Calculate pixel size for tolerance
+        x_span = abs(x_range[1] - x_range[0])
+        y_span = abs(y_range[1] - y_range[0])
+        pixel_size_x = x_span / max(1, nx - 1) if nx > 1 else x_span
+        pixel_size_y = y_span / max(1, ny - 1) if ny > 1 else y_span
+
+        # Add tolerance of 1 pixel to bounds check (allows clicking on edge pixels)
+        x_min, x_max = min(x_range), max(x_range)
+        y_min, y_max = min(y_range), max(y_range)
+        tolerance_x = pixel_size_x * 0.6
+        tolerance_y = pixel_size_y * 0.6
+
+        # Check bounds with tolerance
+        if not (x_min - tolerance_x <= x_pos <= x_max + tolerance_x and
+                y_min - tolerance_y <= y_pos <= y_max + tolerance_y):
+            return None
+
+        # Linear interpolation to nearest index
+        if x_range[1] != x_range[0]:
+            ix = int(round((x_pos - x_range[0]) / (x_range[1] - x_range[0]) * (nx - 1)))
+        else:
+            ix = 0
+        if y_range[1] != y_range[0]:
+            iy = int(round((y_pos - y_range[0]) / (y_range[1] - y_range[0]) * (ny - 1)))
+        else:
+            iy = 0
+
+        # Clamp to valid range
+        ix = max(0, min(nx - 1, ix))
+        iy = max(0, min(ny - 1, iy))
+
+        return (ix, iy)
+
+    def _grid_index_to_linear_index(self, ix: int, iy: int) -> int:
+        """
+        Convert grid indices to linear index accounting for scan pattern.
+
+        Args:
+            ix: X grid index
+            iy: Y grid index
+
+        Returns:
+            Linear index into odmr_raw_per_pixel list
+        """
+        from qudi.logic.motor_scan import ScanPattern
+
+        scan_data = self._logic.scan_data
+        nx = scan_data.scan_resolution[0]
+        pattern = scan_data.scan_pattern
+
+        if pattern in (ScanPattern.LINE_BY_LINE_X, ScanPattern.SNAKE_X):
+            # Fast axis is X
+            if pattern == ScanPattern.SNAKE_X and iy % 2 == 1:
+                ix_in_line = nx - 1 - ix  # Reverse for odd lines
+            else:
+                ix_in_line = ix
+            return iy * nx + ix_in_line
+        else:
+            # Fast axis is Y (LINE_BY_LINE_Y or SNAKE_Y)
+            ny = scan_data.scan_resolution[1]
+            if pattern == ScanPattern.SNAKE_Y and ix % 2 == 1:
+                iy_in_line = ny - 1 - iy
+            else:
+                iy_in_line = iy
+            return ix * ny + iy_in_line
+
+    def _refresh_selected_pixel_spectrum(self) -> None:
+        """Refresh the spectrum display for the currently selected pixel."""
+        if self._selected_pixel is None:
+            return
+
+        from qudi.logic.motor_scan import ScanMode
+
+        scan_data = self._logic.scan_data
+        if scan_data is None or scan_data.scan_mode != ScanMode.STEP_ODMR:
+            return
+
+        ix, iy = self._selected_pixel
+        linear_idx = self._grid_index_to_linear_index(ix, iy)
+
+        # Check if data exists for this pixel
+        if scan_data.odmr_raw_per_pixel is None:
+            return
+
+        if linear_idx >= len(scan_data.odmr_raw_per_pixel):
+            return
+
+        raw_data = scan_data.odmr_raw_per_pixel[linear_idx]
+        if raw_data is None:
+            return
+
+        # Get fit result
+        fit_result = None
+        if scan_data.odmr_fit_results is not None:
+            if ix < len(scan_data.odmr_fit_results):
+                if iy < len(scan_data.odmr_fit_results[ix]):
+                    fit_result = scan_data.odmr_fit_results[ix][iy]
+
+        # Get position from scan data
+        x_range = scan_data.scan_range[0]
+        y_range = scan_data.scan_range[1]
+        nx, ny = scan_data.scan_resolution
+        if nx > 1:
+            x_pos = x_range[0] + ix * (x_range[1] - x_range[0]) / (nx - 1)
+        else:
+            x_pos = x_range[0]
+        if ny > 1:
+            y_pos = y_range[0] + iy * (y_range[1] - y_range[0]) / (ny - 1)
+        else:
+            y_pos = y_range[0]
+
+        pixel_info = {
+            'grid_index': (ix, iy),
+            'position_mm': (x_pos * 1000, y_pos * 1000),
+        }
+
+        self._mw.pixel_spectrum_widget.set_pixel_data(
+            frequency_data=raw_data.get('frequency_data'),
+            signal_data=raw_data.get('signal_data'),
+            fit_result=fit_result,
+            pixel_info=pixel_info
+        )
