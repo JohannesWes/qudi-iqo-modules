@@ -238,3 +238,94 @@ class MotorControlMixin:
         async homing where we can poll is_moving() separately.
         """
         pass
+
+    # =========================================================================
+    # Position Sampling for Continuous Line Scanning
+    # =========================================================================
+
+    def _init_position_sampling_state(self):
+        """Initialize state variables for position sampling. Call from __init__."""
+        self._position_sample_buffer = []  # List of (timestamp, {axis: position})
+        self._position_sample_timer = None
+        self._position_sampling_active = False
+        self._line_scan_start_time = 0.0
+
+    def _start_position_sampling(self, sample_interval_ms: int = 50):
+        """
+        Start recording timestamped positions at regular intervals.
+        
+        Args:
+            sample_interval_ms: Interval between position samples in milliseconds.
+        """
+        self._position_sample_buffer = []
+        self._line_scan_start_time = time.time()
+        self._position_sampling_active = True
+        
+        # Create timer if needed
+        if self._position_sample_timer is None:
+            self._position_sample_timer = QtCore.QTimer()
+            self._position_sample_timer.timeout.connect(
+                self._on_position_sample_timeout,
+                QtCore.Qt.QueuedConnection
+            )
+        
+        # Record initial position
+        self._record_position_sample()
+        
+        # Start periodic sampling
+        self._position_sample_timer.start(sample_interval_ms)
+        self.log.debug(f"Position sampling started at {1000/sample_interval_ms:.0f} Hz")
+
+    def _stop_position_sampling(self) -> list:
+        """
+        Stop position sampling and return the recorded buffer.
+        
+        Returns:
+            List of (timestamp, {axis: position}) tuples recorded during sampling.
+        """
+        if self._position_sample_timer is not None:
+            self._position_sample_timer.stop()
+        
+        # Record final position
+        if self._position_sampling_active:
+            self._record_position_sample()
+        
+        self._position_sampling_active = False
+        buffer = self._position_sample_buffer.copy()
+        
+        if len(buffer) > 0:
+            duration = buffer[-1][0] - buffer[0][0]
+            self.log.debug(f"Position sampling stopped: {len(buffer)} samples over {duration:.2f}s")
+        
+        return buffer
+
+    def _record_position_sample(self):
+        """Record a single timestamped position sample."""
+        try:
+            timestamp = time.time() - self._line_scan_start_time
+            position = self.current_position
+            if position:
+                # FIX Finding #5: Jitter detection for stale position data
+                # If consecutive samples are identical, hardware may be returning cached values
+                if len(self._position_sample_buffer) > 0:
+                    _, prev_position = self._position_sample_buffer[-1]
+                    if position == prev_position:
+                        if not getattr(self, '_jitter_warning_logged', False):
+                            self.log.warning(
+                                "Identical consecutive position samples detected. "
+                                "Motor may be returning cached/stale encoder values."
+                            )
+                            self._jitter_warning_logged = True
+                    else:
+                        self._jitter_warning_logged = False
+                
+                self._position_sample_buffer.append((timestamp, position.copy()))
+        except Exception as e:
+            self.log.debug(f"Failed to record position sample: {e}")
+
+    @QtCore.Slot()
+    def _on_position_sample_timeout(self):
+        """Called periodically to record position samples."""
+        if not self._position_sampling_active:
+            return
+        self._record_position_sample()

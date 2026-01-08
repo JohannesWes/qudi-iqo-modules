@@ -271,7 +271,172 @@ class MotorScanData:
                                      for _ in range(shape_2d[0] if self.is_2d else 1)]
             # Initialize storage for raw ODMR data per pixel
             self.odmr_raw_per_pixel = [None for _ in range(self.total_points)]
+
+    # =========================================================================
+    # Continuous Line Scanning Helpers
+    # =========================================================================
     
+    def get_fast_axis(self) -> str:
+        """
+        Get the fast axis (axis scanned along within a line).
+        
+        Returns:
+            'x' for *_X patterns, 'y' for *_Y patterns.
+        """
+        if self.scan_pattern in (ScanPattern.LINE_BY_LINE_X, ScanPattern.SNAKE_X):
+            return 'x'
+        else:
+            return 'y'
+    
+    def get_slow_axis(self) -> str:
+        """
+        Get the slow axis (axis stepped between lines).
+        
+        Returns:
+            'y' for *_X patterns, 'x' for *_Y patterns.
+        """
+        if self.scan_pattern in (ScanPattern.LINE_BY_LINE_X, ScanPattern.SNAKE_X):
+            return 'y'
+        else:
+            return 'x'
+    
+    def get_num_lines(self) -> int:
+        """
+        Get the number of lines in the scan.
+        
+        Returns:
+            Number of lines (same as resolution along slow axis).
+        """
+        if not self.is_2d:
+            return 1
+        if self.scan_pattern in (ScanPattern.LINE_BY_LINE_X, ScanPattern.SNAKE_X):
+            return self.scan_resolution[1]  # ny lines
+        else:
+            return self.scan_resolution[0]  # nx lines
+    
+    def get_points_per_line(self) -> int:
+        """
+        Get the number of points per line.
+        
+        Returns:
+            Number of points along the fast axis.
+        """
+        if not self.is_2d:
+            return self.scan_resolution[0]
+        if self.scan_pattern in (ScanPattern.LINE_BY_LINE_X, ScanPattern.SNAKE_X):
+            return self.scan_resolution[0]  # nx points per line
+        else:
+            return self.scan_resolution[1]  # ny points per line
+    
+    def get_line_point_indices(self, line_index: int) -> List[int]:
+        """
+        Get flat point indices for all points in a line.
+        
+        Args:
+            line_index: Zero-based line index.
+            
+        Returns:
+            List of flat point indices for this line, in scan order.
+        """
+        points_per_line = self.get_points_per_line()
+        start_idx = line_index * points_per_line
+        return list(range(start_idx, start_idx + points_per_line))
+    
+    def get_line_grid_positions(self, line_index: int) -> np.ndarray:
+        """
+        Get target (x, y) positions for all points in a line.
+        
+        Args:
+            line_index: Zero-based line index.
+            
+        Returns:
+            2D array of shape (points_per_line, 2) with [x, y] positions.
+        """
+        point_indices = self.get_line_point_indices(line_index)
+        if self.target_positions is not None:
+            return self.target_positions[point_indices]
+        return np.array([])
+    
+    def get_line_start_end_positions(self, line_index: int) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        Get the start and end positions for a line.
+        
+        Args:
+            line_index: Zero-based line index.
+            
+        Returns:
+            Tuple of (start_position_dict, end_position_dict).
+        """
+        positions = self.get_line_grid_positions(line_index)
+        if len(positions) == 0:
+            return {}, {}
+        
+        start_pos = {axis: positions[0, i] for i, axis in enumerate(self.scan_axes)}
+        end_pos = {axis: positions[-1, i] for i, axis in enumerate(self.scan_axes)}
+        return start_pos, end_pos
+    
+    def get_bin_boundaries(self, line_index: int) -> np.ndarray:
+        """
+        Get positions of bin boundaries (midpoints between grid points) for a line.
+        
+        The boundaries define where data should be split. For N grid points,
+        there are N+1 boundaries: one before the first point, one after the last,
+        and N-1 midpoints between adjacent points.
+        
+        Args:
+            line_index: Zero-based line index.
+            
+        Returns:
+            1D array of positions along the fast axis at bin boundaries.
+            Length is (points_per_line + 1).
+        """
+        positions = self.get_line_grid_positions(line_index)
+        if len(positions) == 0:
+            return np.array([])
+        
+        # Get fast axis index (0 for x, 1 for y in 2D)
+        fast_axis = self.get_fast_axis()
+        fast_axis_idx = 0 if fast_axis == 'x' else 1
+        if not self.is_2d:
+            fast_axis_idx = 0
+        
+        # Extract positions along fast axis
+        fast_positions = positions[:, fast_axis_idx]
+        n_points = len(fast_positions)
+        
+        # Calculate bin boundaries at midpoints
+        # Boundary 0: before first point (extend by d/2)
+        # Boundaries 1 to n-1: midpoints between adjacent points
+        # Boundary n: after last point (extend by d/2)
+        
+        if n_points == 1:
+            # Edge case: single point, use scan range
+            if self.is_2d:
+                fast_range = self.scan_range[fast_axis_idx]
+            else:
+                fast_range = self.scan_range[0]
+            return np.array([fast_range[0], fast_range[1]])
+        
+        boundaries = np.zeros(n_points + 1)
+        
+        # Midpoints between adjacent points
+        midpoints = (fast_positions[:-1] + fast_positions[1:]) / 2.0
+        
+        # First boundary: extend by d/2 before first point
+        d_first = abs(fast_positions[1] - fast_positions[0])
+        if fast_positions[0] < fast_positions[-1]:
+            # Scanning in positive direction
+            boundaries[0] = fast_positions[0] - d_first / 2.0
+            boundaries[-1] = fast_positions[-1] + d_first / 2.0
+        else:
+            # Scanning in negative direction (reversed line)
+            boundaries[0] = fast_positions[0] + d_first / 2.0
+            boundaries[-1] = fast_positions[-1] - d_first / 2.0
+        
+        boundaries[1:-1] = midpoints
+        
+        return boundaries
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for saving."""
         result = {

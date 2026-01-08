@@ -507,3 +507,219 @@ class DataProcessingMixin:
         }
 
         self._advance_to_next_point(result)
+
+    # =========================================================================
+    # Continuous Line Data Binning
+    # =========================================================================
+
+    def _bin_line_data(
+        self,
+        line_index: int,
+        position_time_buffer: list,
+        raw_data_buffer: dict,
+        data_start_time: float
+    ) -> dict:
+        """
+        Bin collected time-series data to grid points for a completed line.
+        
+        Uses interpolated position data to determine bin boundaries at d/2
+        distances between grid points. Data recorded at times between 
+        boundary crossings is assigned to the corresponding grid point.
+        
+        Args:
+            line_index: Zero-based line index.
+            position_time_buffer: List of (timestamp, {axis: position}) tuples
+                                  from position sampling.
+            raw_data_buffer: Dict of channel_name -> list of raw data samples.
+            data_start_time: Absolute timestamp when time-series started for
+                            aligning raw data timestamps.
+        
+        Returns:
+            Dict with binning results and statistics.
+        """
+        from scipy import interpolate
+        
+        if self._scan_data is None:
+            self.log.error("No scan data available for binning")
+            return {'success': False, 'error': 'No scan data'}
+        
+        # Get line metadata
+        point_indices = self._scan_data.get_line_point_indices(line_index)
+        n_points = len(point_indices)
+        bin_boundaries = self._scan_data.get_bin_boundaries(line_index)
+        fast_axis = self._scan_data.get_fast_axis()
+        
+        if n_points == 0 or len(bin_boundaries) == 0:
+            self.log.warning(f"No points or boundaries for line {line_index}")
+            return {'success': False, 'error': 'Empty line'}
+        
+        # Extract position vs time data along fast axis
+        if len(position_time_buffer) < 2:
+            self.log.warning(f"Insufficient position samples for line {line_index}: "
+                           f"{len(position_time_buffer)} samples")
+            return {'success': False, 'error': 'Insufficient position samples'}
+        
+        pos_times = np.array([t for t, _ in position_time_buffer])
+        pos_values = np.array([p.get(fast_axis, 0) for _, p in position_time_buffer])
+        
+        # Determine scan direction
+        scanning_positive = pos_values[-1] > pos_values[0]
+        
+        # Sort boundaries in scan order
+        if scanning_positive:
+            sorted_boundaries = np.sort(bin_boundaries)
+        else:
+            sorted_boundaries = np.sort(bin_boundaries)[::-1]
+        
+        # Note: We create position->time interpolation below, not time->position
+        # since we need to find the times when motor crossed position boundaries
+        
+        # Find times when motor crossed each bin boundary
+        # We need time -> position inverse, so we interpolate position -> time
+        try:
+            time_interp = interpolate.interp1d(
+                pos_values, pos_times,
+                kind='linear',
+                bounds_error=False,
+                fill_value='extrapolate'
+            )
+            boundary_times = time_interp(sorted_boundaries)
+        except Exception as e:
+            self.log.warning(f"Failed to interpolate boundary times: {e}")
+            # Fallback: linearly divide the time range
+            boundary_times = np.linspace(pos_times[0], pos_times[-1], len(sorted_boundaries))
+        
+        # Ensure boundary times are monotonically increasing
+        boundary_times = np.sort(boundary_times)
+        
+        self.log.debug(f"Line {line_index}: {n_points} bins, boundary times: "
+                      f"{boundary_times[0]:.3f}s to {boundary_times[-1]:.3f}s")
+        
+        # Get time-series data timing info
+        ts_logic = self._time_series_logic()
+        if ts_logic is None:
+            self.log.error("Time series logic not available")
+            return {'success': False, 'error': 'No time series logic'}
+        
+        # Estimate sample rate from time series logic
+        try:
+            sample_rate = ts_logic.data_rate if hasattr(ts_logic, 'data_rate') else 30000.0
+        except Exception:
+            sample_rate = 30000.0  # Default to 30 kHz
+        
+        # Bin the raw data for each channel
+        samples_per_bin = []
+        
+        for channel, raw_data in raw_data_buffer.items():
+            if channel not in self._scan_data.stream_data_mean:
+                continue
+            
+            raw_array = np.array(raw_data) if not isinstance(raw_data, np.ndarray) else raw_data
+            n_samples = len(raw_array)
+            
+            if n_samples == 0:
+                self.log.warning(f"No data in channel {channel} for line {line_index}")
+                continue
+            
+            # Calculate sample times relative to line start
+            # FIX Finding #2: Align sample times with position buffer time reference
+            # Position timestamps start from pos_times[0], so we align sample times similarly
+            sample_times_raw = np.arange(n_samples) / sample_rate
+            
+            # Calculate time offset between data start and position sampling start
+            # Both data_start_time and pos_times[0] are relative to _line_scan_start_time
+            # If there's latency in data arrival, we need to account for it
+            if pos_times[0] != 0:
+                # Align sample times to same reference as position times
+                # Assume first data sample arrived at data_start_time (passed as 0 if aligned)
+                time_offset = 0  # data_start_time - line_scan_start_time offset (usually 0)
+                sample_times = sample_times_raw + time_offset
+            else:
+                sample_times = sample_times_raw
+            
+            # Validate time alignment - warn if position and sample time ranges don't overlap
+            pos_time_range = (pos_times[0], pos_times[-1])
+            sample_time_range = (sample_times[0], sample_times[-1])
+            if sample_time_range[1] < pos_time_range[0] or sample_time_range[0] > pos_time_range[1]:
+                self.log.warning(
+                    f"Time ranges don't overlap! Position: {pos_time_range}, Samples: {sample_time_range}. "
+                    f"Check timestamp alignment."
+                )
+            
+            # Find sample indices for each bin boundary
+            boundary_sample_indices = np.searchsorted(sample_times, boundary_times)
+            boundary_sample_indices = np.clip(boundary_sample_indices, 0, n_samples)
+            
+            # FIX Finding #3: Add assertion for clarity
+            assert len(boundary_sample_indices) == n_points + 1, (
+                f"Unexpected boundary count: got {len(boundary_sample_indices)}, expected {n_points + 1}"
+            )
+            
+            # Bin data between consecutive boundaries
+            for i, point_idx in enumerate(point_indices):
+                # Get grid index for this point
+                grid_idx = self._scan_data.point_index_to_grid_index(point_idx)
+                
+                # Sample range for this bin
+                start_sample = boundary_sample_indices[i] if i < len(boundary_sample_indices) else 0
+                end_sample = boundary_sample_indices[i + 1] if i + 1 < len(boundary_sample_indices) else n_samples
+                
+                # Extract bin data
+                bin_data = raw_array[start_sample:end_sample]
+                n_bin_samples = len(bin_data)
+                
+                if n_bin_samples > 0:
+                    mean_val = np.mean(bin_data)
+                    
+                    # Store in scan_data
+                    if self._scan_data.is_2d:
+                        self._scan_data.stream_data_mean[channel][grid_idx] = mean_val
+                    else:
+                        self._scan_data.stream_data_mean[channel][grid_idx[0]] = mean_val
+                    
+                    # Store raw data for this bin
+                    if channel in self._scan_data.stream_data_raw:
+                        self._scan_data.stream_data_raw[channel][point_idx] = bin_data.tolist()
+                    
+                    samples_per_bin.append(n_bin_samples)
+                else:
+                    self.log.debug(f"Empty bin at point {point_idx}, grid {grid_idx}")
+                    samples_per_bin.append(0)
+        
+        # Store actual positions from interpolation
+        if self._scan_data.actual_positions is not None:
+            grid_positions = self._scan_data.get_line_grid_positions(line_index)
+            for i, point_idx in enumerate(point_indices):
+                for j, axis in enumerate(self._scan_data.scan_axes):
+                    self._scan_data.actual_positions[point_idx, j] = grid_positions[i, j]
+        
+        # Calculate statistics
+        result = {
+            'success': True,
+            'line_index': line_index,
+            'n_points': n_points,
+            'samples_per_bin': samples_per_bin,
+            'avg_samples_per_bin': np.mean(samples_per_bin) if samples_per_bin else 0,
+            'min_samples_per_bin': min(samples_per_bin) if samples_per_bin else 0,
+            'max_samples_per_bin': max(samples_per_bin) if samples_per_bin else 0,
+        }
+        
+        self.log.info(f"Line {line_index} binned: {n_points} points, "
+                     f"avg {result['avg_samples_per_bin']:.0f} samples/bin "
+                     f"(range: {result['min_samples_per_bin']}-{result['max_samples_per_bin']})")
+        
+        return result
+
+    def _get_line_raw_data_buffer(self) -> dict:
+        """
+        Get a copy of the current raw data buffer for the line being scanned.
+        
+        Returns:
+            Dict of channel_name -> list of raw data samples.
+        """
+        return {ch: data.copy() for ch, data in self._ts_raw_data_buffer.items()}
+
+    def _clear_line_raw_data_buffer(self):
+        """Clear the raw data buffer after processing a line."""
+        for ch in self._ts_raw_data_buffer:
+            self._ts_raw_data_buffer[ch] = []

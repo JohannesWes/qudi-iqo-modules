@@ -41,6 +41,7 @@ from .data_structures import ScanMode, ScanPattern, ScanState, MotorScanData
 from .motor_control import MotorControlMixin
 from .data_processing import DataProcessingMixin
 from .data_saving import DataSavingMixin
+from .continuous_line_scan import ContinuousLineScanMixin
 
 # Add qudi-core root to path to find my_software (same as sensitivity_sweep_logic)
 # Get path to qudi-core root (4 levels up from this file in the package)
@@ -49,7 +50,7 @@ if qudi_core_root not in sys.path:
     sys.path.insert(0, qudi_core_root)
 
 
-class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, LogicBase):
+class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingMixin, DataSavingMixin, LogicBase):
     """
     Logic module for motor-based XY scanning.
     
@@ -59,6 +60,7 @@ class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, Lo
     - CONTINUOUS_FREQ_TRACK: Motors move continuously, absolute frequency from lock
     
     This class combines functionality from several mixins:
+    - ContinuousLineScanMixin: Continuous line-by-line scanning for CONTINUOUS_* modes
     - MotorControlMixin: Movement, homing, position polling
     - DataProcessingMixin: Data acquisition, ODMR fitting, streaming
     - DataSavingMixin: Saving data to files, figure generation
@@ -127,6 +129,17 @@ class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, Lo
     _lock_status_poll_interval = ConfigOption(
         name='lock_status_poll_interval',
         default=0.5,  # 500 ms - poll lock status during CONTINUOUS_FREQ_TRACK mode
+        missing='info'
+    )
+    # Continuous line scanning options (for CONTINUOUS_* modes)
+    _continuous_line_mode_enabled = ConfigOption(
+        name='continuous_line_mode',
+        default=True,  # Enable continuous line scanning (no stopping at grid points)
+        missing='info'
+    )
+    _position_sample_interval = ConfigOption(
+        name='position_sample_interval',
+        default=0.05,  # 50ms = 20 Hz position sampling during continuous line scan
         missing='info'
     )
 
@@ -211,6 +224,10 @@ class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, Lo
 
         # Non-blocking manual movement state
         self._moving_in_progress = False
+
+        # Initialize mixin state
+        self._init_position_sampling_state()  # From MotorControlMixin
+        self._init_continuous_line_state()    # From ContinuousLineScanMixin
 
     def on_activate(self):
         """Initialize the module."""
@@ -696,7 +713,13 @@ class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, Lo
                          f"with pattern {pattern.name}, resolution {scan_resolution}")
             
             # Start the scan loop
-            self._sigNextPoint.emit()
+            # Use continuous line mode for CONTINUOUS_* modes if enabled
+            if self._should_use_continuous_line_mode():
+                self.log.info("Using continuous line scanning mode")
+                self._start_continuous_line_scan(line_index=0)
+            else:
+                # Use point-by-point mode (original behavior)
+                self._sigNextPoint.emit()
             
         except Exception as e:
             self.log.error(f"Failed to start scan: {e}", exc_info=True)
@@ -770,7 +793,20 @@ class MotorScanLogic(MotorControlMixin, DataProcessingMixin, DataSavingMixin, Lo
             self._scan_state = ScanState.RUNNING
             self.sigScanStateChanged.emit(self._scan_state)
             self.log.info("Scan resumed.")
-            self._sigNextPoint.emit()
+            
+            # Use appropriate resume method based on mode
+            if self._should_use_continuous_line_mode():
+                # Try to resume continuous line if paused mid-line
+                if not self._resume_continuous_line():
+                    # Not paused mid-line, start next line
+                    next_line = self._current_line_index + 1
+                    if next_line < self._scan_data.get_num_lines():
+                        self._start_continuous_line_scan(next_line)
+                    else:
+                        self._finalize_scan(completed=True)
+            else:
+                # Point-by-point mode
+                self._sigNextPoint.emit()
     
     @QtCore.Slot()
     def _process_next_point(self):
