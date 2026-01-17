@@ -786,14 +786,39 @@ class MotorScanGui(GuiBase):
             else:
                 return
         
-        # Update image
-        self._mw.image_widget.set_image(data)
-        self._mw.image_widget.set_data_label(label=display_channel, unit=unit)
-        
-        # Set proper extent
+        # Flip data array for display when scan direction is reversed.
+        #
+        # The image widget's set_image_extent() normalizes ranges to (min, max),
+        # which means pyqtgraph always maps array[0,0] to (x_min, y_min).
+        # But our grid index convention is: ix=0 corresponds to x_start, iy=0 to y_start.
+        # When start > stop (reversed scan), we must flip the data so that:
+        #   - Data at grid iy=0 (y_start) appears at y_start position, not y_min
+        #   - Data at grid ix=0 (x_start) appears at x_start position, not x_min
+        #
+        # This flip is ONLY for visualization. Data storage and click-to-data
+        # lookup use the original (non-flipped) arrays with the original scan_range.
+
+        data_display = data
         if scan_data.is_2d:
-            x_range = (scan_data.scan_range[0][0], scan_data.scan_range[0][1])
-            y_range = (scan_data.scan_range[1][0], scan_data.scan_range[1][1])
+            x_range = scan_data.scan_range[0]
+            y_range = scan_data.scan_range[1]
+
+            x_reversed = x_range[0] > x_range[1]  # x_start > x_stop
+            y_reversed = y_range[0] > y_range[1]  # y_start > y_stop
+
+            if x_reversed or y_reversed:
+                data_display = data.copy()
+                if x_reversed:
+                    data_display = data_display[::-1, :]  # Flip along X (first axis)
+                if y_reversed:
+                    data_display = data_display[:, ::-1]  # Flip along Y (second axis)
+
+        # Update image
+        self._mw.image_widget.set_image(data_display)
+        self._mw.image_widget.set_data_label(label=display_channel, unit=unit)
+
+        # Set proper extent (widget normalizes to min/max internally)
+        if scan_data.is_2d:
             self._mw.image_widget.set_image_extent((x_range, y_range), adjust_for_px_size=True)
     
     def _update_progress(self):
