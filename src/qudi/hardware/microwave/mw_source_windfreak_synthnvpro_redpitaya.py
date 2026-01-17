@@ -202,8 +202,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             # Ensure outputs are off on startup
             self.log.info('Ensuring all microwave outputs are off upon activation.')
-            self._windfreak_off()
-            self._redpitaya.enable_output(False)
+            # self._windfreak_off() # fixme  : turning off disabled for testing temperature fluctuations when microwave goes off/on
+            # self._redpitaya.enable_output(False) # fixme  : turning off disabled for testing temperature fluctuations when microwave goes off/on
 
         except Exception as e:
             self.log.error(f'Failed to activate module: {e}')
@@ -545,9 +545,9 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         with self._thread_lock:
             if self.module_state() != 'idle':
                 # Turn off Windfreak
-                self._windfreak_off()
+                #self._windfreak_off() # fixme  : turning off disabled for testing temperature fluctuations when microwave goes off/on
                 # Turn off Red Pitaya
-                self._redpitaya.enable_output(False)
+                # self._redpitaya.enable_output(False) #fixme  : turning off disabled for testing temperature fluctuations when microwave goes off/on
                 self.module_state.unlock()
                 self.log.debug('All outputs turned off')
 
