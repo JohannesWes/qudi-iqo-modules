@@ -64,6 +64,16 @@ OdmrTrackingGui (inherits from OdmrGui)
   - Lock Controls Dock (mode, parameters, stream/lock enable/disable)
   - Stream Mode Dock (input selection: error signal or frequency correction)
 
+## Lock Implementation Reference
+
+The frequency lock algorithm (control theory, gain formulas, tuning procedures, register map)
+is documented in the PyRPL project:
+
+**See:** `pyrpl/docs/developer_guide/odmr_freq_lock_implementation.md`
+
+This qudi module provides the GUI and integration layer; the actual lock runs on the
+Red Pitaya FPGA via PyRPL's `odmr_freq_lock` hardware module.
+
 ## Usage
 
 ### 1. Configuration
@@ -163,26 +173,16 @@ pattern for streaming data acquisition.
     - Click "Stop Stream" to stop data acquisition
     - Use "Clear" button to reset integrator if saturated
 
-### 3. Lock Tuning Tips
+### 3. Lock Tuning
 
-**Integral Mode** (recommended for starting):
-- Start with BW = 300 Hz
-- Stable, no overshoot, good noise rejection
-- Increase BW for faster tracking (max ~1 kHz)
-- Decrease if lock oscillates
+For detailed lock tuning procedures (bandwidth selection, polarity verification, deadband
+configuration, stability analysis), see the PyRPL documentation:
+`pyrpl/docs/developer_guide/odmr_freq_lock_implementation.md` → "Tuning & Commissioning"
 
-**PI Mode** (advanced):
-- Start with BW = 300 Hz, α = 3.0 (balanced zero placement)
-- Faster response than integral-only
-- Zero frequency = BW / α (e.g., 300 Hz / 3.0 = 100 Hz zero)
-- **α = 2.0**: Aggressive (zero at BW/2, faster but may overshoot)
-- **α = 3.0**: Balanced (zero at BW/3, recommended)
-- **α = 4.0**: Conservative (zero at BW/4, slower but very stable)
-- Use for rapid frequency changes
-
-**Stream Mode Selection**:
-- **Error Signal (LSB)**: Raw demodulated error signal, useful for diagnostics
-- **Frequency Correction (Hz)**: FTW correction applied to microwave, shows actual frequency drift
+**Quick reference:**
+- **Integral Mode**: Start with BW = 300 Hz, increase if stable
+- **PI Mode**: BW = 300 Hz, α = 3.0 (balanced), use for faster response
+- **Stream Modes**: Error Signal (LSB) for diagnostics, Frequency Correction (Hz) for drift monitoring
 
 ### 4. Independent Stream/Lock Operation
 
@@ -211,17 +211,11 @@ Performs linear fit on ODMR scan data within specified range.
 - Emits `sigFitCompleted` signal to GUI
 
 #### `configure_lock(bandwidth_hz, slope_lsb_per_hz)`
-Configures integral-only lock mode.
-- Calls hardware interface `set_bandwidth()`
-- PyRPL calculates μ (integral gain) and programs FPGA
+Configures integral-only lock mode via hardware interface.
 
 #### `configure_lock_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)`
-Configures PI lock mode with zero placement.
-- Calls hardware interface `set_bandwidth_pi()`
-- PyRPL calculates μ and Kp (proportional gain), programs FPGA
-- `zero_ratio` (α): Controls zero placement, range [2.0, 4.0], default 3.0
-  - Zero frequency = bandwidth_hz / zero_ratio
-  - Higher α = more conservative (lower zero frequency)
+Configures PI lock mode. For control theory details (gain formulas, zero placement),
+see PyRPL documentation.
 
 #### `set_stream_mode(mode)`
 Set streaming mode: 'error' or 'correction'.
@@ -275,24 +269,13 @@ to the same `TimeSeriesReaderLogic`. The Stream Mode Dock provides a hint about 
 ### Hardware Interface
 
 **OdmrFreqLockInterface** (abstract):
-Defines required methods:
-- `set_bandwidth(bandwidth_hz, slope_lsb_per_hz)` - Integral mode
-- `set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)` - PI mode
-  - `zero_ratio`: Range [2.0, 4.0], controls zero placement
-- `enable_lock(enable)` - Turn on/off
-- `get_status()` - Returns dict with enabled, locked, saturated, error_lsb, correction_hz
-- `clear()` - Reset integrator
-- `get_constraints()` - Returns hardware limits
+Defines required methods for lock hardware. See `odmr_freq_lock_interface.py` for the
+full interface specification.
 
 **RedPitayaOdmrLockHardware** (implementation):
-- Wraps PyRPL `odmrfreqlock` module (PyRPL naming: `odmr_freq_lock.OdmrFreqLock`)
+- Wraps PyRPL `odmr_freq_lock` module
 - Manages PyRPL instance via resource manager
-- Thread-safe (runs on main thread)
-- Constraints (from `get_constraints()`):
-  - `bandwidth_range`: (10.0, 10000.0) Hz
-  - `slope_range`: (1e-6, 1e6) LSB/Hz
-  - `damping_range`: (0.5, 1.0) - dimensionless
-  - `max_correction_hz`: 62.5 MHz (Nyquist limit)
+- For hardware constraints and register details, see PyRPL documentation
 
 ## Dock Widget Layout
 
