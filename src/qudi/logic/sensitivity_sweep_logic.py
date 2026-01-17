@@ -674,6 +674,10 @@ class SensitivitySweepLogic(LogicBase):
         fit_result_with_curves['fit_data'] = odmr_signal  # Could compute parabola fit here
         self.sigFitDataReady.emit(fit_result_with_curves)
 
+        # Calculate ODMR center frequency from peak and dip positions
+        # Center = mean(mean(peak_positions), mean(dip_positions))
+        odmr_center_hz = self._calculate_odmr_center(fit_result)
+
         # Step 4: Set CW to zero crossing
         zc_freq = fit_result['zero_crossing_frequencies [Hz]'][self._which_zero_crossing]
         slope = fit_result['zero_crossing_slopes [V/Hz]'][self._which_zero_crossing]
@@ -716,6 +720,7 @@ class SensitivitySweepLogic(LogicBase):
             'power_dbm': power_dbm,
             'f_mod_hz': f_mod_hz,
             'f_dev_khz': f_dev_khz,
+            'odmr_center_hz': odmr_center_hz,
             'linewidth_hz': fit_result['linewidths [Hz]'][self._which_zero_crossing],
             'zc_slope_V_per_Hz': slope,
             'sensitivity_nT_rtHz': sensitivity_on,
@@ -844,6 +849,44 @@ class SensitivitySweepLogic(LogicBase):
         except Exception as e:
             self.log.error(f'Fitting failed: {e}', exc_info=True)
             return None
+
+    def _calculate_odmr_center(self, fit_result: Dict) -> float:
+        """
+        Calculate the overall ODMR center frequency from fitted peak and dip positions.
+
+        Args:
+            fit_result: Dictionary from fit_hyperfine containing 'peak_positions [Hz]'
+                       and 'dip_positions [Hz]' arrays.
+
+        Returns:
+            Center frequency in Hz, or np.nan if calculation fails.
+        """
+        try:
+            peak_positions = fit_result.get('peak_positions [Hz]', np.array([]))
+            dip_positions = fit_result.get('dip_positions [Hz]', np.array([]))
+
+            # Filter out NaN values
+            valid_peaks = peak_positions[~np.isnan(peak_positions)]
+            valid_dips = dip_positions[~np.isnan(dip_positions)]
+
+            if len(valid_peaks) == 0 or len(valid_dips) == 0:
+                self.log.warning('Cannot calculate ODMR center: no valid peak or dip positions')
+                return np.nan
+
+            mean_peak = np.mean(valid_peaks)
+            mean_dip = np.mean(valid_dips)
+            center = (mean_peak + mean_dip) / 2.0
+
+            self.log.debug(
+                f'ODMR center calculation: mean_peak={mean_peak/1e9:.6f} GHz, '
+                f'mean_dip={mean_dip/1e9:.6f} GHz, center={center/1e9:.6f} GHz'
+            )
+
+            return center
+
+        except Exception as e:
+            self.log.error(f'Error calculating ODMR center: {e}')
+            return np.nan
 
     def _set_cw_frequency(self, frequency: float, power: float):
         """Set CW microwave output.
