@@ -58,6 +58,9 @@ from my_software.sensitivity_msmt.auswertung.sensitivity_auswertung_modular impo
     plot_magnetic_field_time_traces
 )
 
+# Import visualization module for summary plots
+from qudi.logic.sensitivity_sweep_visualizer import SensitivitySweepVisualizer
+
 
 class SensitivitySweepLogic(LogicBase):
     """
@@ -1204,6 +1207,9 @@ class SensitivitySweepLogic(LogicBase):
             # Save results collected so far
             self._save_final_results()
 
+            # Generate summary visualization plots (even for cancelled sweeps)
+            self._generate_summary_plots()
+
             self.sigSweepCancelled.emit()
             self.log.info(f'Sweep cancelled after {self._current_sweep_index} measurements')
 
@@ -1217,6 +1223,9 @@ class SensitivitySweepLogic(LogicBase):
 
             # Save final results
             self._save_final_results()
+
+            # Generate summary visualization plots
+            self._generate_summary_plots()
 
             # Emit completion signal
             self.sigSweepFinished.emit(self._current_folder)
@@ -1308,3 +1317,48 @@ class SensitivitySweepLogic(LogicBase):
 
         except Exception as e:
             self.log.error(f'Error saving final results: {e}', exc_info=True)
+
+    def _generate_summary_plots(self):
+        """
+        Generate summary visualization plots for the sweep results.
+
+        Creates plots showing how sensitivity and ODMR parameters vary with
+        the swept parameters. Plots are saved to a 'summary_plots' subfolder.
+        """
+        if not self._results_list or len(self._results_list) < 2:
+            self.log.info('Not enough data points for summary visualization (need >= 2)')
+            return
+
+        try:
+            # Prepare data and metadata
+            df = pd.DataFrame(self._results_list)
+
+            # Build metadata dict with current state
+            metadata = {
+                'best_sensitivity_nT_rtHz': float(self._best_sensitivity),
+                'best_parameters': {k: float(v) for k, v in self._best_parameters.items()},
+                'sweep_loop_order': self._sweep_loop_order,
+                'total_measurements': len(self._results_list),
+                'total_planned': self._total_combinations
+            }
+
+            # Create visualizer and generate plots
+            visualizer = SensitivitySweepVisualizer(
+                results_df=df,
+                metadata=metadata,
+                output_folder=self._current_folder,
+                logger=self.log
+            )
+
+            generated_files = visualizer.generate_all_plots()
+
+            if generated_files:
+                self.log.info(
+                    f'Generated {len(generated_files)} summary plots in '
+                    f'{os.path.join(self._current_folder, "summary_plots")}'
+                )
+            else:
+                self.log.warning('No summary plots were generated')
+
+        except Exception as e:
+            self.log.error(f'Error generating summary plots: {e}', exc_info=True)
