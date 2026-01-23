@@ -56,6 +56,7 @@ lo_frequency = 2.6e9  # Hz
 
 # Calibration files should contain columns:
 # lo_frequency_ghz, if_amplitude, g, phi, I_offset, Q_offset
+# Optional: sideband ('upper'/'lower') for sanity checks
 calibration_files = {
     19.422e6: "calibration_IF_19.422MHz.csv",
     21.580e6: "calibration_IF_21.580MHz.csv",
@@ -91,7 +92,7 @@ class IQComponentConfig:
     amplitude_i: float = None  # Corrected I amplitude (calculated)
     amplitude_q: float = None  # Corrected Q amplitude (calculated)
     phase_i: float = 0.0  # degrees
-    phase_q: float = 90.0  # degrees
+    phase_q: float = 270.0  # degrees (default: USB operation)
     enabled: bool = True
     # FM parameters
     fm_enabled: bool = False
@@ -133,6 +134,27 @@ class IFSourceBase(ABC):
         self._current_config = None
         self._calibration_data = {}  # Dict mapping frequency to calibration DataFrame
         self._max_components = 1  # Default, subclasses can override
+        self._sideband = "upper"
+
+    @staticmethod
+    def _normalize_sideband(sideband: str) -> str:
+        sideband_normalized = str(sideband).strip().lower()
+        if sideband_normalized in {"upper", "usb"}:
+            return "upper"
+        if sideband_normalized in {"lower", "lsb"}:
+            return "lower"
+        raise ValueError(f'Invalid sideband "{sideband}". Use "upper"/"usb" or "lower"/"lsb".')
+
+    @property
+    def sideband(self) -> str:
+        return self._sideband
+
+    def set_sideband(self, sideband: str) -> None:
+        self._sideband = self._normalize_sideband(sideband)
+        self.logger.info(f"Sideband set to {self._sideband.upper()}")
+
+    def _q_base_phase_deg(self) -> float:
+        return 270.0 if self._sideband == "upper" else 90.0
 
     @property
     def max_components(self) -> int:
@@ -271,18 +293,30 @@ class IFSourceBase(ABC):
             fm_deviations_khz = [0.0] * len(frequencies)
 
         # Load calibration data for each frequency if not already loaded
+        #
+        # Behaviour:
+        # - If `calibration_files` is None: try the default filename for missing calibrations.
+        # - If `calibration_files` is a dict (even empty): only try to load files explicitly
+        #   provided for a given IF frequency.
         for freq in frequencies:
-            if freq not in self._calibration_data:
-                if calibration_files and freq in calibration_files:
-                    cal_file = calibration_files[freq]
-                else:
-                    # Try to find default calibration file
-                    cal_file = f'calibration_redpitaya_all_results_IF_{freq / 1e6:.3f}MHz.csv'
+            if freq in self._calibration_data:
+                continue
 
-                try:
-                    self.load_calibration_data(freq, cal_file)
-                except Exception as e:
-                    self.logger.warning(f"Could not load calibration for {freq / 1e6:.3f} MHz: {e}")
+            cal_file = None
+            if calibration_files is None:
+                cal_file = f'calibration_redpitaya_all_results_IF_{freq / 1e6:.3f}MHz.csv'
+            elif freq in calibration_files:
+                cal_file = calibration_files[freq]
+
+            if not cal_file:
+                continue
+
+            try:
+                self.load_calibration_data(freq, cal_file)
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not load calibration for {freq / 1e6:.3f} MHz: {e}"
+                )
 
         # Create component configurations
         components = []
@@ -297,6 +331,10 @@ class IFSourceBase(ABC):
                 fm_deviation_khz=fm_dev
             )
 
+            # Default quadrature phases based on desired sideband.
+            component.phase_i = 0.0
+            component.phase_q = self._q_base_phase_deg()
+
             # Apply calibration if available
             if freq in self._calibration_data:
                 try:
@@ -308,7 +346,7 @@ class IFSourceBase(ABC):
                     component.amplitude_i = amp * (1 + g)
                     component.amplitude_q = amp * (1 - g)
                     component.phase_i = 0.0
-                    component.phase_q = 90.0 + np.degrees(phi)
+                    component.phase_q = float((self._q_base_phase_deg() + np.degrees(phi)) % 360.0)
 
                     dc_offsets_i.append(i_offset)
                     dc_offsets_q.append(q_offset)

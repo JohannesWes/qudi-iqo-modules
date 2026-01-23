@@ -26,21 +26,24 @@ Key Features:
 
 Calibration File Format:
 -----------------------
-Tab-separated CSV files with columns:
-- lo_frequency_ghz: LO frequency in GHz
-- if_amplitude: IF amplitude (0-1)
-- g: Gain imbalance parameter
-- phi: Phase imbalance in radians
-- I_offset: DC offset for I channel (V)
-- Q_offset: DC offset for Q channel (V)
+ Tab-separated CSV files with columns:
+ - sideband: 'upper' (USB) or 'lower' (LSB) (optional, for sanity checks)
+ - lo_frequency_ghz: LO frequency in GHz
+ - if_amplitude: IF amplitude (0-1)
+ - g: Gain imbalance parameter
+ - phi: Phase imbalance in radians
+ - I_offset: DC offset for I channel (V)
+ - Q_offset: DC offset for Q channel (V)
 
-IQ Correction Formulas:
-----------------------
-For each frequency component with calibration parameters (g, phi):
-- I amplitude = base_amplitude * (1 + g)
-- Q amplitude = base_amplitude * (1 - g)
-- I phase = 0°
-- Q phase = 90° + phi (converted to degrees)
+ IQ Correction Formulas:
+ ----------------------
+ For each frequency component with calibration parameters (g, phi):
+ - I amplitude = base_amplitude * (1 + g)
+ - Q amplitude = base_amplitude * (1 - g)
+ - I phase = 0°
+ - Q phase = base_q + phi (converted to degrees), where base_q depends on sideband:
+   - Upper sideband (USB): base_q = 270° (default)
+   - Lower sideband (LSB): base_q = 90°
 
 DC offsets are averaged across all active frequencies since they represent
 physical voltage offsets of the output channels.
@@ -193,6 +196,22 @@ class RedPitayaIFSource(IFSourceBase):
 
         try:
             calibration_df = pd.read_csv(path, sep="\t", index_col=0)
+            if "sideband" in calibration_df.columns:
+                raw_sidebands = calibration_df["sideband"].dropna().unique()
+                try:
+                    normalized = {self._normalize_sideband(s) for s in raw_sidebands}
+                except ValueError as e:
+                    self.logger.warning(f'Could not parse sideband column in "{path}": {e}')
+                    normalized = set()
+                if len(normalized) > 1:
+                    self.logger.warning(
+                        f'Calibration file "{path}" contains multiple sidebands: {sorted(normalized)}'
+                    )
+                elif len(normalized) == 1 and next(iter(normalized)) != self.sideband:
+                    self.logger.warning(
+                        f'Calibration file "{path}" sideband={next(iter(normalized))} '
+                        f"does not match current sideband={self.sideband}"
+                    )
             self._calibration_data[frequency] = calibration_df
             self.logger.info(f"IQ calibration data for {frequency / 1e6:.3f} MHz loaded from {path}")
             return calibration_df
@@ -443,7 +462,7 @@ class RedPitayaIFSource(IFSourceBase):
 
         # Calculate corrected phases
         phase_i = 0.0
-        phase_q = 90.0 + np.degrees(phase_imbalance)
+        phase_q = float((self._q_base_phase_deg() + np.degrees(phase_imbalance)) % 360.0)
 
         # Apply corrections
         setattr(self.fgen3, f'amplitude_a{component_index}', amp_i)
@@ -473,6 +492,8 @@ class RedPitayaIFSource(IFSourceBase):
         # Set amplitude on component 0 for backward compatibility
         self.fgen3.amplitude_a0 = amplitude
         self.fgen3.amplitude_b0 = amplitude
+        self.fgen3.phase_offset_a0 = 0.0
+        self.fgen3.phase_offset_b0 = self._q_base_phase_deg()
         self.fgen3.enable0 = True
 
         self.logger.debug(f"Amplitude set to {amplitude:.3f} on component 0")

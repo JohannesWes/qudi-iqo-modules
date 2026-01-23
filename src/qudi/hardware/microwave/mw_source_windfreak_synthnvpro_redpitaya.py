@@ -4,8 +4,10 @@ This file contains the Qudi hardware module for a combined microwave source cons
 - IQ Mixer for upconversion
 - Windfreak SynthNV Pro as LO source
 
-The actual output frequency is: RF = LO - IF
-For multi-frequency excitation: RF_i = LO - IF_i for each IF frequency
+The actual output frequency depends on sideband selection:
+- Upper sideband (USB, default): RF = LO + IF
+- Lower sideband (LSB):         RF = LO - IF
+For multi-frequency excitation: RF_i = LO ± IF_i for each IF frequency
 """
 
 import time
@@ -27,8 +29,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         - IQ Mixer for upconversion
         - Windfreak SynthNV Pro as LO source
 
-    The actual RF output frequency is: RF = LO - IF
-    For multi-frequency excitation: RF_i = LO - IF_i for each IF frequency
+    The actual RF output frequency depends on sideband selection:
+    - Upper sideband (USB, default): RF = LO + IF
+    - Lower sideband (LSB):         RF = LO - IF
+    For multi-frequency excitation: RF_i = LO ± IF_i for each IF frequency
 
     Example config for copy-paste:
 
@@ -39,13 +43,14 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             windfreak_comm_timeout: 10  # in seconds
             redpitaya_hostname: '10.203.129.28'
             redpitaya_config_name: 'rpy_shared_config'
-            if_frequencies: [19.422e6, 21.580e6, 23.738e6]
-            if_frequency_index: 1  # Use middle frequency (21.580 MHz) for calculations
-            lo_power: 13  # dBm - fixed power for IQ mixer LO input
-            calibration_files:
-                19.422e6: 'path/to/calibration_IF_19.422MHz.csv'
-                21.580e6: 'path/to/calibration_IF_21.580MHz.csv'
-                23.738e6: 'path/to/calibration_IF_23.738MHz.csv'
+             if_frequencies: [19.422e6, 21.580e6, 23.738e6]
+             if_frequency_index: 1  # Use middle frequency (21.580 MHz) for calculations
+             lo_power: 13  # dBm - fixed power for IQ mixer LO input
+            sideband: 'upper'  # 'upper' (USB, default) or 'lower' (LSB)
+             calibration_files:
+                 19.422e6: 'path/to/calibration_IF_19.422MHz.csv'
+                 21.580e6: 'path/to/calibration_IF_21.580MHz.csv'
+                 23.738e6: 'path/to/calibration_IF_23.738MHz.csv'
             enable_fm: False  # Enable FM modulation capability
             fm_deviation_khz: 100.0  # Default FM deviation in kHz
             fm_modulation_frequency: 5000.0  # Default FM modulation frequency in Hz
@@ -84,6 +89,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
     # Multi-frequency configuration
     _multi_frequency_mode = ConfigOption('multi_frequency_mode', default='single', missing='info')
     _multi_frequency_amplitudes = ConfigOption('multi_frequency_amplitudes', default=[0.5, 0.5, 0.5], missing='info')
+
+    # Sideband selection for IQ mixing
+    # - 'upper' / 'usb': RF = LO + IF (default)
+    # - 'lower' / 'lsb': RF = LO - IF
+    _sideband = ConfigOption('sideband', default='upper', missing='info')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -124,6 +134,42 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         # Initialize per-component FM settings
         self._fm_enables_per_component = []
         self._fm_deviations_per_component = []
+
+    @staticmethod
+    def _normalize_sideband(sideband: str) -> str:
+        sideband_normalized = str(sideband).strip().lower()
+        if sideband_normalized in {"upper", "usb"}:
+            return "upper"
+        if sideband_normalized in {"lower", "lsb"}:
+            return "lower"
+        raise ValueError(f'Invalid sideband "{sideband}". Use "upper"/"usb" or "lower"/"lsb".')
+
+    def _rf_to_lo_frequency(self, rf_frequency: float) -> float:
+        avg_if_freq = self._get_average_if_frequency()
+        if self._sideband == "upper":
+            return rf_frequency - avg_if_freq
+        return rf_frequency + avg_if_freq
+
+    def _lo_to_rf_frequency(self, lo_frequency: float) -> float:
+        avg_if_freq = self._get_average_if_frequency()
+        if self._sideband == "upper":
+            return lo_frequency + avg_if_freq
+        return lo_frequency - avg_if_freq
+
+    @property
+    def sideband(self) -> str:
+        return self._sideband
+
+    def set_sideband(self, sideband: str) -> None:
+        with self._thread_lock:
+            if self.module_state() != "idle":
+                raise RuntimeError("Unable to change sideband. Microwave output active.")
+
+            self._sideband = self._normalize_sideband(sideband)
+            if self._redpitaya and self._redpitaya.is_connected:
+                self._redpitaya.set_sideband(self._sideband)
+
+            self.log.info(f"Sideband set to {self._sideband.upper()}")
 
     def on_activate(self):
         """ Initialisation performed during activation of the module. """
@@ -166,6 +212,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             self._redpitaya.connect(config_name=self._redpitaya_config_name)
             self.log.info('Connected to Red Pitaya')
 
+            # Sideband selection (must be set before loading calibration files)
+            self._sideband = self._normalize_sideband(self._sideband)
+            self._redpitaya.set_sideband(self._sideband)
+
             # Load calibration data
             for freq, cal_file in self._calibration_files.items():
                 try:
@@ -184,11 +234,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             # Generate constraints based on average IF frequency
             avg_if_freq = self._get_average_if_frequency()
-            min_rf = 100e6  # Set reasonable minimum RF frequency (100 MHz)
-            max_rf = 6.4e9 - avg_if_freq
+            min_rf = 100e6 + avg_if_freq if self._sideband == 'upper' else 100e6  # conservative
+            max_rf = 6.4e9 + avg_if_freq if self._sideband == 'upper' else 6.4e9 - avg_if_freq
 
             self._constraints = MicrowaveConstraints(
-                power_limits=(-50, 10),
+                power_limits=(-50, 13),
                 frequency_limits=(min_rf, max_rf),
                 scan_size_limits=(2, 2**12),
                 sample_rate_limits=(0.1, 2500),
@@ -288,8 +338,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             # Update constraints based on new average IF frequency
             avg_if_freq = self._get_average_if_frequency()
-            min_rf = 100e6
-            max_rf = 6.4e9 - avg_if_freq
+            min_rf = 100e6 + avg_if_freq if self._sideband == 'upper' else 100e6  # conservative
+            max_rf = 6.4e9 + avg_if_freq if self._sideband == 'upper' else 6.4e9 - avg_if_freq
 
             self._constraints = MicrowaveConstraints(
                 power_limits=(-50, 10),
@@ -333,9 +383,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         @return float: The currently set CW microwave frequency in Hz.
         """
         with self._thread_lock:
-            # Return the center RF frequency based on average IF
-            avg_if_freq = self._get_average_if_frequency()
-            return float(self._windfreak_device.query('f?')) * 1e6 - avg_if_freq
+            lo_frequency = float(self._windfreak_device.query('f?')) * 1e6
+            return self._lo_to_rf_frequency(lo_frequency)
 
     @property
     def scan_power(self):
@@ -383,7 +432,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         "cw_on".
 
         @param float frequency: RF frequency to set in Hz (center frequency for multi-freq mode)
-        @param float power: RF power to set in dBm (total power of all IF components)
+        @param float power: Requested power in dBm (does not change Windfreak LO power; that is set via `lo_power`).
+                            This value is mapped to an IF amplitude via `_power_to_if_amplitude()`.
+                            In multi-frequency modes, the resulting IF amplitude is distributed across the
+                            active components according to `multi_frequency_amplitudes`.
         """
         with self._thread_lock:
             if self.module_state() != 'idle':
@@ -393,9 +445,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             self._current_rf_frequency = frequency
             self._current_rf_power = power
 
-            # Calculate required LO frequency based on average IF
-            avg_if_freq = self._get_average_if_frequency()
-            lo_frequency = frequency + avg_if_freq
+            # Calculate required LO frequency based on average IF and sideband selection
+            lo_frequency = self._rf_to_lo_frequency(frequency)
 
             # Configure Windfreak for CW at calculated LO frequency
             self._windfreak_device.write('X0')  # sweep mode off
@@ -479,8 +530,12 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             if mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
                 # For sweep mode, calculate LO frequencies
                 rf_start, rf_stop, num_points = frequencies
-                lo_start = rf_start + avg_if_freq
-                lo_stop = rf_stop + avg_if_freq
+                if self._sideband == 'upper':
+                    lo_start = rf_start - avg_if_freq
+                    lo_stop = rf_stop - avg_if_freq
+                else:
+                    lo_start = rf_start + avg_if_freq
+                    lo_stop = rf_stop + avg_if_freq
 
                 # Use mid-point LO frequency for calibration
                 lo_mid = (lo_start + lo_stop) / 2
@@ -508,7 +563,7 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             elif mode == SamplingOutputMode.JUMP_LIST:
                 # For jump list, calculate all LO frequencies
                 rf_frequencies = np.asarray(frequencies, dtype=np.float64)
-                lo_frequencies = rf_frequencies + avg_if_freq
+                lo_frequencies = rf_frequencies - avg_if_freq if self._sideband == 'upper' else rf_frequencies + avg_if_freq
 
                 # Use mid-point LO frequency for calibration
                 lo_mid = np.mean([np.min(lo_frequencies), np.max(lo_frequencies)])
@@ -718,9 +773,19 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             return 0, 0
 
     def _power_to_if_amplitude(self, power_dbm):
-        """Convert desired RF power in dBm to IF amplitude / peak voltage (0-1) V.
+        """Convert requested power (dBm) to Red Pitaya IF amplitude.
 
-        This uses either a calibration table or formula for 50 Ohm system.
+        This module maps the Qudi microwave `power` setting to the Red Pitaya IF sine-wave peak
+        amplitude (`if_amplitude`, in volts, 0..1).
+
+        If a `power_calibration_table` is provided, it is used for the mapping.
+        Without a table, this is only an electrical 50 Ω equivalence at the IF output (not a calibrated RF output power).
+
+        Fallback (no table):
+        - Assumes a 50 Ω load
+        - Interprets `if_amplitude` as V_peak (not V_rms)
+        - Uses P = V_rms^2 / R = V_peak^2 / (2R), hence for R=50 Ω:
+          P(dBm) = 20*log10(V_peak) + 10
         """
         if self._power_cal_data is not None:
             try:
@@ -737,9 +802,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         return if_amplitude
 
     def _if_amplitude_to_power(self, if_amplitude):
-        """Convert IF amplitude / peak voltage (0-1) V to RF power in dBm.
+        """Convert Red Pitaya IF amplitude to equivalent power (dBm).
 
-        This uses either a calibration table or a formula for 50 Ohm system.
+        If a `power_calibration_table` is provided, it is used for the mapping.
+        Otherwise assumes a 50 Ω load and interprets `if_amplitude` as sine-wave peak voltage V_peak (0..1),
+        i.e. P(dBm) = 20*log10(V_peak) + 10.
         """
         if self._power_cal_data is not None:
             try:
@@ -849,13 +916,17 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             if self.module_state() != 'idle':
                 try:
                     lo_freq = float(self._windfreak_device.query('f?')) * 1e6
-                    rf_frequencies = [lo_freq - if_freq for if_freq in self._active_if_frequencies]
+                    if self._sideband == 'upper':
+                        rf_frequencies = [lo_freq + if_freq for if_freq in self._active_if_frequencies]
+                    else:
+                        rf_frequencies = [lo_freq - if_freq for if_freq in self._active_if_frequencies]
                 except:
                     rf_frequencies = None
             else:
                 rf_frequencies = None
 
             return {
+                'sideband': self._sideband,
                 'mode': self._multi_frequency_mode,
                 'active_if_frequencies': self._active_if_frequencies.copy(),
                 'active_if_amplitudes': self._active_if_amplitudes.copy(),
@@ -889,3 +960,145 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                     self.log.info(f'IQ phase offset set to {phase_offset:.2f} degrees')
                 except Exception as e:
                     self.log.error(f'Failed to set IQ phase offset: {e}')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # IQ Calibration Methods
+    # ─────────────────────────────────────────────────────────────────────────
+    # These methods expose the RedPitayaIFSource calibration functions for use
+    # during IQ mixer calibration workflows.
+
+    def calibration_set_sideband(self, sideband: str) -> None:
+        """Set sideband selection for IQ mixing during calibration.
+
+        @param str sideband: 'upper'/'usb' or 'lower'/'lsb'
+        """
+        self.set_sideband(sideband)
+
+    def calibration_set_dc_offsets(self, i_offset: float, q_offset: float) -> None:
+        """Set DC offsets on the RedPitaya fgen3 for IQ calibration.
+
+        This method directly sets the DC offsets used for LO leakage cancellation.
+        DC offsets are in normalized units (-1.0 to 1.0).
+
+        @param float i_offset: I channel DC offset (-1.0 to 1.0)
+        @param float q_offset: Q channel DC offset (-1.0 to 1.0)
+        """
+        with self._thread_lock:
+            if self._redpitaya and self._redpitaya.is_connected:
+                self._redpitaya.set_dc_offsets(i_offset, q_offset)
+                self.log.debug(f'Calibration DC offsets set: I={i_offset:.5f}, Q={q_offset:.5f}')
+            else:
+                raise RuntimeError('Red Pitaya not connected')
+
+    def calibration_set_iq_correction(self, g: float, phi: float, amplitude: float,
+                                       component_index: int = 0) -> tuple:
+        """Apply IQ imbalance correction to fgen3 for calibration.
+
+        This applies gain imbalance (g) and phase imbalance (phi) corrections
+        to minimize image power during IQ mixer calibration.
+
+         Correction formulas:
+         - I amplitude = amplitude * (1 + g)
+         - Q amplitude = amplitude * (1 - g)
+         - I phase = 0°
+        - Q phase = base_q + degrees(phi), where base_q depends on sideband:
+          - USB (default): base_q = 270°
+          - LSB: base_q = 90°
+
+        @param float g: Gain imbalance parameter (typically -0.1 to 0.1)
+        @param float phi: Phase imbalance in radians (typically 0 to 0.5)
+        @param float amplitude: Base IF amplitude (0.0 to 1.0)
+        @param int component_index: Frequency component index (default 0)
+
+        @return tuple: (amp_i, amp_q, phase_i, phase_q) - the corrected values applied
+        """
+        with self._thread_lock:
+            if self._redpitaya and self._redpitaya.is_connected:
+                result = self._redpitaya.set_iq_correction(
+                    component_index, amplitude, g, phi
+                )
+                self.log.debug(f'IQ correction applied: g={g:.5f}, phi={phi:.5f}, '
+                              f'amp={amplitude:.3f} -> amp_i={result[0]:.4f}, '
+                              f'amp_q={result[1]:.4f}, phase_q={result[3]:.2f}°')
+                return result
+            else:
+                raise RuntimeError('Red Pitaya not connected')
+
+    def calibration_set_if_amplitude(self, amplitude: float, component_index: int = 0) -> None:
+        """Set the IF signal amplitude for calibration (uncorrected).
+
+        This sets equal I and Q amplitudes without IQ imbalance correction.
+        Used to set the initial amplitude before applying corrections.
+
+        @param float amplitude: IF amplitude (0.0 to 1.0)
+        @param int component_index: Frequency component index (default 0)
+        """
+        with self._thread_lock:
+            if self._redpitaya and self._redpitaya.is_connected:
+                max_components = int(getattr(self._redpitaya, 'max_components', 3))
+                if not (0 <= component_index < max_components):
+                    raise ValueError(f'component_index {component_index} out of range (0..{max_components - 1})')
+
+                # Ensure only the selected component contributes to the output during calibration.
+                for i in range(max_components):
+                    setattr(self._redpitaya.fgen3, f'enable{i}', False)
+                    setattr(self._redpitaya.fgen3, f'fm_enable{i}', False)
+
+                setattr(self._redpitaya.fgen3, f'amplitude_a{component_index}', amplitude)
+                setattr(self._redpitaya.fgen3, f'amplitude_b{component_index}', amplitude)
+                setattr(self._redpitaya.fgen3, f'phase_offset_a{component_index}', 0.0)
+                setattr(self._redpitaya.fgen3, f'phase_offset_b{component_index}',
+                        270.0 if self._sideband == 'upper' else 90.0)
+                setattr(self._redpitaya.fgen3, f'enable{component_index}', True)
+                self.log.debug(f'IF amplitude set to {amplitude:.3f} (uncorrected)')
+            else:
+                raise RuntimeError('Red Pitaya not connected')
+
+    def calibration_set_if_frequency(self, frequency_hz: float, component_index: int = 0) -> None:
+        """Set the IF frequency for calibration.
+
+        @param float frequency_hz: IF frequency in Hz
+        @param int component_index: Frequency component index (default 0)
+        """
+        with self._thread_lock:
+            if self._redpitaya and self._redpitaya.is_connected:
+                max_components = int(getattr(self._redpitaya, 'max_components', 3))
+                if not (0 <= component_index < max_components):
+                    raise ValueError(f'component_index {component_index} out of range (0..{max_components - 1})')
+
+                # Ensure only the selected component contributes to the output during calibration.
+                for i in range(max_components):
+                    setattr(self._redpitaya.fgen3, f'enable{i}', False)
+                    setattr(self._redpitaya.fgen3, f'fm_enable{i}', False)
+
+                setattr(self._redpitaya.fgen3, f'frequency{component_index}', frequency_hz)
+                setattr(self._redpitaya.fgen3, f'fm_enable{component_index}', False)
+                setattr(self._redpitaya.fgen3, f'enable{component_index}', True)
+                self.log.debug(f'IF frequency set to {frequency_hz / 1e6:.3f} MHz')
+            else:
+                raise RuntimeError('Red Pitaya not connected')
+
+    def calibration_enable_output(self, enable: bool = True) -> None:
+        """Enable or disable the RedPitaya output for calibration.
+
+        @param bool enable: True to enable output, False to disable
+        """
+        with self._thread_lock:
+            if self._redpitaya and self._redpitaya.is_connected:
+                self._redpitaya.enable_output(enable)
+                self.log.debug(f'RedPitaya output {"enabled" if enable else "disabled"}')
+            else:
+                raise RuntimeError('Red Pitaya not connected')
+
+    def calibration_get_if_source(self):
+        """Get direct access to the RedPitayaIFSource for advanced calibration.
+
+        This provides direct access to the IF source for advanced operations
+        like loading calibration files or verifying signal generation.
+
+        @return RedPitayaIFSource: The internal IF source instance
+        """
+        if self._redpitaya and self._redpitaya.is_connected:
+            return self._redpitaya
+        else:
+            raise RuntimeError('Red Pitaya not connected')
