@@ -302,9 +302,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
         """
         Set streaming input source.
 
-        Can be called while streaming is active - the FPGA will switch to the new
-        input source seamlessly. There may be a brief transition in the data during
-        the switch.
+        Can be called while streaming is active or inactive. The FPGA register is
+        always updated immediately to ensure the correct input is selected for
+        subsequent operations (including ODMR scans that share the scan module).
 
         Args:
             input_mode: 'demod' for error signal or 'ftw_corr' for frequency correction
@@ -318,13 +318,17 @@ class RedPitayaDataInStream(DataInStreamInterface):
 
             self._current_stream_input = input_mode
 
-            # If streaming is active, update FPGA register immediately
+            # Always update FPGA register immediately, regardless of streaming state.
+            # This is critical because other modules (e.g., RedPitayaFiniteSamplingInput
+            # for ODMR scans) share the same physical scan module and need the correct
+            # input_select setting.
             # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
-            if self._running and self._scan_module is not None:
+            if self._scan_module is not None:
                 self._scan_module.input_select = input_mode
-                self.log.info(f'Stream input switched live to: {input_mode}')
-            else:
-                self.log.info(f'Stream input set to: {input_mode}')
+                if self._running:
+                    self.log.info(f'Stream input switched live to: {input_mode}')
+                else:
+                    self.log.info(f'Stream input set to: {input_mode} (FPGA register updated)')
 
     def configure(self,
                   active_channels: Sequence[str],
