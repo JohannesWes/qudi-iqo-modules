@@ -1117,7 +1117,8 @@ class SensitivitySweepLogic(LogicBase):
                 actual_data_rate,
                 actual_trace_duration,
                 save_fig=True,
-                filename_prefix=filename_prefix
+                filename_prefix=filename_prefix,
+                voltage_trace=voltage_trace
             )
 
             # Verify file was created
