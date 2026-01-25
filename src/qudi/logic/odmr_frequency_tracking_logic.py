@@ -412,10 +412,12 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             slope_lsb_per_hz: Discriminator slope from fit (if None, uses last fit)
             zero_ratio: PI zero placement ratio α (default: 3.0)
                        Zero frequency = bandwidth_hz / zero_ratio
-                       Range: [2.0, 4.0]
+                       Range: [0.1, 30.0]
+                       - α < 2: Very aggressive (fast, may oscillate)
                        - α = 2.0: Aggressive (faster, may overshoot)
                        - α = 3.0: Balanced (recommended)
                        - α = 4.0: Conservative (slower, very stable)
+                       - α > 4: Very conservative (P term becomes negligible)
         """
         # Get slope from fit if not provided
         if slope_lsb_per_hz is None:
@@ -508,7 +510,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         parked at the zero-crossing of the error signal (where the demodulated
         lock-in output is zero) for the frequency lock to work correctly.
 
-        The RF frequency calculation (LO - IF) is handled internally by the
+        The RF frequency calculation (LO ± IF, depending on sideband selection) is handled internally by the
         microwave hardware module, so the zero-crossing frequency from the fit
         (which is in RF units) will be correctly applied.
 

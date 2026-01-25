@@ -289,7 +289,7 @@ class OdmrTrackingGui(OdmrGui):
         self._bandwidth_spinbox.setMinimumWidth(120)
 
         self._zero_ratio_spinbox = QtWidgets.QDoubleSpinBox()
-        self._zero_ratio_spinbox.setRange(2.0, 4.0)
+        self._zero_ratio_spinbox.setRange(0.1, 30.0)
         self._zero_ratio_spinbox.setSingleStep(0.1)
         self._zero_ratio_spinbox.setValue(3.0)
         self._zero_ratio_spinbox.setDecimals(1)
@@ -297,9 +297,11 @@ class OdmrTrackingGui(OdmrGui):
         self._zero_ratio_spinbox.setToolTip(
             'PI zero placement ratio α\n'
             'Zero freq = Bandwidth / α\n'
-            '  2.0: Aggressive (faster, may overshoot)\n'
+            '  <2: Very aggressive (fast, may oscillate)\n'
+            '  2-3: Aggressive (faster, may overshoot)\n'
             '  3.0: Balanced (recommended)\n'
-            '  4.0: Conservative (slower, stable)'
+            '  3-4: Conservative (slower, stable)\n'
+            '  >4: Very conservative (P term becomes negligible)'
         )
 
         # Max correction (FTW saturation) spinbox

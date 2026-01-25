@@ -108,8 +108,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface):
             raise ValueError(f'Bandwidth must be positive, got {bandwidth_hz}')
         if slope_lsb_per_hz <= 0:
             raise ValueError(f'Slope must be positive, got {slope_lsb_per_hz}')
-        if not 2.0 <= zero_ratio <= 4.0:
-            raise ValueError(f'Zero ratio must be in [2.0, 4.0], got {zero_ratio}')
+        if not 0.1 <= zero_ratio <= 30.0:
+            raise ValueError(f'Zero ratio must be in [0.1, 30.0], got {zero_ratio}')
 
         self._lock.set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)
 

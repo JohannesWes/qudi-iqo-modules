@@ -58,10 +58,12 @@ class OdmrFreqLockInterface(Base):
             slope_lsb_per_hz: Error signal slope from linear fit (LSB/Hz)
             zero_ratio: PI zero placement ratio α (default: 3.0)
                        Zero frequency = bandwidth_hz / zero_ratio
-                       Valid range: [2.0, 4.0]
+                       Valid range: [0.1, 30.0]
+                       - α < 2: Very aggressive (fast, may oscillate)
                        - α = 2.0: Aggressive (zero at BW/2, faster but may overshoot)
                        - α = 3.0: Balanced (zero at BW/3, good damping, recommended)
                        - α = 4.0: Conservative (zero at BW/4, slower but very stable)
+                       - α > 4: Very conservative (P term becomes negligible)
 
         Raises:
             ValueError: If parameters out of valid range
