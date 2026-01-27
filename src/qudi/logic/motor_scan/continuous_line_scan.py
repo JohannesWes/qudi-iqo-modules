@@ -59,8 +59,8 @@ class ContinuousLineScanMixin:
         if self._scan_data is None:
             return False
         
-        # Only use for CONTINUOUS_* modes
-        if self._scan_data.scan_mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK):
+        # Only use for CONTINUOUS_* modes and POSITION_ONLY
+        if self._scan_data.scan_mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK, ScanMode.POSITION_ONLY):
             return False
         
         # Check if continuous line mode is enabled
@@ -184,21 +184,26 @@ class ContinuousLineScanMixin:
                 # Line complete - stop sampling and bin data
                 self._waiting_for_line_end = False
                 position_buffer = self._stop_position_sampling()
-                raw_data_buffer = self._get_line_raw_data_buffer()
-                
-                # Bin the collected data
-                bin_result = self._bin_line_data(
-                    line_index=self._current_line_index,
-                    position_time_buffer=position_buffer,
-                    raw_data_buffer=raw_data_buffer,
-                    data_start_time=self._line_data_start_time
-                )
-                
-                if not bin_result.get('success', False):
-                    self.log.warning(f"Binning failed for line {self._current_line_index}: "
-                                   f"{bin_result.get('error', 'unknown')}")
-                    # Clean up failed line data to prevent corruption of next line
-                    self._clear_line_raw_data_buffer()
+
+                # Skip data binning for POSITION_ONLY mode
+                if self._scan_data.scan_mode != ScanMode.POSITION_ONLY:
+                    raw_data_buffer = self._get_line_raw_data_buffer()
+
+                    # Bin the collected data
+                    bin_result = self._bin_line_data(
+                        line_index=self._current_line_index,
+                        position_time_buffer=position_buffer,
+                        raw_data_buffer=raw_data_buffer,
+                        data_start_time=self._line_data_start_time
+                    )
+
+                    if not bin_result.get('success', False):
+                        self.log.warning(f"Binning failed for line {self._current_line_index}: "
+                                       f"{bin_result.get('error', 'unknown')}")
+                        # Clean up failed line data to prevent corruption of next line
+                        self._clear_line_raw_data_buffer()
+                else:
+                    self.log.debug(f"POSITION_ONLY: Line {self._current_line_index} completed (no data)")
                 
                 # Validate motor reached line end (Finding #4: motor stop detection)
                 fast_axis = self._scan_data.get_fast_axis()

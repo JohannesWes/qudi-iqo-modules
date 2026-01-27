@@ -19,6 +19,7 @@ class ScanMode(Enum):
     CONTINUOUS_STREAM = 0     # Motors move continuously, data binned by position
     STEP_ODMR = 1             # Motors stop at each point, ODMR scan taken
     CONTINUOUS_FREQ_TRACK = 2 # Motors move continuously, absolute frequency from lock
+    POSITION_ONLY = 3         # Stage movement only, no data acquisition (debugging)
 
 
 class ScanPattern(Enum):

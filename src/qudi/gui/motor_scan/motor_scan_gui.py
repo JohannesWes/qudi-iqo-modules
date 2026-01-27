@@ -112,11 +112,12 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.mode_label = QtWidgets.QLabel(' Mode: ')
         self.toolbar.addWidget(self.mode_label)
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK'])
+        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK', 'POSITION_ONLY'])
         self.mode_combo.setToolTip(
             'STEP_ODMR: Stop at each point, take ODMR spectrum\n'
             'CONTINUOUS_STREAM: Continuous movement, stream channel data\n'
-            'CONTINUOUS_FREQ_TRACK: Continuous movement, record absolute frequency from lock'
+            'CONTINUOUS_FREQ_TRACK: Continuous movement, record absolute frequency from lock\n'
+            'POSITION_ONLY: Move stage along pattern without data acquisition (debugging)'
         )
         self.toolbar.addWidget(self.mode_combo)
         
@@ -529,6 +530,8 @@ class MotorScanGui(GuiBase):
             ])
         elif mode_text == 'CONTINUOUS_FREQ_TRACK':
             self._mw.display_combo.addItems(['Absolute Frequency'])
+        elif mode_text == 'POSITION_ONLY':
+            self._mw.display_combo.addItems(['Scan Progress'])
         else:
             self._mw.display_combo.addItems(['Mean Value'])
 
@@ -755,7 +758,25 @@ class MotorScanGui(GuiBase):
         # Get the appropriate data array based on display selection
         from qudi.logic.motor_scan import ScanMode
         
-        if scan_data.scan_mode == ScanMode.STEP_ODMR:
+        if scan_data.scan_mode == ScanMode.POSITION_ONLY:
+            # Display progress: 1.0 for visited points, 0.0 for unvisited
+            if scan_data.is_2d:
+                shape_2d = (scan_data.scan_resolution[0], scan_data.scan_resolution[1])
+            else:
+                shape_2d = (scan_data.scan_resolution[0],)
+
+            data = np.zeros(shape_2d)
+            # Mark visited points based on current_point_index
+            for i in range(scan_data.current_point_index):
+                grid_idx = scan_data.point_index_to_grid_index(i)
+                if scan_data.is_2d:
+                    data[grid_idx[0], grid_idx[1]] = 1.0
+                else:
+                    data[grid_idx[0]] = 1.0
+
+            unit = ''
+            display_channel = 'Scan Progress'
+        elif scan_data.scan_mode == ScanMode.STEP_ODMR:
             if display_channel == 'Center Frequency' and scan_data.center_frequency is not None:
                 data = scan_data.center_frequency
                 unit = 'Hz'

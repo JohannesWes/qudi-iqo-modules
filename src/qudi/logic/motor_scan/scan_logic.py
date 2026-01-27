@@ -611,7 +611,10 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
                 self._paused_due_to_lock_loss = False
                 self.log.info(f"Frequency tracking scan with zero-crossing: "
                               f"{zero_crossing / 1e9:.6f} GHz")
-            
+            elif mode == ScanMode.POSITION_ONLY:
+                # POSITION_ONLY mode requires no measurement connectors
+                self.log.info("POSITION_ONLY mode - stage movement only, no data acquisition")
+
             # Create scan configuration
             scan_axes = tuple(axes)
             scan_range = tuple(self._scan_ranges[a] for a in axes)
@@ -688,6 +691,10 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
                 # Start lock status polling
                 poll_interval_ms = int(self._lock_status_poll_interval * 1000)
                 self._lock_status_timer.start(poll_interval_ms)
+            elif mode == ScanMode.POSITION_ONLY:
+                # Initialize with empty channels - only track positions
+                self._scan_data.initialize_data_arrays(channel_names=[])
+                self._current_scan_folder = None
             else:
                 self._scan_data.initialize_data_arrays()
                 # Create scan folder now for STEP_ODMR mode so fit plots can be saved during scan
