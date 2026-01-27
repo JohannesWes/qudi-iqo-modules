@@ -91,9 +91,12 @@ class ContinuousLineScanMixin:
             
             n_lines = self._scan_data.get_num_lines()
             points_per_line = self._scan_data.get_points_per_line()
-            
+
+            # Log positions for debugging direction issues
+            start_str = ', '.join(f'{k}={v*1000:.3f}mm' for k, v in start_pos.items())
+            end_str = ', '.join(f'{k}={v*1000:.3f}mm' for k, v in end_pos.items())
             self.log.info(f"Starting continuous line {line_index + 1}/{n_lines} "
-                         f"({points_per_line} points)")
+                         f"({points_per_line} points): start=({start_str}), end=({end_str})")
             
             # Move to line start position (blocking)
             motor = self._motor_hardware()
