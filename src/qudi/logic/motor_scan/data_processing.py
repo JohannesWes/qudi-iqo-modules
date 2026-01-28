@@ -336,37 +336,74 @@ class DataProcessingMixin:
                     else:
                         fit_filename = None
 
-                    # Call fit_hyperfine with same parameters as sensitivity_sweep_logic
-                    fit_result = self._fit_function(
-                        freq_data,  # positional argument (like sensitivity_sweep)
-                        voltage_data,  # positional argument (like sensitivity_sweep)
-                        feature_prominence=self._fit_feature_prominence,
-                        n_most_prominent_peaks=self._fit_n_most_prominent_peaks,
-                        min_feature_height=self._fit_min_feature_height,
-                        plot_result=False,
-                        save_result_plot=save_plot,
-                        filename=fit_filename
-                    )
+                    # Calculate max_pair_distance_hz (use default if not set)
+                    max_pair_dist = self._max_pair_distance_hz
+                    if max_pair_dist is None:
+                        max_pair_dist = self._hyperfine_spacing_hz * 0.75  # ~1.6 MHz for 2.158 MHz spacing
+
+                    # Use robust fitting if enabled, otherwise standard fit_hyperfine
+                    if self._use_robust_fitting and hasattr(self, '_fit_function_robust') and self._fit_function_robust is not None:
+                        # Use fit_odmr_robust with automatic quality assessment
+                        fit_result = self._fit_function_robust(
+                            freq_data,
+                            voltage_data,
+                            n_expected_features=self._fit_n_most_prominent_peaks,
+                            hyperfine_spacing_hz=self._hyperfine_spacing_hz,
+                            max_pair_distance_hz=max_pair_dist,
+                            feature_prominence=self._fit_feature_prominence,
+                            min_feature_height=self._fit_min_feature_height
+                        )
+                        # Log quality assessment info
+                        if fit_result:
+                            quality = fit_result.get('quality_grade', 'unknown')
+                            method = fit_result.get('method_used', 'unknown')
+                            self.log.debug(f"Point {point_idx}: quality={quality}, method={method}")
+                    else:
+                        # Call fit_hyperfine with proximity-based pairing
+                        fit_result = self._fit_function(
+                            freq_data,  # positional argument (like sensitivity_sweep)
+                            voltage_data,  # positional argument (like sensitivity_sweep)
+                            feature_prominence=self._fit_feature_prominence,
+                            n_most_prominent_peaks=self._fit_n_most_prominent_peaks,
+                            min_feature_height=self._fit_min_feature_height,
+                            max_pair_distance_hz=max_pair_dist,  # NEW: proximity-based pairing
+                            plot_result=False,
+                            save_result_plot=save_plot,
+                            filename=fit_filename
+                        )
 
                     if fit_result is not None:
                         result['fit_result'] = fit_result
-                        result['n_features_found'] = fit_result.get('n_features_found', 0)
+                        result['n_features_found'] = fit_result.get('n_features_found', fit_result.get('n_features', 0))
 
-                        zc_freqs = fit_result.get('zero_crossing_frequencies [Hz]', [])
+                        # Check if fit_odmr_robust provided center_frequency directly
+                        # (from constrained model or COM fallback)
+                        if 'center_frequency' in fit_result and fit_result['center_frequency'] is not None:
+                            center_freq = fit_result['center_frequency']
+                            if not np.isnan(center_freq):
+                                result['center_frequency'] = center_freq
+                                result['fit_method'] = fit_result.get('method_used', 'unknown')
+                                result['quality_grade'] = fit_result.get('quality_grade', 'unknown')
+
+                        # Also try standard fit_hyperfine output format (zero_crossing_frequencies)
+                        if np.isnan(result['center_frequency']):
+                            zc_freqs = fit_result.get('zero_crossing_frequencies [Hz]', [])
+                            if isinstance(zc_freqs, np.ndarray) and len(zc_freqs) > 0:
+                                valid_zc = zc_freqs[~np.isnan(zc_freqs)]
+                                if len(valid_zc) > 0:
+                                    result['center_frequency'] = np.mean(valid_zc)
+                                    if len(valid_zc) >= 2:
+                                        result['splitting'] = valid_zc[-1] - valid_zc[0]
+
+                        # Extract linewidth from either format
                         linewidths = fit_result.get('linewidths [Hz]', [])
-
-                        if isinstance(zc_freqs, np.ndarray) and len(zc_freqs) > 0:
-                            valid_zc = zc_freqs[~np.isnan(zc_freqs)]
-                            if len(valid_zc) > 0:
-                                result['center_frequency'] = np.mean(valid_zc)
-                                if len(valid_zc) >= 2:
-                                    result['splitting'] = valid_zc[-1] - valid_zc[0]
-
                         if isinstance(linewidths, np.ndarray) and len(linewidths) > 0:
                             valid_lw = linewidths[~np.isnan(linewidths)]
                             if len(valid_lw) > 0:
                                 result['linewidth'] = np.mean(valid_lw)
-                        
+                        elif 'linewidth' in fit_result and fit_result['linewidth'] is not None:
+                            result['linewidth'] = fit_result['linewidth']
+
                         self.log.debug(f"Point {point_idx}: center_freq={result['center_frequency']/1e9:.6f} GHz, "
                                       f"linewidth={result['linewidth']/1e3:.1f} kHz, "
                                       f"n_features={result['n_features_found']}")

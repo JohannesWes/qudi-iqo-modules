@@ -122,6 +122,22 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         default=True,
         missing='info'
     )
+    # Robust fitting parameters
+    _hyperfine_spacing_hz = ConfigOption(
+        name='hyperfine_spacing_hz',
+        default=2.158e6,  # N14 hyperfine splitting
+        missing='info'
+    )
+    _max_pair_distance_hz = ConfigOption(
+        name='max_pair_distance_hz',
+        default=None,  # If None, defaults to 0.75 * hyperfine_spacing_hz
+        missing='info'
+    )
+    _use_robust_fitting = ConfigOption(
+        name='use_robust_fitting',
+        default=False,  # If True, use fit_odmr_robust with auto quality assessment
+        missing='info'
+    )
     _home_before_scan = ConfigOption(
         name='home_before_scan',
         default=False,
@@ -333,15 +349,23 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     def _load_fit_function(self):
         """Load the ODMR fit function from my_software.tools.fitting."""
         try:
-            from my_software.tools.fitting import fit_hyperfine
+            from my_software.tools.fitting import (
+                fit_hyperfine,
+                fit_odmr_robust,
+                fit_odmr_zero_crossing
+            )
             self._fit_function = fit_hyperfine
-            self.log.info("Loaded fit_hyperfine function from my_software.tools.fitting")
+            self._fit_function_robust = fit_odmr_robust
+            self._fit_function_zero_crossing = fit_odmr_zero_crossing
+            self.log.info("Loaded ODMR fitting functions from my_software.tools.fitting")
         except ImportError as e:
             if self._require_fit_function:
                 self.log.warning(f"Could not load fit function: {e}. ODMR fitting will be unavailable.")
             else:
                 self.log.debug(f"Fit function not loaded (optional): {e}")
             self._fit_function = None
+            self._fit_function_robust = None
+            self._fit_function_zero_crossing = None
     
     # =========================================================================
     # Properties
