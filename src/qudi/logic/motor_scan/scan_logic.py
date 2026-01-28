@@ -41,6 +41,7 @@ from .data_structures import ScanMode, ScanPattern, ScanState, MotorScanData
 from .motor_control import MotorControlMixin
 from .data_processing import DataProcessingMixin
 from .data_saving import DataSavingMixin
+from .data_loading import DataLoadingMixin
 from .continuous_line_scan import ContinuousLineScanMixin
 
 # Add qudi-core root to path to find my_software (same as sensitivity_sweep_logic)
@@ -50,7 +51,7 @@ if qudi_core_root not in sys.path:
     sys.path.insert(0, qudi_core_root)
 
 
-class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingMixin, DataSavingMixin, LogicBase):
+class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingMixin, DataSavingMixin, DataLoadingMixin, LogicBase):
     """
     Logic module for motor-based XY scanning.
     
@@ -167,6 +168,7 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     sigMovementStateChanged = QtCore.Signal(bool)  # True when moving to position, False when done
     sigLockLostDuringScan = QtCore.Signal()  # Emitted when lock is lost during CONTINUOUS_FREQ_TRACK
     sigLockStatusUpdated = QtCore.Signal(bool)  # Emitted with current lock status (for GUI indicator)
+    sigLoadedDataChanged = QtCore.Signal(bool)  # True when data loaded, False when cleared
 
     # Internal signals for async operations (run on logic thread via QueuedConnection)
     _sigNextPoint = QtCore.Signal()
@@ -228,6 +230,7 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         # Initialize mixin state
         self._init_position_sampling_state()  # From MotorControlMixin
         self._init_continuous_line_state()    # From ContinuousLineScanMixin
+        self._init_data_loading()             # From DataLoadingMixin
 
     def on_activate(self):
         """Initialize the module."""
@@ -519,7 +522,14 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
                 if axis not in self._scan_ranges:
                     self.log.error(f"Axis '{axis}' not configured. Available: {list(self._scan_ranges.keys())}")
                     return
-            
+
+            # Clear any loaded data when starting a new scan
+            if self._viewing_loaded_data:
+                self._loaded_scan_data = None
+                self._viewing_loaded_data = False
+                self._loaded_data_folder = None
+                self.sigLoadedDataChanged.emit(False)
+
             # Mark as initializing (prevents double-start, disables UI)
             self._scan_state = ScanState.INITIALIZING
             self.sigScanStateChanged.emit(self._scan_state)

@@ -105,7 +105,18 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.save_nametag_lineedit.setPlaceholderText('Enter save tag...')
         self.save_nametag_lineedit.setToolTip('Enter a nametag to include in saved file name')
         self.toolbar.addWidget(self.save_nametag_lineedit)
-        
+
+        # Load action
+        self.action_load = QtWidgets.QAction('Load Data', self)
+        load_icon = QtGui.QIcon(os.path.join(icon_path, 'icons', 'document-open.svg'))
+        self.action_load.setIcon(load_icon)
+        self.action_load.setToolTip(
+            'Load previously saved STEP_ODMR scan data.\n'
+            'Allows reviewing data and viewing per-pixel ODMR spectra.\n'
+            'Only available in STEP_ODMR mode when no scan is running.'
+        )
+        self.toolbar.addAction(self.action_load)
+
         self.toolbar.addSeparator()
         
         # Scan mode selector
@@ -297,6 +308,12 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.lock_status_label.setVisible(False)  # Hidden by default
         self.statusbar.addPermanentWidget(self.lock_status_label)
 
+        # Loaded data indicator
+        self.loaded_data_label = QtWidgets.QLabel('')
+        self.loaded_data_label.setStyleSheet('color: #CC8800; font-weight: bold; padding: 0 10px;')
+        self.loaded_data_label.setVisible(False)  # Hidden by default
+        self.statusbar.addPermanentWidget(self.loaded_data_label)
+
         # Scan status
         self.scan_status_label = QtWidgets.QLabel('Idle')
         self.statusbar.addWidget(self.scan_status_label)
@@ -344,11 +361,13 @@ class MotorScanGui(GuiBase):
         self._logic.sigMovementStateChanged.connect(self._on_movement_state_changed)
         self._logic.sigLockLostDuringScan.connect(self._on_lock_lost)
         self._logic.sigLockStatusUpdated.connect(self._on_lock_status_updated)
+        self._logic.sigLoadedDataChanged.connect(self._on_loaded_data_changed)
 
         # Connect GUI signals
         self._mw.action_start_scan.triggered.connect(self._toggle_scan)
         self._mw.action_pause_scan.triggered.connect(self._toggle_pause)
         self._mw.action_save.triggered.connect(self._save_data)
+        self._mw.action_load.triggered.connect(self._load_data)
         self._mw.action_home_stages.triggered.connect(self._home_stages)
         self._mw.apply_settings_button.clicked.connect(self._apply_settings)
         self._mw.mode_combo.currentTextChanged.connect(self._mode_changed)
@@ -385,6 +404,7 @@ class MotorScanGui(GuiBase):
         self._logic.sigMovementStateChanged.disconnect(self._on_movement_state_changed)
         self._logic.sigLockLostDuringScan.disconnect(self._on_lock_lost)
         self._logic.sigLockStatusUpdated.disconnect(self._on_lock_status_updated)
+        self._logic.sigLoadedDataChanged.disconnect(self._on_loaded_data_changed)
 
         # Disconnect pixel click signal
         self._mw.image_widget.plot_widget.scene().sigMouseClicked.disconnect(
@@ -454,6 +474,12 @@ class MotorScanGui(GuiBase):
         current_mode = self._mw.mode_combo.currentText()
         self._mw.pixel_spectrum_groupbox.setVisible(current_mode == 'STEP_ODMR')
 
+        # Ensure Load button state matches current mode
+        from qudi.logic.motor_scan import ScanState
+        is_step_odmr = current_mode == 'STEP_ODMR'
+        is_idle = self._logic.scan_state == ScanState.IDLE
+        self._mw.action_load.setEnabled(is_step_odmr and is_idle)
+
     def _apply_settings(self):
         """Apply current GUI settings to logic."""
         # Block settings changed signal to avoid restoring values while we're updating
@@ -517,7 +543,87 @@ class MotorScanGui(GuiBase):
             self._mw.action_home_stages.setEnabled(False)
             # Call home_stages which now runs asynchronously on the logic thread
             self._logic.home_stages()
-    
+
+    def _load_data(self):
+        """Load previously saved scan data for review."""
+        # Check if current mode is STEP_ODMR
+        if self._mw.mode_combo.currentText() != 'STEP_ODMR':
+            QtWidgets.QMessageBox.warning(
+                self._mw,
+                'Load Data',
+                'Loading data is only supported in STEP_ODMR mode.\n\n'
+                'Please switch to STEP_ODMR mode first.',
+                QtWidgets.QMessageBox.Ok
+            )
+            return
+
+        # Show confirmation dialog
+        reply = QtWidgets.QMessageBox.question(
+            self._mw,
+            'Load Measurement Data',
+            'Loading will replace the current scan view.\n\n'
+            'If you have unsaved measurement data, you can still\n'
+            'save it later (the data is preserved in the logic module).\n\n'
+            'Do you want to continue?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        # Get default directory for file dialog
+        default_dir = self._logic.module_default_data_dir
+
+        # Show folder selection dialog
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self._mw,
+            'Select Motor Scan Data Folder',
+            default_dir,
+            QtWidgets.QFileDialog.ShowDirsOnly
+        )
+
+        if folder:
+            # Load the data through logic module
+            success = self._logic.load_scan_data_from_folder(folder)
+            if not success:
+                QtWidgets.QMessageBox.warning(
+                    self._mw,
+                    'Load Failed',
+                    'Failed to load scan data from the selected folder.\n\n'
+                    'Please check the log for details.\n'
+                    'Ensure the folder contains valid STEP_ODMR scan data.',
+                    QtWidgets.QMessageBox.Ok
+                )
+
+    @QtCore.Slot(bool)
+    def _on_loaded_data_changed(self, is_loaded: bool):
+        """Handle loaded data state change from logic."""
+        # Update loaded data indicator
+        self._mw.loaded_data_label.setVisible(is_loaded)
+
+        if is_loaded:
+            self._mw.loaded_data_label.setText('[VIEWING LOADED DATA]')
+
+            # Update window title with timestamp
+            loaded_data = self._logic.loaded_scan_data
+            if loaded_data is not None and loaded_data.timestamp_start is not None:
+                ts = loaded_data.timestamp_start.strftime('%Y-%m-%d %H:%M')
+                self._mw.setWindowTitle(f'Motor XY Scan - [Loaded: {ts}]')
+            else:
+                self._mw.setWindowTitle('Motor XY Scan - [Loaded Data]')
+        else:
+            # Reset window title
+            self._mw.setWindowTitle('Motor XY Scan')
+
+        # Clear selected pixel when switching data sources
+        self._selected_pixel = None
+        self._mw.pixel_spectrum_widget.clear()
+
+        # Trigger display refresh
+        self._update_display()
+        self._update_progress()
+
     def _mode_changed(self, mode_text: str):
         """Handle scan mode change."""
         self._logic.set_scan_mode(mode_text)
@@ -545,6 +651,11 @@ class MotorScanGui(GuiBase):
         # Show/hide pixel spectrum panel based on mode (only for STEP_ODMR)
         is_step_odmr = (mode_text == 'STEP_ODMR')
         self._mw.pixel_spectrum_groupbox.setVisible(is_step_odmr)
+
+        # Enable/disable Load button based on mode (only for STEP_ODMR when idle)
+        from qudi.logic.motor_scan import ScanState
+        is_idle = self._logic.scan_state == ScanState.IDLE
+        self._mw.action_load.setEnabled(is_step_odmr and is_idle)
 
         # Clear spectrum when switching away from STEP_ODMR
         if not is_step_odmr:
@@ -600,6 +711,10 @@ class MotorScanGui(GuiBase):
         self._mw.move_button.setEnabled(not is_busy)
         self._mw.move_to_start_button.setEnabled(not is_busy)
         self._mw.stop_move_button.setEnabled(False)  # Stop button only for manual moves
+
+        # Load button enabled only in STEP_ODMR mode when idle
+        is_step_odmr = self._mw.mode_combo.currentText() == 'STEP_ODMR'
+        self._mw.action_load.setEnabled(not is_busy and is_step_odmr)
 
         # Update status label with user-friendly text
         if is_initializing:
@@ -667,6 +782,10 @@ class MotorScanGui(GuiBase):
         self._mw.move_to_start_button.setEnabled(not is_homing)
         self._mw.stop_move_button.setEnabled(False)  # Can't stop homing with this button
 
+        # Load button disabled during homing
+        is_step_odmr = self._mw.mode_combo.currentText() == 'STEP_ODMR'
+        self._mw.action_load.setEnabled(not is_homing and is_step_odmr)
+
         # Update status label
         if is_homing:
             self._mw.scan_status_label.setText('Homing stages...')
@@ -699,6 +818,10 @@ class MotorScanGui(GuiBase):
 
         # Stop button is ONLY enabled during movement
         self._mw.stop_move_button.setEnabled(is_moving)
+
+        # Load button disabled during movement
+        is_step_odmr = self._mw.mode_combo.currentText() == 'STEP_ODMR'
+        self._mw.action_load.setEnabled(not is_moving and is_step_odmr)
 
         # Update status label
         if is_moving:
@@ -749,7 +872,7 @@ class MotorScanGui(GuiBase):
 
     def _update_display(self):
         """Update the scan image display."""
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         if scan_data is None:
             return
         
@@ -844,7 +967,7 @@ class MotorScanGui(GuiBase):
     
     def _update_progress(self):
         """Update progress bar."""
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         if scan_data is not None:
             progress = int(scan_data.progress * 100)
             self._mw.progress_bar.setValue(progress)
@@ -890,7 +1013,7 @@ class MotorScanGui(GuiBase):
         from qudi.logic.motor_scan import ScanMode
 
         # Only handle in STEP_ODMR mode
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         if scan_data is None or scan_data.scan_mode != ScanMode.STEP_ODMR:
             return
 
@@ -951,7 +1074,7 @@ class MotorScanGui(GuiBase):
         Returns:
             Tuple (ix, iy) or None if position is far out of bounds
         """
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         if scan_data is None:
             return None
 
@@ -1005,7 +1128,7 @@ class MotorScanGui(GuiBase):
         """
         from qudi.logic.motor_scan import ScanPattern
 
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         nx = scan_data.scan_resolution[0]
         pattern = scan_data.scan_pattern
 
@@ -1032,7 +1155,7 @@ class MotorScanGui(GuiBase):
 
         from qudi.logic.motor_scan import ScanMode
 
-        scan_data = self._logic.scan_data
+        scan_data = self._logic.display_scan_data
         if scan_data is None or scan_data.scan_mode != ScanMode.STEP_ODMR:
             return
 

@@ -93,10 +93,11 @@ class MotorScanData:
     odmr_raw_per_pixel: Optional[List[Dict]] = None  # List of dicts with 'frequency', 'signal' per point
     
     # Derived quantities for display (computed from fits)
-    center_frequency: Optional[np.ndarray] = None  # 2D array (ny, nx)
-    linewidth: Optional[np.ndarray] = None  # 2D array (ny, nx)
-    splitting: Optional[np.ndarray] = None  # 2D array (ny, nx)
-    fit_quality: Optional[np.ndarray] = None  # 2D array (ny, nx) - n_features_found
+    # Shape: (nx, ny) - first index is X, second index is Y (matrix indexing convention)
+    center_frequency: Optional[np.ndarray] = None  # 2D array [ix, iy]
+    linewidth: Optional[np.ndarray] = None  # 2D array [ix, iy]
+    splitting: Optional[np.ndarray] = None  # 2D array [ix, iy]
+    fit_quality: Optional[np.ndarray] = None  # 2D array [ix, iy] - n_features_found
     
     # Scan progress
     current_point_index: int = 0
