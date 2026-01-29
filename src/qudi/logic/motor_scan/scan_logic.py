@@ -159,6 +159,11 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         default=0.05,  # 50ms = 20 Hz position sampling during continuous line scan
         missing='info'
     )
+    _auto_save_on_completion = ConfigOption(
+        name='auto_save_on_completion',
+        default=True,  # Automatically save scan data when scan completes
+        missing='info'
+    )
 
     # Status variables (persistent across sessions)
     _scan_ranges = StatusVar(
@@ -1070,7 +1075,15 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         # Emit signals
         self.sigScanStateChanged.emit(self._scan_state)
         self.sigScanCompleted.emit(self._scan_data)
-        
+
         status = "completed" if completed else "stopped"
         self.log.info(f"Scan {status}. Duration: {self._scan_data.scan_duration:.1f}s, "
                      f"Points: {self._scan_data.current_point_index}/{self._scan_data.total_points}")
+
+        # Auto-save scan data if enabled
+        if self._auto_save_on_completion and completed:
+            self.log.info("Auto-saving scan data...")
+            try:
+                self.save_scan_data()
+            except Exception as e:
+                self.log.error(f"Auto-save failed: {e}")
