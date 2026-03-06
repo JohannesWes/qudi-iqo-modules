@@ -362,6 +362,7 @@ class MotorScanGui(GuiBase):
         self._logic.sigLockLostDuringScan.connect(self._on_lock_lost)
         self._logic.sigLockStatusUpdated.connect(self._on_lock_status_updated)
         self._logic.sigLoadedDataChanged.connect(self._on_loaded_data_changed)
+        self._logic.sigScanStatusMessage.connect(self._on_scan_status_message)
 
         # Connect GUI signals
         self._mw.action_start_scan.triggered.connect(self._toggle_scan)
@@ -405,6 +406,7 @@ class MotorScanGui(GuiBase):
         self._logic.sigLockLostDuringScan.disconnect(self._on_lock_lost)
         self._logic.sigLockStatusUpdated.disconnect(self._on_lock_status_updated)
         self._logic.sigLoadedDataChanged.disconnect(self._on_loaded_data_changed)
+        self._logic.sigScanStatusMessage.disconnect(self._on_scan_status_message)
 
         # Disconnect pixel click signal
         self._mw.image_widget.plot_widget.scene().sigMouseClicked.disconnect(
@@ -722,6 +724,10 @@ class MotorScanGui(GuiBase):
         else:
             self._mw.scan_status_label.setText(state.name)
     
+    def _on_scan_status_message(self, message: str):
+        """Handle descriptive status text from logic (e.g. 'Scanning line 3/20...')."""
+        self._mw.scan_status_label.setText(message)
+
     def _on_scan_data_updated(self):
         """Handle scan data update from logic."""
         self._update_display()

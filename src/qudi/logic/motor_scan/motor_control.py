@@ -250,15 +250,19 @@ class MotorControlMixin:
         self._position_sampling_active = False
         self._line_scan_start_time = 0.0
 
-    def _start_position_sampling(self, sample_interval_ms: int = 50):
+    def _start_position_sampling(self, sample_interval_ms: int = 50,
+                                  preserve_buffer: bool = False):
         """
         Start recording timestamped positions at regular intervals.
-        
+
         Args:
             sample_interval_ms: Interval between position samples in milliseconds.
+            preserve_buffer: If True, keep existing buffer contents (used when
+                resuming a paused line scan to retain pre-pause position samples).
         """
-        self._position_sample_buffer = []
-        self._line_scan_start_time = time.time()
+        if not preserve_buffer:
+            self._position_sample_buffer = []
+            self._line_scan_start_time = time.time()
         self._position_sampling_active = True
         
         # Create timer if needed
@@ -305,19 +309,25 @@ class MotorControlMixin:
             timestamp = time.time() - self._line_scan_start_time
             position = self.current_position
             if position:
-                # FIX Finding #5: Jitter detection for stale position data
-                # If consecutive samples are identical, hardware may be returning cached values
+                # Detect identical consecutive position samples (expected at scan
+                # endpoints when motor has stopped; could also indicate stale
+                # encoder readback if it persists during movement).
                 if len(self._position_sample_buffer) > 0:
                     _, prev_position = self._position_sample_buffer[-1]
                     if position == prev_position:
-                        if not getattr(self, '_jitter_warning_logged', False):
+                        if not getattr(self, '_identical_pos_count', 0):
+                            self._identical_pos_count = 1
+                        else:
+                            self._identical_pos_count += 1
+                        # Only warn after many consecutive identical samples
+                        # (suggests stale data during movement, not just stopped motor)
+                        if self._identical_pos_count == 10:
                             self.log.warning(
-                                "Identical consecutive position samples detected. "
-                                "Motor may be returning cached/stale encoder values."
+                                "10+ identical consecutive position samples. "
+                                "Motor may be returning stale encoder values."
                             )
-                            self._jitter_warning_logged = True
                     else:
-                        self._jitter_warning_logged = False
+                        self._identical_pos_count = 0
                 
                 self._position_sample_buffer.append((timestamp, position.copy()))
         except Exception as e:

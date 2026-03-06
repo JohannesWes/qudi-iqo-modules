@@ -190,6 +190,7 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     sigLockLostDuringScan = QtCore.Signal()  # Emitted when lock is lost during CONTINUOUS_FREQ_TRACK
     sigLockStatusUpdated = QtCore.Signal(bool)  # Emitted with current lock status (for GUI indicator)
     sigLoadedDataChanged = QtCore.Signal(bool)  # True when data loaded, False when cleared
+    sigScanStatusMessage = QtCore.Signal(str)  # Descriptive status text for GUI status bar
 
     # Internal signals for async operations (run on logic thread via QueuedConnection)
     _sigNextPoint = QtCore.Signal()
@@ -586,7 +587,17 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
                     try:
                         result = motor.calibrate(axes)
                         if result != 0:
-                            self.log.warning(f"Homing returned error code {result}. Proceeding anyway.")
+                            self.log.error(
+                                f"Homing failed (error code {result}). "
+                                f"Aborting scan — encoder zero reference may be "
+                                f"incorrect, positions would be wrong."
+                            )
+                            self.sigScanStatusMessage.emit(
+                                'Scan aborted: homing failed'
+                            )
+                            self._scan_state = ScanState.IDLE
+                            self.sigScanStateChanged.emit(self._scan_state)
+                            return
                     except Exception as e:
                         self.log.error(f"Homing failed: {e}. Aborting scan.")
                         self._scan_state = ScanState.IDLE

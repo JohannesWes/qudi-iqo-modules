@@ -36,6 +36,15 @@ class ContinuousLineScanMixin:
     - log: Logger instance
     """
 
+    # Position tolerance for verifying motor arrived at target (meters)
+    _LINE_START_POSITION_TOLERANCE = 500e-6  # 500 µm
+    # Maximum retries for re-issuing move command when motor reports idle at wrong position
+    _LINE_START_MAX_RETRIES = 3
+    # Timeout for reaching line start position (seconds). Long moves (e.g., 20mm)
+    # can take 10-30s on KDC101 stages. The timeout covers the entire move, not
+    # individual retries.
+    _LINE_START_TIMEOUT = 120.0
+
     def _init_continuous_line_state(self):
         """Initialize state variables for continuous line scanning. Call from __init__."""
         self._continuous_line_mode = True  # Enable continuous line scanning
@@ -44,10 +53,12 @@ class ContinuousLineScanMixin:
         self._line_motor_poll_timer = None
         self._waiting_for_line_start = False
         self._waiting_for_line_end = False
+        self._line_start_position = {}  # Target start position for current line
         self._line_end_position = {}  # Target end position for current line
         self._line_paused_mid_scan = False
         self._line_pause_position = None  # Position where pause occurred
         self._line_pause_position_buffer = []  # Preserved position samples during pause
+        self._line_start_retries = 0  # Retry counter for reaching line start
 
     def _should_use_continuous_line_mode(self) -> bool:
         """
@@ -106,11 +117,15 @@ class ContinuousLineScanMixin:
             
             # Start by moving to line start
             motor.move_abs(start_pos)
-            
+            self.sigScanStatusMessage.emit(f'Moving to line {line_index + 1}/{n_lines} start...')
+
             # Wait for arrival at line start
             self._waiting_for_line_start = True
+            self._line_start_position = start_pos
             self._line_end_position = end_pos
-            
+            self._line_start_retries = 0
+            self._line_start_move_time = time.time()
+
             # Initialize line motor poll timer if needed
             if self._line_motor_poll_timer is None:
                 self._line_motor_poll_timer = QtCore.QTimer()
@@ -119,9 +134,12 @@ class ContinuousLineScanMixin:
                     self._on_line_motor_poll_timeout,
                     QtCore.Qt.QueuedConnection
                 )
-            
-            # Start polling for arrival at line start
-            self._line_motor_poll_timer.start(50)
+
+            # Use longer initial delay (200ms) to let KDC101 process the USB
+            # move command before we start polling is_moving(). Without this,
+            # the first poll can see is_moving()=False because the motor hasn't
+            # started yet, causing the scan to proceed from the wrong position.
+            self._line_motor_poll_timer.start(200)
 
     @QtCore.Slot()
     def _on_line_motor_poll_timeout(self):
@@ -160,23 +178,106 @@ class ContinuousLineScanMixin:
                 if is_moving:
                     self._line_motor_poll_timer.start(50)
                     return
-                
-                # Arrived at line start - begin continuous scan
+
+                # Motor reports not moving — verify we actually reached the
+                # target start position on ALL axes. The KDC101 can report
+                # not-moving if:
+                # (a) the USB move command hasn't been processed yet (race), or
+                # (b) the stage genuinely stopped short of the target.
+                # We must check all axes (not just the fast axis) because the
+                # slow axis also needs to reach its target before the line scan
+                # begins — otherwise a line scan at y=20mm could run at y=0.
+                actual_pos = motor.get_pos()
+                max_position_error = 0.0
+                worst_axis = ''
+                for axis, target in self._line_start_position.items():
+                    error = abs(actual_pos.get(axis, 0) - target)
+                    if error > max_position_error:
+                        max_position_error = error
+                        worst_axis = axis
+
+                if max_position_error > self._LINE_START_POSITION_TOLERANCE:
+                    elapsed = time.time() - self._line_start_move_time
+
+                    # Check overall timeout first
+                    if elapsed > self._LINE_START_TIMEOUT:
+                        self.log.error(
+                            f"Line {self._current_line_index}: timed out reaching start "
+                            f"position after {elapsed:.1f}s "
+                            f"({worst_axis} error={max_position_error*1e6:.0f}µm). "
+                            f"Aborting scan."
+                        )
+                        self._finalize_scan(completed=False)
+                        return
+
+                    # Motor says idle but position is wrong. Re-issue the move
+                    # command (handles USB race where command wasn't processed).
+                    # Limit re-issues to avoid flooding USB, but keep polling
+                    # with a longer interval to allow the motor time to move.
+                    self._line_start_retries += 1
+                    if self._line_start_retries <= self._LINE_START_MAX_RETRIES:
+                        target_val = self._line_start_position.get(worst_axis, 0)
+                        actual_val = actual_pos.get(worst_axis, 0)
+                        self.log.warning(
+                            f"Line {self._current_line_index}: motor not at start position "
+                            f"({worst_axis}: target={target_val*1000:.3f}mm, "
+                            f"actual={actual_val*1000:.3f}mm, "
+                            f"error={max_position_error*1e6:.0f}µm). "
+                            f"Re-issuing move (attempt {self._line_start_retries}/"
+                            f"{self._LINE_START_MAX_RETRIES})."
+                        )
+                        motor.move_abs(self._line_start_position)
+                    # Keep polling — motor may need time to reach target.
+                    # Use 500ms interval to avoid flooding USB with get_pos() calls.
+                    self._line_motor_poll_timer.start(500)
+                    return
+
+                # Position verified — log actual position for traceability
+                pos_str = ', '.join(
+                    f'{ax}={actual_pos.get(ax, 0)*1000:.3f}mm' for ax in self._line_start_position
+                )
+                if self._line_start_retries > 0:
+                    self.log.info(
+                        f"Line {self._current_line_index}: start position reached "
+                        f"after {self._line_start_retries} re-issue(s): ({pos_str}), "
+                        f"max error={max_position_error*1e6:.0f}µm"
+                    )
+                else:
+                    self.log.debug(
+                        f"Line {self._current_line_index}: start position verified: "
+                        f"({pos_str}), max error={max_position_error*1e6:.0f}µm"
+                    )
+
                 self._waiting_for_line_start = False
                 self._waiting_for_line_end = True
-                
+
                 # Clear data buffers and start position sampling
                 self._clear_line_raw_data_buffer()
                 self._line_data_start_time = time.time()
-                
+
                 sample_interval_ms = int(getattr(self, '_position_poll_interval', 0.05) * 1000)
                 self._start_position_sampling(sample_interval_ms)
-                
-                # Issue move to line end (non-blocking)
-                motor.move_abs(self._line_end_position)
-                
-                self.log.debug(f"Line {self._current_line_index}: moving to end position")
-                self._line_motor_poll_timer.start(50)
+
+                # Issue move to line end — ONLY command the fast axis.
+                # Sending both axes causes a race condition: for LINE_BY_LINE_Y,
+                # move_abs({'x': current, 'y': target}) sends the x no-op first
+                # (dict iteration order), then y second. The poll can fire in the
+                # gap after x's no-op completes but before y starts, seeing both
+                # axes idle and concluding the line is "complete" at y=0.
+                # The slow axis is already at the correct position from Phase 1.
+                fast_axis = self._scan_data.get_fast_axis()
+                fast_axis_move = {fast_axis: self._line_end_position[fast_axis]}
+                motor.move_abs(fast_axis_move)
+
+                n_lines = self._scan_data.get_num_lines()
+                self.log.info(f"Scanning line {self._current_line_index + 1}/{n_lines} "
+                              f"({fast_axis}: {self._line_start_position[fast_axis]*1000:.3f}"
+                              f" -> {self._line_end_position[fast_axis]*1000:.3f}mm)")
+                self.sigScanStatusMessage.emit(
+                    f'Scanning line {self._current_line_index + 1}/{n_lines}...'
+                )
+                # Use 200ms initial delay to let KDC101 process the USB command
+                self._line_motor_poll_timer.start(200)
                 
             elif self._waiting_for_line_end:
                 # Phase 2: Waiting to arrive at line end (continuous scan in progress)
@@ -254,19 +355,17 @@ class ContinuousLineScanMixin:
             # Resume from pause position to line end
             self.log.info(f"Resuming line {self._current_line_index} from pause position")
             
-            # FIX Finding #1: Prepare buffer with preserved samples BEFORE starting timer
-            # to avoid race condition where timer fires before buffer is restored
-            preserved = []
+            # Restore pre-pause position samples into the buffer, then start
+            # sampling with preserve_buffer=True so _start_position_sampling()
+            # does not clear them.
             if hasattr(self, '_line_pause_position_buffer') and self._line_pause_position_buffer:
-                preserved = self._line_pause_position_buffer.copy()
+                self._position_sample_buffer = self._line_pause_position_buffer.copy()
                 self._line_pause_position_buffer = []
-            
-            # Initialize position sample buffer with preserved samples
-            self._position_sample_buffer = preserved
-            
-            # Now start sampling (timer will append to our pre-initialized buffer)
+            else:
+                self._position_sample_buffer = []
+
             sample_interval_ms = int(getattr(self, '_position_sample_interval', 0.05) * 1000)
-            self._start_position_sampling(sample_interval_ms)
+            self._start_position_sampling(sample_interval_ms, preserve_buffer=True)
             
             # Continue movement to line end
             motor = self._motor_hardware()

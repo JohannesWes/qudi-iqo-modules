@@ -337,20 +337,47 @@ class DataSavingMixin:
         # Get scan ranges
         x_range = self._scan_data.scan_range[0]
         y_range = self._scan_data.scan_range[1] if len(self._scan_data.scan_range) > 1 else (0, 1)
-        
+
+        # Detect degenerate ranges (line scan where one axis has start == stop)
+        x_degenerate = (x_range[0] == x_range[1])
+        y_degenerate = (y_range[0] == y_range[1])
+
+        # For degenerate axes, create artificial extent so imshow renders a visible strip
+        if y_degenerate and not x_degenerate:
+            x_span = abs(x_range[1] - x_range[0])
+            artificial_half = x_span / max(data.shape[0], 1) / 2
+            x_range_display = x_range
+            y_range_display = (y_range[0] - artificial_half, y_range[1] + artificial_half)
+        elif x_degenerate and not y_degenerate:
+            y_span = abs(y_range[1] - y_range[0])
+            artificial_half = y_span / max(data.shape[1] if data.ndim > 1 else 1, 1) / 2
+            x_range_display = (x_range[0] - artificial_half, x_range[1] + artificial_half)
+            y_range_display = y_range
+        else:
+            x_range_display = x_range
+            y_range_display = y_range
+
         # Handle colorbar range - ignore NaN values
         valid_data = data[~np.isnan(data)]
         if len(valid_data) == 0:
             cbar_range = (0, 1)
         else:
             cbar_range = (np.nanmin(data), np.nanmax(data))
-        
+
         # Calculate SI scaling for axes
-        si_prefix_x = ScaledFloat(x_range[1] - x_range[0]).scale
-        si_factor_x = ScaledFloat(x_range[1] - x_range[0]).scale_val
-        si_prefix_y = ScaledFloat(y_range[1] - y_range[0]).scale
-        si_factor_y = ScaledFloat(y_range[1] - y_range[0]).scale_val
-        
+        # For degenerate axes, use absolute position value for SI prefix instead of zero span
+        x_span_display = abs(x_range_display[1] - x_range_display[0])
+        y_span_display = abs(y_range_display[1] - y_range_display[0])
+        si_prefix_x = ScaledFloat(x_span_display).scale if x_span_display > 0 else ScaledFloat(abs(x_range[0])).scale
+        si_factor_x = ScaledFloat(x_span_display).scale_val if x_span_display > 0 else ScaledFloat(abs(x_range[0])).scale_val
+        si_prefix_y = ScaledFloat(y_span_display).scale if y_span_display > 0 else ScaledFloat(abs(y_range[0])).scale
+        si_factor_y = ScaledFloat(y_span_display).scale_val if y_span_display > 0 else ScaledFloat(abs(y_range[0])).scale_val
+        # Avoid division by zero for SI factors
+        if si_factor_x == 0:
+            si_factor_x = 1
+        if si_factor_y == 0:
+            si_factor_y = 1
+
         # Calculate SI scaling for colorbar
         if cbar_range[1] != cbar_range[0]:
             si_prefix_cb = ScaledFloat(cbar_range[1] - cbar_range[0]).scale
@@ -358,10 +385,10 @@ class DataSavingMixin:
         else:
             si_prefix_cb = ScaledFloat(cbar_range[1]).scale if cbar_range[1] != 0 else ''
             si_factor_cb = ScaledFloat(cbar_range[1]).scale_val if cbar_range[1] != 0 else 1
-        
+
         # Create figure
         fig, ax = plt.subplots()
-        
+
         # Create image plot
         # Data shape is (nx, ny), but imshow expects (rows, cols) = (ny, nx)
         # So we transpose the data for correct display
@@ -373,21 +400,21 @@ class DataSavingMixin:
             vmax=cbar_range[1] / si_factor_cb,
             interpolation='none',
             extent=(
-                x_range[0] / si_factor_x,
-                x_range[1] / si_factor_x,
-                y_range[0] / si_factor_y,
-                y_range[1] / si_factor_y
+                x_range_display[0] / si_factor_x,
+                x_range_display[1] / si_factor_x,
+                y_range_display[0] / si_factor_y,
+                y_range_display[1] / si_factor_y
             )
         )
-        
+
         # Set axis labels
         x_axis_name = self._scan_data.scan_axes[0] if self._scan_data.scan_axes else 'x'
         y_axis_name = self._scan_data.scan_axes[1] if len(self._scan_data.scan_axes) > 1 else 'y'
         ax.set_xlabel(f'{x_axis_name} position ({si_prefix_x}m)')
         ax.set_ylabel(f'{y_axis_name} position ({si_prefix_y}m)')
-        
-        # Configure axis appearance (use 1 for aspect ratio, consistent with scanning_data_logic)
-        ax.set_aspect(1)
+
+        # Use 'auto' aspect for line scans (degenerate axis), equal aspect for 2D
+        ax.set_aspect('auto' if (x_degenerate or y_degenerate) else 1)
         ax.spines['bottom'].set_position(('outward', 10))
         ax.spines['left'].set_position(('outward', 10))
         ax.spines['top'].set_visible(False)

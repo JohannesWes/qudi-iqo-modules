@@ -598,19 +598,44 @@ class DataProcessingMixin:
         
         pos_times = np.array([t for t, _ in position_time_buffer])
         pos_values = np.array([p.get(fast_axis, 0) for _, p in position_time_buffer])
-        
+
+        # Trim stationary samples from start and end of position buffer.
+        # The motor is briefly stationary after the move command (USB latency)
+        # and after arriving at the end position. These constant-position
+        # regions cause divide-by-zero in scipy interp1d (position→time is
+        # not a function when multiple times map to the same position).
+        pos_diff = np.diff(pos_values)
+        moving_mask = np.abs(pos_diff) > 1e-7  # ~0.1 µm threshold
+        moving_indices = np.where(moving_mask)[0]
+
+        if len(moving_indices) < 2:
+            self.log.warning(f"Motor did not move during line {line_index}: "
+                           f"position stayed at {pos_values[0]*1000:.3f}mm")
+            return {'success': False, 'error': 'Motor did not move'}
+
+        # Keep one sample before first movement and one after last movement
+        trim_start = max(0, moving_indices[0])
+        trim_end = min(len(pos_values) - 1, moving_indices[-1] + 2)
+        pos_times = pos_times[trim_start:trim_end]
+        pos_values = pos_values[trim_start:trim_end]
+
+        self.log.debug(f"Line {line_index}: trimmed position buffer from "
+                      f"{len(position_time_buffer)} to {len(pos_values)} samples "
+                      f"(removed {trim_start} leading + "
+                      f"{len(position_time_buffer) - trim_end} trailing stationary)")
+
         # Determine scan direction
         scanning_positive = pos_values[-1] > pos_values[0]
-        
+
         # Sort boundaries in scan order
         if scanning_positive:
             sorted_boundaries = np.sort(bin_boundaries)
         else:
             sorted_boundaries = np.sort(bin_boundaries)[::-1]
-        
+
         # Note: We create position->time interpolation below, not time->position
         # since we need to find the times when motor crossed position boundaries
-        
+
         # Find times when motor crossed each bin boundary
         # We need time -> position inverse, so we interpolate position -> time
         try:
@@ -625,7 +650,7 @@ class DataProcessingMixin:
             self.log.warning(f"Failed to interpolate boundary times: {e}")
             # Fallback: linearly divide the time range
             boundary_times = np.linspace(pos_times[0], pos_times[-1], len(sorted_boundaries))
-        
+
         # Ensure boundary times are monotonically increasing
         boundary_times = np.sort(boundary_times)
         

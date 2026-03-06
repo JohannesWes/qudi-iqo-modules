@@ -478,6 +478,9 @@ class ThorlabsKDC101Kinesis(MotorInterface):
 
         return status
 
+    # Maximum number of homing retries per axis before giving up
+    _HOMING_MAX_RETRIES = 2
+
     def calibrate(self, param_list: Optional[List[str]] = None) -> int:
         """
         Calibrate (home) the stage.
@@ -486,13 +489,18 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         and establishes the zero reference. After homing, the stage stays
         at the home offset position (typically ~1mm from the limit).
 
+        Each axis is verified after homing. If position verification fails,
+        homing is retried up to _HOMING_MAX_RETRIES times before returning
+        an error. A failed homing means the encoder zero reference is wrong
+        and all subsequent move_abs commands would go to incorrect positions.
+
         Uses the 'default_velocity' config option for homing speed.
 
         Args:
             param_list: Optional list of axis labels to home. If None, homes all.
 
         Returns:
-            int: Error code (0: OK, -1: error)
+            int: Error code (0: OK, -1: error, -2: position verification failed)
         """
         try:
             axes_to_home = param_list if param_list is not None else list(self._stages.keys())
@@ -503,68 +511,10 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                 if axis_label not in self._stages:
                     self.log.warning(f"Axis {axis_label} not found")
                     continue
-                    
-                stage = self._stages[axis_label]
-                
-                # Set homing velocity to default_velocity
-                try:
-                    stage.setup_homing(velocity=self._default_velocity)
-                except Exception as e:
-                    self.log.warning(f"Could not set homing velocity for {axis_label}-axis: {e}")
-                
-                pos_before = stage.get_position()
-                self.log.info(f"Homing {axis_label}-axis (from {pos_before*1000:.1f}mm)...")
-                
-                # Use force=True to ensure homing happens even if device thinks it's already homed
-                try:
-                    stage.home(sync=False, force=True)
-                except Exception as e:
-                    self.log.error(f"Failed to start homing on {axis_label}-axis: {e}")
-                    return -1
-                
-                time.sleep(1.0)
-                
-                # Poll until movement stops (timeout 120 seconds)
-                timeout = 120.0
-                start_time = time.time()
-                last_log_time = 0
-                
-                while time.time() - start_time < timeout:
-                    if not stage.is_moving():
-                        break
-                    elapsed = time.time() - start_time
-                    if elapsed - last_log_time >= 10:
-                        pos_now = stage.get_position()
-                        self.log.info(f"{axis_label}-axis homing... {pos_now*1000:.1f}mm, {elapsed:.0f}s")
-                        last_log_time = elapsed
-                    time.sleep(0.5)
-                else:
-                    self.log.error(f"{axis_label}-axis homing timed out after {timeout}s")
-                    return -1
-                
-                # After homing completes, encoder has been reset by firmware.
-                # Small delay to ensure encoder state is synchronized before reading position.
-                time.sleep(0.5)
-                pos_after = stage.get_position()
-                elapsed = time.time() - start_time
-                
-                # Verify homing actually happened: position should be near home (~-2mm to +2mm)
-                # and if we started far from home, it should have taken significant time
-                home_position_ok = abs(pos_after) < 2e-3  # Within 2mm of zero
-                time_plausible = elapsed > 2.0 or abs(pos_before) < 5e-3  # >2s unless started near home
-                
-                if not home_position_ok:
-                    self.log.warning(
-                        f"{axis_label}-axis homing may have failed: position {pos_after*1000:.1f}mm "
-                        f"is not near home. Expected ~0mm (within ±2mm)."
-                    )
-                elif not time_plausible:
-                    self.log.warning(
-                        f"{axis_label}-axis homing completed unusually fast ({elapsed:.1f}s) "
-                        f"from {pos_before*1000:.1f}mm. Homing may not have executed properly."
-                    )
-                
-                self.log.info(f"{axis_label}-axis homed in {elapsed:.1f}s (position: {pos_after*1000:.1f}mm)")
+
+                result = self._home_single_axis(axis_label)
+                if result != 0:
+                    return result
 
             self._is_homed = True
             self.sigHomingComplete.emit()
@@ -574,6 +524,126 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         except Exception as e:
             self.log.error(f"Calibration failed: {e}", exc_info=True)
             return -1
+
+    def _home_single_axis(self, axis_label: str) -> int:
+        """
+        Home a single axis with retry logic.
+
+        Attempts homing up to (1 + _HOMING_MAX_RETRIES) times. After each
+        attempt, verifies that the position is near zero (within ±2mm).
+
+        Args:
+            axis_label: The axis to home (e.g., 'x' or 'y').
+
+        Returns:
+            int: 0 on success, -1 on hard error, -2 on verification failure.
+        """
+        stage = self._stages[axis_label]
+        max_attempts = 1 + self._HOMING_MAX_RETRIES
+
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                self.log.warning(
+                    f"{axis_label}-axis: retrying homing "
+                    f"(attempt {attempt + 1}/{max_attempts})"
+                )
+
+            # Set homing velocity
+            try:
+                stage.setup_homing(velocity=self._default_velocity)
+            except Exception as e:
+                self.log.warning(
+                    f"Could not set homing velocity for {axis_label}-axis: {e}"
+                )
+
+            pos_before = stage.get_position()
+            self.log.info(
+                f"Homing {axis_label}-axis (from {pos_before*1000:.1f}mm)..."
+            )
+
+            # Start homing (force=True to home even if device thinks it's done)
+            try:
+                stage.home(sync=False, force=True)
+            except Exception as e:
+                self.log.error(
+                    f"Failed to start homing on {axis_label}-axis: {e}"
+                )
+                return -1
+
+            time.sleep(1.0)
+
+            # Poll until movement stops (timeout 120 seconds)
+            timeout = 120.0
+            start_time = time.time()
+            last_log_time = 0
+
+            while time.time() - start_time < timeout:
+                if not stage.is_moving():
+                    break
+                elapsed = time.time() - start_time
+                if elapsed - last_log_time >= 10:
+                    pos_now = stage.get_position()
+                    self.log.info(
+                        f"{axis_label}-axis homing... "
+                        f"{pos_now*1000:.1f}mm, {elapsed:.0f}s"
+                    )
+                    last_log_time = elapsed
+                time.sleep(0.5)
+            else:
+                self.log.error(
+                    f"{axis_label}-axis homing timed out after {timeout}s"
+                )
+                return -1
+
+            # After homing, encoder is reset by firmware. Small delay to
+            # ensure encoder state is synchronized before reading position.
+            time.sleep(0.5)
+            pos_after = stage.get_position()
+            elapsed = time.time() - start_time
+
+            # Verify position is near home. After homing, KDC101 stages
+            # move to the home offset position which typically reads as
+            # -1.0 to -1.5mm. Accept positions within 3mm of zero (covers
+            # normal -1.5mm offset plus some margin). A failed homing reads
+            # as 10-25mm away, so this threshold reliably catches failures.
+            home_position_ok = abs(pos_after) < 3e-3
+            # Verify timing is plausible (>2s unless started near home)
+            time_plausible = (
+                elapsed > 2.0 or abs(pos_before) < 5e-3
+            )
+
+            if home_position_ok and time_plausible:
+                self.log.info(
+                    f"{axis_label}-axis homed in {elapsed:.1f}s "
+                    f"(position: {pos_after*1000:.1f}mm)"
+                )
+                return 0
+
+            # Homing verification failed
+            if not home_position_ok:
+                self.log.warning(
+                    f"{axis_label}-axis homing failed: position "
+                    f"{pos_after*1000:.1f}mm is not near home. "
+                    f"Expected ~0mm (within ±2mm)."
+                )
+            elif not time_plausible:
+                self.log.warning(
+                    f"{axis_label}-axis homing completed unusually fast "
+                    f"({elapsed:.1f}s) from {pos_before*1000:.1f}mm. "
+                    f"Homing may not have executed properly."
+                )
+
+            self.log.info(
+                f"{axis_label}-axis homed in {elapsed:.1f}s "
+                f"(position: {pos_after*1000:.1f}mm)"
+            )
+
+        # All retries exhausted
+        self.log.error(
+            f"{axis_label}-axis homing failed after {max_attempts} attempts. "
+            f"Encoder zero reference may be incorrect."
+        )
+        return -2
 
     def get_velocity(self, param_list: Optional[List[str]] = None) -> Dict[str, float]:
         """
