@@ -665,7 +665,8 @@ class SensitivitySweepLogic(LogicBase):
                 'power_dbm': power_dbm,
                 'f_mod_hz': f_mod_hz,
                 'f_dev_khz': f_dev_khz,
-                'sensitivity_nT_rtHz': np.nan
+                'sensitivity_nT_rtHz': np.nan,
+                'sensitivity_rms_nT_rtHz': np.nan
             }
 
         # Emit fit data for GUI (add fit curve data for plotting)
@@ -687,7 +688,7 @@ class SensitivitySweepLogic(LogicBase):
         self._set_cw_frequency(zc_freq, power_dbm)
 
         # Step 5: Record time series and calculate sensitivity
-        sensitivity_on, asd_freq, asd_on = self._measure_sensitivity(
+        sensitivity_on, sensitivity_on_rms, asd_freq, asd_on = self._measure_sensitivity(
             filename_prefix + '_ON-resonant',
             slope
         )
@@ -705,12 +706,13 @@ class SensitivitySweepLogic(LogicBase):
         )
 
         sensitivity_off = np.nan
+        sensitivity_off_rms = np.nan
         if include_off_resonant:
             off_freq = zc_freq + off_resonant_offset
             self._set_cw_frequency(off_freq, power_dbm)
             self.log.info(f'Measuring off-resonant sensitivity at {off_freq/1e9:.6f} GHz '
                          f'(+{off_resonant_offset/1e6:.1f} MHz from zero-crossing)')
-            sensitivity_off, _, _ = self._measure_sensitivity(
+            sensitivity_off, sensitivity_off_rms, _, _ = self._measure_sensitivity(
                 filename_prefix + '_OFF-resonant',
                 slope
             )
@@ -727,7 +729,9 @@ class SensitivitySweepLogic(LogicBase):
             'linewidth_hz': fit_result['linewidths [Hz]'][self._which_zero_crossing],
             'zc_slope_V_per_Hz': slope,
             'sensitivity_nT_rtHz': sensitivity_on,
-            'sensitivity_off_resonant_nT_rtHz': sensitivity_off
+            'sensitivity_rms_nT_rtHz': sensitivity_on_rms,
+            'sensitivity_off_resonant_nT_rtHz': sensitivity_off,
+            'sensitivity_off_resonant_rms_nT_rtHz': sensitivity_off_rms
         }
 
         self.log.info(
@@ -989,7 +993,7 @@ class SensitivitySweepLogic(LogicBase):
             self.log.error(f'Error configuring lock-in filters: {e}', exc_info=True)
 
     def _measure_sensitivity(self, filename_prefix: str, slope: float
-                            ) -> Tuple[float, np.ndarray, np.ndarray]:
+                            ) -> Tuple[float, float, np.ndarray, np.ndarray]:
         """
         Measure magnetic field sensitivity using time series data.
 
@@ -998,7 +1002,7 @@ class SensitivitySweepLogic(LogicBase):
             slope: Zero-crossing slope in V/Hz for B-field conversion
 
         Returns:
-            Tuple of (sensitivity_nT_rtHz, asd_frequencies, asd_data)
+            Tuple of (sensitivity_nT_rtHz, sensitivity_rms_nT_rtHz, asd_frequencies, asd_data)
         """
         ts_logic = self._time_series_logic()
 
@@ -1097,6 +1101,20 @@ class SensitivitySweepLogic(LogicBase):
         # Emit time trace for GUI
         self.sigTimeTraceReady.emit(trace_times, b_field_trace)
 
+        # Save raw voltage time trace data as numpy file
+        # (conversion factor slope is saved in the summary CSV as zc_slope_V_per_Hz)
+        try:
+            time_trace_data_path = filename_prefix + '_voltage_time_trace.npz'
+            np.savez(
+                time_trace_data_path,
+                time_s=trace_times,
+                voltage_V=voltage_trace,
+                sample_rate_Hz=actual_data_rate
+            )
+            self.log.info(f'Voltage time trace saved: {time_trace_data_path}')
+        except Exception as e:
+            self.log.error(f'Failed to save time trace data: {e}')
+
         # Plot and save time traces
         try:
             n_samples = len(b_field_trace)
@@ -1160,14 +1178,16 @@ class SensitivitySweepLogic(LogicBase):
             )
 
             sensitivity = asd_result['sensitivity']
+            sensitivity_rms = asd_result.get('sensitivity_rms', np.nan)
             asd_frequencies = asd_result.get('frequencies', np.array([]))
             asd_data = asd_result.get('asd_hanning', np.array([]))  # Use Hanning window ASD
 
-            self.log.info(f'Sensitivity: {sensitivity:.3f} nT/sqrt(Hz)')
+            self.log.info(f'Sensitivity: {sensitivity:.3f} nT/sqrt(Hz) (RMS: {sensitivity_rms:.3f})')
 
         except Exception as e:
             self.log.error(f'ASD calculation failed: {e}', exc_info=True)
             sensitivity = np.nan
+            sensitivity_rms = np.nan
             asd_frequencies = np.array([])
             asd_data = np.array([])
 
@@ -1181,7 +1201,7 @@ class SensitivitySweepLogic(LogicBase):
         except Exception as e:
             self.log.warning(f'Failed to stop streaming cleanly: {e}')
 
-        return sensitivity, asd_frequencies, asd_data
+        return sensitivity, sensitivity_rms, asd_frequencies, asd_data
 
     # =========================================================================
     # Internal Methods - State Management
