@@ -853,6 +853,12 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         with self._thread_lock:
             if enable is not None:
                 self._enable_fm = bool(enable)
+                # Also update the per-component enables list, which is what
+                # configure_scan() actually reads when setting up fgen3 FM.
+                if hasattr(self, '_fm_enables_per_component') and self._fm_enables_per_component:
+                    self._fm_enables_per_component = [self._enable_fm] * len(self._fm_enables_per_component)
+                elif hasattr(self, '_if_frequencies'):
+                    self._fm_enables_per_component = [self._enable_fm] * len(self._if_frequencies)
 
             if deviation_khz is not None:
                 self._fm_deviation_khz = float(deviation_khz)
@@ -872,6 +878,20 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             self.log.info(f'FM parameters updated: enable={self._enable_fm}, '
                           f'deviation={self._fm_deviation_khz} kHz, '
                           f'mod_freq={self._fm_modulation_frequency} Hz')
+
+            # Toggle lock-in demodulation bypass based on FM enable state.
+            # When FM is disabled, we use DC ODMR mode (bypass demodulation).
+            # When FM is enabled, we need lock-in demodulation (disable bypass).
+            if enable is not None and self._redpitaya and self._redpitaya.pyrpl:
+                try:
+                    lockin = self._redpitaya.pyrpl.rp.lockin
+                    bypass = not self._enable_fm
+                    lockin.demod_bypass_ch1 = bypass
+                    lockin.demod_bypass_ch2 = bypass
+                    self.log.info(f'Lock-in demod bypass set to {bypass} '
+                                  f'(DC ODMR mode {"enabled" if bypass else "disabled"})')
+                except Exception as e:
+                    self.log.warning(f'Could not set lock-in demod bypass: {e}')
 
             # If CW is currently on, update the configuration
             if self.module_state() != 'idle' and self._in_cw_mode:
@@ -903,6 +923,21 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
 
             self.log.info(f'Component {component_index} FM settings: enabled={fm_enabled}, '
                           f'deviation={self._fm_deviations_per_component[component_index]} kHz')
+
+    def set_dc_odmr_mode(self, enable=True):
+        """Enable or disable direct DC ODMR mode (bypasses lock-in demodulation).
+
+        When enabled:
+        - FM modulation is disabled on fgen3
+        - Lock-in demodulation bypass is activated (ADC goes through CIC/FIR only)
+        - The ODMR signal is measured as a direct DC fluorescence level change
+
+        When disabled:
+        - FM modulation and lock-in demodulation are restored
+
+        @param bool enable: True to enable DC ODMR mode, False to restore lock-in mode
+        """
+        self.set_fm_parameters(enable=not enable)
 
     def get_multi_frequency_info(self):
         """Get information about the current multi-frequency configuration.

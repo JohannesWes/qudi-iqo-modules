@@ -61,6 +61,9 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     # Filter selection (active when fir_bypass is False): '500Hz', '2kHz', '5kHz'
     _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='500Hz', missing='info')
     _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='500Hz', missing='info')
+    # Demodulation bypass: True = DC passthrough (no ref mixing), False = normal lock-in demod
+    _lock_in_demod_bypass_ch1 = ConfigOption('lock_in_demod_bypass_ch1', default=False, missing='nothing')
+    _lock_in_demod_bypass_ch2 = ConfigOption('lock_in_demod_bypass_ch2', default=False, missing='nothing')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -412,10 +415,16 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
                 self._lock_in_filter_ch2 = '500Hz'
             lock_in.filter_select_ch2 = self._lock_in_filter_ch2
 
+            # Configure demodulation bypass (DC ODMR mode)
+            lock_in.demod_bypass_ch1 = self._lock_in_demod_bypass_ch1
+            lock_in.demod_bypass_ch2 = self._lock_in_demod_bypass_ch2
+
             # Log configuration summary
+            ch1_demod = 'DC bypass' if self._lock_in_demod_bypass_ch1 else 'lock-in demod'
+            ch2_demod = 'DC bypass' if self._lock_in_demod_bypass_ch2 else 'lock-in demod'
             ch1_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch1 else f'CIC+FIR ({self._lock_in_filter_ch1})'
             ch2_mode = 'CIC only (~15 kHz)' if self._lock_in_fir_bypass_ch2 else f'CIC+FIR ({self._lock_in_filter_ch2})'
-            self.log.info(f'Lock-in filters configured - Ch1: {ch1_mode}, Ch2: {ch2_mode}')
+            self.log.info(f'Lock-in configured - Ch1: {ch1_demod}, {ch1_mode} | Ch2: {ch2_demod}, {ch2_mode}')
 
         except AttributeError as e:
             self.log.warning(f'Could not configure lock-in filters (module not available): {e}')
