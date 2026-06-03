@@ -3,15 +3,24 @@
 Red Pitaya Data Input Streaming Module for Qudi.
 
 This module provides continuous data streaming from the Red Pitaya using
-pyrpl's scan module in stream mode. It implements the qudi DataInStreamInterface
-for efficient continuous data acquisition at 125MHz/4096 ~ 30.5 kHz.
+pyrpl's scan module in *push* stream mode. It implements the qudi
+DataInStreamInterface for efficient continuous data acquisition at
+125MHz/4096 ~ 30.5 kHz.
 
 Architecture:
-- Uses pyrpl scan module's stream mode
+- Uses pyrpl scan module's ARM-side-drain + TCP-push streaming
+  (``scan.push_stream_start/read/stop``). The real-time deadline lives on the
+  Red Pitaya ARM core, not on this PC, so GC pauses / Qt event-loop stalls /
+  network jitter no longer cause data loss.
+- A background receiver thread on the PC (pyrpl ``StreamClient``) drains the
+  socket continuously into its own buffer; this module only pulls from it.
 - Supports two input modes: demodulated lock-in data or FTW frequency corrections
-- FPGA ring buffer (4096 samples) with continuous writing
-- Software buffering for smooth data delivery
+- Lost samples (genuine FPGA-ring overruns only) are reported explicitly and
+  **NaN-filled** so the time axis stays truthful -- never silently dropped.
 - Supports both CONTINUOUS and FINITE streaming modes
+
+See ``docs/developer_guide/scan_push_streaming.md`` in the pyrpl repo for the
+full design and wire protocol.
 
 Example config:
 
@@ -59,8 +68,9 @@ Usage Example:
 
 Performance:
     - Fixed sample rate: ~30.517 kHz (125 MHz / 4096 FPGA decimation)
-    - Typical latency: 5-20 ms per read
-    - Software buffer prevents data loss under normal conditions
+    - ARM-side drain + TCP push keeps the real-time deadline off the PC; the
+      receiver thread tolerates PC-side stalls (socket buffers ~1 s headroom)
+    - No data loss under normal load; genuine overruns are NaN-filled and logged
 """
 
 import numpy as np
@@ -86,9 +96,12 @@ class RedPitayaDataInStream(DataInStreamInterface):
     Provides high-speed continuous streaming of demodulated lock-in data
     at fixed ~30.517 kHz sample rate (125 MHz / 4096 decimation).
 
-    The module uses pyrpl's scan module in stream mode, which writes samples
-    continuously to a 4096-sample FPGA ring buffer. This module polls that
-    buffer and maintains a larger software buffer for smooth data delivery.
+    The module uses pyrpl's scan module in *push* stream mode: the Red Pitaya
+    ARM core continuously drains the 4096-sample FPGA ring buffer and pushes
+    framed samples over a dedicated TCP socket. A pyrpl ``StreamClient`` daemon
+    thread receives them on the PC; this module pulls from that receiver on
+    demand. Lost samples (genuine FPGA-ring overruns only) are NaN-filled rather
+    than silently dropped, keeping the time axis truthful.
     """
 
     # Config options
@@ -98,6 +111,8 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _calibration_factor = ConfigOption('calibration_factor', default=1.0, missing='info')
     _signal_scale = ConfigOption('signal_scale', default=1.0, missing='info')
     _default_buffer_size = ConfigOption('channel_buffer_size', default=100000, missing='info')
+    # Deprecated/unused with push streaming (the ARM server drains the FPGA ring
+    # continuously, so there is no per-poll read cap). Kept for config back-compat.
     _max_fpga_read_samples = ConfigOption('max_fpga_read_samples', default=None, missing='info')
     _stream_input = ConfigOption('stream_input', default='demod', missing='info')
 
@@ -132,14 +147,17 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._sample_rate = self._STREAM_SAMPLE_RATE
         self._current_stream_input = 'demod'  # Current input: 'demod' or 'ftw_corr'
 
-        # Software buffer for smooth data delivery
-        self._data_buffer = None  # numpy array
-        self._buffer_write_pos = 0  # Write position in buffer
-        self._buffer_read_pos = 0  # Read position in buffer
+        # Push-streaming receiver (pyrpl StreamClient) + a small FIFO of samples
+        # already drained from it but not yet handed to the consumer. The
+        # StreamClient's own daemon thread does the continuous buffering, so we
+        # no longer maintain a circular buffer or a PC-side polling deadline.
+        self._rx = None              # pyrpl StreamClient
+        self._pending = np.empty(0, dtype=np.float64)  # calibrated, unconsumed
         self._total_samples_acquired = 0
+        self._last_gap_reported = 0  # for gap (NaN) delta logging
 
-        # Background polling
-        self._poll_interval = 0.005  # 5ms between FPGA reads
+        # Sleep interval while blocking for more samples in read_data_into_buffer
+        self._poll_interval = 0.005
         self._running = False
 
     def on_activate(self):
@@ -264,16 +282,17 @@ class RedPitayaDataInStream(DataInStreamInterface):
 
     @property
     def available_samples(self) -> int:
-        """Number of samples available to read without blocking."""
+        """Number of samples available to read without blocking.
+
+        Counts samples already drained into the local FIFO plus those still
+        buffered in the receiver thread (each is 1:1 on the stream timeline,
+        including NaN-filled gap samples).
+        """
         with self._thread_lock:
-            if not self._running or self._data_buffer is None:
-                return 0
-            # Calculate available samples in circular buffer
-            if self._buffer_write_pos >= self._buffer_read_pos:
-                return self._buffer_write_pos - self._buffer_read_pos
-            else:
-                # Wrapped around
-                return (self._channel_buffer_size - self._buffer_read_pos) + self._buffer_write_pos
+            n = int(self._pending.size)
+            if self._running and self._rx is not None:
+                n += int(self._rx.available())
+            return n
 
     @property
     def sample_rate(self) -> float:
@@ -399,128 +418,128 @@ class RedPitayaDataInStream(DataInStreamInterface):
                 'Must configure before starting stream'
 
             try:
-                # Allocate software buffer (circular)
-                self._data_buffer = np.zeros(self._channel_buffer_size, dtype=np.float64)
-                self._buffer_write_pos = 0
-                self._buffer_read_pos = 0
+                # Reset local FIFO and counters
+                self._pending = np.empty(0, dtype=np.float64)
                 self._total_samples_acquired = 0
-        
-                # Start FPGA streaming with configured input
-                self._scan_module.stream_start(input_source=self._current_stream_input)
+                self._last_gap_reported = 0
+
+                # Start push streaming: selects input, resets+enables the FPGA
+                # stream engine, lazily deploys+starts the ARM server, and starts
+                # the PC-side receiver thread. Returns the StreamClient.
+                self._rx = self._scan_module.push_stream_start(
+                    input_source=self._current_stream_input)
 
                 # Mark as running
                 self._running = True
                 self.module_state.lock()
 
-                self.log.info(f'Started {self._streaming_mode.name} stream (input: {self._current_stream_input})')
+                self.log.info(f'Started {self._streaming_mode.name} push stream '
+                              f'(input: {self._current_stream_input})')
 
             except Exception as e:
                 self._running = False
+                self._rx = None
                 if self.module_state() == 'locked':
                     self.module_state.unlock()
                 raise RuntimeError(f'Failed to start stream: {e}')
 
     def stop_stream(self) -> None:
-        """Stop the data acquisition/streaming."""
+        """Stop the data acquisition/streaming.
+
+        Any samples still buffered in the receiver are drained into the local
+        FIFO so a consumer can read the tail after stopping; the FIFO is cleared
+        on the next ``start_stream``.
+        """
         with self._thread_lock:
-            if not self._running:
-                return
+            self._do_stop()
 
-            try:
-                # Stop FPGA streaming
-                self._scan_module.stream_stop()
-
-                # Mark as stopped
-                self._running = False
-
-                self.log.info(
-                    f'Stopped stream. Total samples acquired: {self._total_samples_acquired}'
-                )
-
-            except Exception as e:
-                self.log.error(f'Error stopping stream: {e}')
-            finally:
-                if self.module_state() == 'locked':
-                    self.module_state.unlock()
-                # Clear buffer
-                self._data_buffer = None
-
-    def _poll_fpga_and_update_buffer(self, max_samples_to_read=None):
-        """
-        Poll FPGA for new data and write to circular buffer.
-
-        Args:
-            max_samples_to_read: Maximum samples to request from FPGA per poll.
-                                If None, uses config value (default: read all available).
-                                Reading all available samples prevents FPGA ring buffer overflow.
-
-        Returns:
-            int: Number of new samples added to buffer
-        """
+    def _do_stop(self) -> None:
+        """Internal stop: disable the FPGA stream engine, stop the receiver,
+        and drain any remaining samples into the local FIFO. Must be called
+        under ``self._thread_lock``. Used by both ``stop_stream`` and the
+        FINITE-mode auto-stop."""
         if not self._running:
-            return 0
-
-        # Use config value if not specified
-        if max_samples_to_read is None:
-            max_samples_to_read = self._max_fpga_read_samples
-
+            return
+        # Clear the running flag first so the FINITE auto-stop inside _drain_rx()
+        # (reached via the drain below) short-circuits instead of re-entering.
+        self._running = False
         try:
-            # Read from FPGA stream (non-blocking)
-            # If max_samples=None, stream_read() reads all available samples to prevent overflow
-            # At ~30.5 kHz sample rate with 100ms polling, expect ~3000 samples per poll
-            raw_data = self._scan_module.stream_read(max_samples=max_samples_to_read)
+            # Stops the PC receiver thread AND disables the FPGA stream engine.
+            # Leaves the ARM server running for fast restarts.
+            self._scan_module.push_stream_stop()
+            # Drain whatever the receiver buffered before it was stopped so the
+            # consumer can still read the tail.
+            self._drain_rx()
+            s = self._rx.stats() if self._rx is not None else {}
+            self.log.info(
+                f'Stopped push stream. Total samples: {self._total_samples_acquired}, '
+                f'gap(NaN) samples: {s.get("n_gap", 0)}, seq_skips: {s.get("n_seq_skips", 0)}'
+            )
+        except Exception as e:
+            self.log.error(f'Error stopping stream: {e}')
+            self._running = False
+        finally:
+            if self.module_state() == 'locked':
+                self.module_state.unlock()
+
+    def _drain_rx(self):
+        """Pull all samples the receiver has buffered, calibrate them, and append
+        to the local FIFO. Non-blocking. Must be called under ``self._thread_lock``.
+
+        Lost (NaN) samples are preserved so the time axis stays truthful; gap
+        growth is surfaced via a warning. Returns the number of samples appended.
+        """
+        if self._rx is None:
+            return 0
+        try:
+            # float64 already, with NaN where the FPGA overran the ARM drainer.
+            raw_data = self._rx.read()
 
             if raw_data.size == 0:
+                # Surface receiver-thread errors even when no data arrives.
+                err = self._rx.error
+                if err is not None:
+                    self.log.warning(f'Stream receiver error: {err}')
                 return 0
 
-            # Apply calibration/conversion and scaling based on input mode
+            # Apply calibration/conversion and scaling based on input mode.
+            # NaN gap markers propagate cleanly through both paths.
             if self._current_stream_input == 'ftw_corr':
                 # FTW correction: convert to Hz using pyrpl's conversion
                 calibrated_data = self._scan_module.ftw_to_hz(raw_data) * self._signal_scale
             else:
                 # Demod: apply calibration factor
-                calibrated_data = raw_data.astype(np.float64) * self._calibration_factor * self._signal_scale
+                calibrated_data = raw_data * self._calibration_factor * self._signal_scale
 
-            # Write to circular buffer
+            # Append to the local FIFO (no artificial cap -> no silent drops).
+            self._pending = (np.concatenate((self._pending, calibrated_data))
+                             if self._pending.size else calibrated_data)
             n_samples = calibrated_data.size
-            write_pos = self._buffer_write_pos
-            buffer_size = self._channel_buffer_size
-
-            # Check for buffer overflow (write catching up to read)
-            space_available = buffer_size - self.available_samples - 1  # -1 to distinguish full/empty
-            if n_samples > space_available:
-                self.log.warning(
-                    f'Software buffer overflow! Dropping {n_samples - space_available} samples. '
-                    f'Consider increasing buffer size or reading faster.'
-                )
-                # In FINITE mode, this is critical
-                if self._streaming_mode == StreamingMode.FINITE:
-                    self.log.error('Buffer overflow in FINITE mode - data loss occurred!')
-
-            # Write data (handle wraparound)
-            if write_pos + n_samples <= buffer_size:
-                # No wraparound
-                self._data_buffer[write_pos:write_pos + n_samples] = calibrated_data
-                self._buffer_write_pos = (write_pos + n_samples) % buffer_size
-            else:
-                # Wraparound
-                first_chunk = buffer_size - write_pos
-                self._data_buffer[write_pos:] = calibrated_data[:first_chunk]
-                self._data_buffer[:n_samples - first_chunk] = calibrated_data[first_chunk:]
-                self._buffer_write_pos = n_samples - first_chunk
-
             self._total_samples_acquired += n_samples
 
-            # Check if FINITE mode target reached
+            # Surface genuine FPGA-ring overruns (NaN-filled gaps) to the user.
+            stats = self._rx.stats()
+            n_gap = stats.get('n_gap', 0)
+            if n_gap > self._last_gap_reported:
+                new_gap = n_gap - self._last_gap_reported
+                self._last_gap_reported = n_gap
+                msg = (f'Stream overrun: {new_gap} lost samples NaN-filled '
+                       f'(total gap {n_gap}). Read faster or reduce other load.')
+                if self._streaming_mode == StreamingMode.FINITE:
+                    self.log.error('FINITE mode data loss: ' + msg)
+                else:
+                    self.log.warning(msg)
+
+            # Check if FINITE mode target reached.
             if self._streaming_mode == StreamingMode.FINITE:
                 if self._total_samples_acquired >= self._channel_buffer_size:
                     self.log.debug('FINITE mode target reached, stopping stream')
-                    self.stop_stream()
+                    self._do_stop()
 
             return n_samples
 
         except Exception as e:
-            self.log.error(f'Error polling FPGA: {e}')
+            self.log.error(f'Error draining stream receiver: {e}')
             return 0
 
     def read_data_into_buffer(self,
@@ -562,32 +581,20 @@ class RedPitayaDataInStream(DataInStreamInterface):
         samples_read = 0
 
         while samples_read < samples_per_channel:
-            # Poll FPGA for new data
-            self._poll_fpga_and_update_buffer()
+            with self._thread_lock:
+                # Pull whatever the receiver thread has buffered into the FIFO.
+                self._drain_rx()
 
-            # Read available samples
-            available = self.available_samples
-            if available > 0:
-                to_read = min(available, samples_per_channel - samples_read)
+                if self._pending.size > 0:
+                    to_read = min(self._pending.size,
+                                  samples_per_channel - samples_read)
+                    chunk = self._pending[:to_read]
+                    self._pending = self._pending[to_read:]
+                    data_buffer_flat[samples_read:samples_read + to_read] = chunk
+                    samples_read += to_read
 
-                # Read from circular buffer
-                read_pos = self._buffer_read_pos
-                if read_pos + to_read <= self._channel_buffer_size:
-                    # No wraparound
-                    chunk = self._data_buffer[read_pos:read_pos + to_read]
-                    self._buffer_read_pos = (read_pos + to_read) % self._channel_buffer_size
-                else:
-                    # Wraparound
-                    first_chunk_size = self._channel_buffer_size - read_pos
-                    chunk = np.concatenate([
-                        self._data_buffer[read_pos:],
-                        self._data_buffer[:to_read - first_chunk_size]
-                    ])
-                    self._buffer_read_pos = to_read - first_chunk_size
-
-                # Write to output buffer (interleaved, but we only have 1 channel)
-                data_buffer_flat[samples_read:samples_read + to_read] = chunk
-                samples_read += to_read
+            if samples_read >= samples_per_channel:
+                break
 
             # Check timeout
             if time.time() - start_time > timeout:
@@ -596,9 +603,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
                     f'Only {samples_read} samples acquired after {timeout:.1f}s'
                 )
 
-            # Small sleep if no data available
-            if available == 0:
-                time.sleep(self._poll_interval)
+            # No data right now: yield briefly (the receiver thread keeps draining
+            # the board in the background, so we never miss samples by sleeping).
+            time.sleep(self._poll_interval)
 
     def read_available_data_into_buffer(self,
                                         data_buffer: np.ndarray,
@@ -616,9 +623,6 @@ class RedPitayaDataInStream(DataInStreamInterface):
         if timestamp_buffer is not None:
             raise NotImplementedError('Timestamp buffers not supported (SampleTiming.CONSTANT)')
 
-        # Poll FPGA for latest data
-        self._poll_fpga_and_update_buffer()
-
         # Validate buffer
         data_buffer_flat = data_buffer.ravel()
         n_channels = len(self._active_channels)
@@ -628,27 +632,18 @@ class RedPitayaDataInStream(DataInStreamInterface):
                 f'Buffer dtype {data_buffer.dtype} does not match required {self._constraints.data_type}'
             )
 
-        # Determine how many samples to read
-        available = self.available_samples
         max_samples = data_buffer_flat.size // n_channels
-        samples_to_read = min(available, max_samples)
 
-        if samples_to_read == 0:
-            return 0
-
-        # Read from circular buffer (same logic as read_data_into_buffer)
         with self._thread_lock:
-            read_pos = self._buffer_read_pos
-            if read_pos + samples_to_read <= self._channel_buffer_size:
-                chunk = self._data_buffer[read_pos:read_pos + samples_to_read]
-                self._buffer_read_pos = (read_pos + samples_to_read) % self._channel_buffer_size
-            else:
-                first_chunk_size = self._channel_buffer_size - read_pos
-                chunk = np.concatenate([
-                    self._data_buffer[read_pos:],
-                    self._data_buffer[:samples_to_read - first_chunk_size]
-                ])
-                self._buffer_read_pos = samples_to_read - first_chunk_size
+            # Pull the latest data from the receiver thread into the FIFO.
+            self._drain_rx()
+
+            samples_to_read = min(self._pending.size, max_samples)
+            if samples_to_read == 0:
+                return 0
+
+            chunk = self._pending[:samples_to_read]
+            self._pending = self._pending[samples_to_read:]
 
         # Write to output buffer
         data_buffer_flat[:samples_to_read] = chunk
@@ -669,9 +664,10 @@ class RedPitayaDataInStream(DataInStreamInterface):
         This method will not return until all requested samples have been read or a timeout occurs.
         """
         if samples_per_channel is None:
-            # Non-blocking: read all available
-            self._poll_fpga_and_update_buffer()
-            samples_per_channel = self.available_samples
+            # Non-blocking: read all currently available
+            with self._thread_lock:
+                self._drain_rx()
+                samples_per_channel = int(self._pending.size)
             if samples_per_channel == 0:
                 return np.array([], dtype=self._constraints.data_type), None
 
