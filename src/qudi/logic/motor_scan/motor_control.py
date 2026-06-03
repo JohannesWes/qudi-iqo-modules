@@ -92,11 +92,22 @@ class MotorControlMixin:
         try:
             # Use synchronous move with position verification
             if hasattr(motor, 'move_abs_sync'):
-                motor.move_abs_sync(position)
+                result = motor.move_abs_sync(position)
+                if result != 0:
+                    self.log.error(f"Move did not reach target position: {position}")
+                    self.sigPositionUpdated.emit(self.current_position)
+                    return
             else:
-                motor.move_abs(position)
+                result = motor.move_abs(position)
+                if result != 0:
+                    self.log.error(f"Failed to issue move command: {position}")
+                    self.sigPositionUpdated.emit(self.current_position)
+                    return
                 if hasattr(motor, 'wait_for_idle'):
-                    motor.wait_for_idle()
+                    if not motor.wait_for_idle():
+                        self.log.error(f"Move timed out before reaching target: {position}")
+                        self.sigPositionUpdated.emit(self.current_position)
+                        return
 
             # Read and verify actual position from hardware
             actual_pos = self.current_position

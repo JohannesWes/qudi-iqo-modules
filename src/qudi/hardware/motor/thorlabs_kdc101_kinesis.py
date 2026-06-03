@@ -130,6 +130,11 @@ class ThorlabsKDC101Kinesis(MotorInterface):
     # StatusVars
     _is_homed = StatusVar(name='is_homed', default=False)
 
+    # Kinesis controllers can report idle for a short interval immediately
+    # after a USB move command is sent. Completion checks therefore verify the
+    # encoder target, not only the moving flag.
+    _MOVE_POLL_INTERVAL = 0.05
+
     # Signals
     sigPositionChanged = QtCore.Signal(dict)   # {'x': pos, 'y': pos}
     sigMovementFinished = QtCore.Signal()
@@ -142,6 +147,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         self._stages: Dict[str, Any] = {}  # axis_label -> KinesisMotor
         self._constraints: Dict[str, dict] = {}
         self._Thorlabs = None
+        self._homed_axes: Dict[str, bool] = {}
 
     # =========================================================================
     # Properties
@@ -184,6 +190,11 @@ class ThorlabsKDC101Kinesis(MotorInterface):
 
         # Connect to stages
         self._connect_stages()
+
+        # Do not trust the persisted StatusVar blindly. Query the controllers
+        # after connecting so a power cycle or controller reset cannot leave
+        # qudi believing the stages are homed.
+        self._refresh_homed_state()
 
         # Set default velocity
         self._apply_default_velocity()
@@ -272,6 +283,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                     )
 
                 self._stages[axis_label] = stage
+                self._homed_axes[axis_label] = False
                 self.log.info(f"Connected to {axis_label}-axis (serial: {serial})")
 
             except Exception as e:
@@ -290,6 +302,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                 self.log.warning(f"Error disconnecting {axis_label}-axis: {e}")
 
         self._stages.clear()
+        self._homed_axes.clear()
 
     def _apply_default_velocity(self) -> None:
         """Apply default velocity to all axes."""
@@ -315,6 +328,33 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                 - ramp: available ramp profiles
         """
         return self._constraints.copy()
+
+    def _refresh_homed_state(self) -> Dict[str, bool]:
+        """Query the hardware homed bit for all connected axes."""
+        homed_axes = {}
+        for axis_label, stage in self._stages.items():
+            try:
+                homed_axes[axis_label] = bool(stage.is_homed())
+            except Exception as e:
+                self.log.warning(f"Failed to query homed state of {axis_label}: {e}")
+                homed_axes[axis_label] = False
+
+        self._homed_axes = homed_axes
+        self._is_homed = bool(homed_axes) and all(homed_axes.values())
+        return homed_axes.copy()
+
+    def is_homed(self, param_list: Optional[List[str]] = None) -> bool:
+        """
+        Return True only if all requested axes report a valid homed reference.
+
+        Args:
+            param_list: Optional list of axis labels. If None, checks all axes.
+        """
+        homed_axes = self._refresh_homed_state()
+        axes_to_check = param_list if param_list is not None else list(self._stages.keys())
+        if not axes_to_check:
+            return False
+        return all(homed_axes.get(axis_label, False) for axis_label in axes_to_check)
 
     def move_rel(self, param_dict: Dict[str, float]) -> int:
         """
@@ -373,25 +413,11 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             int: Error code (0: OK, -1: error)
         """
         try:
-            for axis_label, position in param_dict.items():
-                if axis_label not in self._stages:
-                    self.log.warning(f"Unknown axis '{axis_label}', ignoring.")
-                    continue
+            targets = self._get_valid_abs_targets(param_dict, log_invalid=True)
+            if not targets:
+                return -1
 
-                # Check constraints
-                constraints = self._constraints.get(axis_label, {})
-                pos_min = constraints.get('pos_min', SPECS.TRAVEL_MIN)
-                pos_max = constraints.get('pos_max', SPECS.TRAVEL_MAX)
-
-                if position < pos_min or position > pos_max:
-                    self.log.warning(
-                        f"Position {position*1000:.3f}mm on {axis_label} "
-                        f"exceeds limits [{pos_min*1000:.3f}, {pos_max*1000:.3f}]mm. "
-                        f"Ignored."
-                    )
-                    continue
-
-                # Execute move
+            for axis_label, position in targets.items():
                 self._stages[axis_label].move_to(position)
 
             return 0
@@ -399,6 +425,42 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         except Exception as e:
             self.log.error(f"Absolute move failed: {e}")
             return -1
+
+    def _get_valid_abs_targets(
+        self,
+        param_dict: Dict[str, float],
+        log_invalid: bool = False
+    ) -> Dict[str, float]:
+        """
+        Return absolute move targets that address known axes and satisfy limits.
+
+        Invalid axes or out-of-range positions are excluded. The public move
+        methods use this helper so synchronous waits do not wait for targets
+        that the driver deliberately ignored.
+        """
+        targets = {}
+        for axis_label, position in param_dict.items():
+            if axis_label not in self._stages:
+                if log_invalid:
+                    self.log.warning(f"Unknown axis '{axis_label}', ignoring.")
+                continue
+
+            constraints = self._constraints.get(axis_label, {})
+            pos_min = constraints.get('pos_min', SPECS.TRAVEL_MIN)
+            pos_max = constraints.get('pos_max', SPECS.TRAVEL_MAX)
+
+            if position < pos_min or position > pos_max:
+                if log_invalid:
+                    self.log.warning(
+                        f"Position {position*1000:.3f}mm on {axis_label} "
+                        f"exceeds limits [{pos_min*1000:.3f}, {pos_max*1000:.3f}]mm. "
+                        f"Ignored."
+                    )
+                continue
+
+            targets[axis_label] = position
+
+        return targets
 
     def abort(self) -> int:
         """
@@ -508,15 +570,30 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             self.log.info(f"Homing velocity: {self._default_velocity*1000:.2f} mm/s")
 
             for axis_label in axes_to_home:
+                if axis_label in self._homed_axes:
+                    self._homed_axes[axis_label] = False
+            self._is_homed = False
+
+            for axis_label in axes_to_home:
                 if axis_label not in self._stages:
                     self.log.warning(f"Axis {axis_label} not found")
                     continue
 
                 result = self._home_single_axis(axis_label)
                 if result != 0:
+                    self._homed_axes[axis_label] = False
+                    self._is_homed = False
                     return result
+                self._homed_axes[axis_label] = True
 
-            self._is_homed = True
+            self._refresh_homed_state()
+            if not self.is_homed(axes_to_home):
+                self.log.error(
+                    f"Homing verification failed for axes {axes_to_home}. "
+                    f"Controller homed state: {self._homed_axes}"
+                )
+                return -2
+
             self.sigHomingComplete.emit()
             self.log.info("Homing complete.")
             return 0
@@ -570,17 +647,44 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                 )
                 return -1
 
-            time.sleep(1.0)
-
-            # Poll until movement stops (timeout 120 seconds)
+            # Poll until movement stops (timeout 120 seconds). Track whether
+            # the controller ever reported homing/motion after the forced home
+            # command. This catches the unsafe case where a stale near-zero
+            # coordinate or stale homed bit makes homing appear successful even
+            # though the command did not run.
             timeout = 120.0
+            no_activity_timeout = 5.0
             start_time = time.time()
             last_log_time = 0
+            observed_homing = False
+            observed_movement = False
+            saw_activity = False
 
             while time.time() - start_time < timeout:
-                if not stage.is_moving():
+                try:
+                    status = stage.get_status()
+                except Exception:
+                    status = []
+
+                try:
+                    moving = stage.is_moving()
+                except Exception:
+                    moving = False
+
+                observed_homing = observed_homing or ('homing' in status)
+                observed_movement = observed_movement or moving
+                saw_activity = saw_activity or observed_homing or observed_movement
+
+                if saw_activity and not moving and 'homing' not in status:
                     break
+
                 elapsed = time.time() - start_time
+                if not saw_activity and elapsed > no_activity_timeout:
+                    self.log.warning(
+                        f"{axis_label}-axis did not report homing or movement "
+                        f"within {no_activity_timeout:.1f}s after home command."
+                    )
+                    break
                 if elapsed - last_log_time >= 10:
                     pos_now = stage.get_position()
                     self.log.info(
@@ -588,7 +692,7 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                         f"{pos_now*1000:.1f}mm, {elapsed:.0f}s"
                     )
                     last_log_time = elapsed
-                time.sleep(0.5)
+                time.sleep(0.05 if elapsed < 2.0 else 0.5)
             else:
                 self.log.error(
                     f"{axis_label}-axis homing timed out after {timeout}s"
@@ -600,6 +704,13 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             time.sleep(0.5)
             pos_after = stage.get_position()
             elapsed = time.time() - start_time
+            try:
+                controller_homed = bool(stage.is_homed())
+            except Exception as e:
+                self.log.warning(
+                    f"Could not query homed bit for {axis_label}-axis: {e}"
+                )
+                controller_homed = False
 
             # Verify position is near home. After homing, KDC101 stages
             # move to the home offset position which typically reads as
@@ -607,12 +718,12 @@ class ThorlabsKDC101Kinesis(MotorInterface):
             # normal -1.5mm offset plus some margin). A failed homing reads
             # as 10-25mm away, so this threshold reliably catches failures.
             home_position_ok = abs(pos_after) < 3e-3
-            # Verify timing is plausible (>2s unless started near home)
-            time_plausible = (
-                elapsed > 2.0 or abs(pos_before) < 5e-3
-            )
+            # Verify the forced homing command actually produced homing/motion
+            # feedback. A false reference often reads near zero; do not accept
+            # "near zero" by itself.
+            homing_executed = observed_homing or observed_movement
 
-            if home_position_ok and time_plausible:
+            if home_position_ok and homing_executed and controller_homed:
                 self.log.info(
                     f"{axis_label}-axis homed in {elapsed:.1f}s "
                     f"(position: {pos_after*1000:.1f}mm)"
@@ -626,11 +737,15 @@ class ThorlabsKDC101Kinesis(MotorInterface):
                     f"{pos_after*1000:.1f}mm is not near home. "
                     f"Expected ~0mm (within ±2mm)."
                 )
-            elif not time_plausible:
+            if not homing_executed:
                 self.log.warning(
-                    f"{axis_label}-axis homing completed unusually fast "
-                    f"({elapsed:.1f}s) from {pos_before*1000:.1f}mm. "
-                    f"Homing may not have executed properly."
+                    f"{axis_label}-axis homing failed: controller never "
+                    f"reported homing or movement after the forced home command."
+                )
+            if not controller_homed:
+                self.log.warning(
+                    f"{axis_label}-axis homing failed: controller homed bit "
+                    f"is not set after homing."
                 )
 
             self.log.info(
@@ -759,6 +874,55 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         self.log.warning(f"wait_for_idle timed out after {timeout}s")
         return False
 
+    def wait_for_target(
+        self,
+        target_dict: Dict[str, float],
+        timeout: float = 30.0,
+        position_tolerance: float = 50e-6
+    ) -> bool:
+        """
+        Wait until all requested axes are idle and at their target positions.
+
+        This is stricter than wait_for_idle(). It protects against the KDC101
+        USB/startup race where is_moving() can briefly be false after move_to()
+        was called but before the controller begins executing the move.
+        """
+        targets = self._get_valid_abs_targets(target_dict, log_invalid=False)
+        if not targets:
+            self.log.error("No valid targets to wait for.")
+            return False
+
+        start_time = time.time()
+        last_pos = {}
+
+        while time.time() - start_time < timeout:
+            moving = self.is_moving()
+            last_pos = self.get_pos(list(targets.keys()))
+
+            max_error = 0.0
+            for axis_label, target_pos in targets.items():
+                error = abs(last_pos.get(axis_label, 0.0) - target_pos)
+                max_error = max(max_error, error)
+
+            if not moving and max_error <= position_tolerance:
+                self.sigMovementFinished.emit()
+                return True
+
+            time.sleep(self._MOVE_POLL_INTERVAL)
+
+        for axis_label, target_pos in targets.items():
+            actual = last_pos.get(axis_label, 0.0)
+            error = abs(actual - target_pos)
+            if error > position_tolerance:
+                self.log.error(
+                    f"{axis_label}-axis failed to reach target: "
+                    f"target={target_pos*1000:.3f}mm, "
+                    f"actual={actual*1000:.3f}mm, "
+                    f"error={error*1000:.3f}mm"
+                )
+        self.log.error(f"wait_for_target timed out after {timeout}s")
+        return False
+
     def move_abs_sync(
         self,
         param_dict: Dict[str, float],
@@ -776,26 +940,31 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         Returns:
             int: Error code (0: OK, -1: error)
         """
-        result = self.move_abs(param_dict)
+        targets = self._get_valid_abs_targets(param_dict, log_invalid=False)
+        if not targets:
+            self.log.error("Movement has no valid target axes.")
+            return -1
+
+        result = self.move_abs(targets)
         if result != 0:
             return result
 
-        if not self.wait_for_idle(timeout):
-            self.log.error("Movement timed out")
+        if not self.wait_for_target(targets, timeout, position_tolerance):
+            self.log.error("Movement timed out or target was not reached")
             return -1
 
         # Verify positions reached target
         actual_pos = self.get_pos()
-        for axis_label, target_pos in param_dict.items():
+        for axis_label, target_pos in targets.items():
             if axis_label in actual_pos:
                 actual = actual_pos[axis_label]
                 error = abs(actual - target_pos)
                 if error > position_tolerance:
-                    self.log.warning(
+                    self.log.error(
                         f"{axis_label}-axis position error: target={target_pos*1000:.3f}mm, "
                         f"actual={actual*1000:.3f}mm, error={error*1000:.3f}mm"
                     )
-                    # Don't return error - just warn. The stage may have hit a limit.
+                    return -1
 
         # Emit position update
         self.sigPositionChanged.emit(actual_pos)

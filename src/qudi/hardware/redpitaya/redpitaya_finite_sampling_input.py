@@ -39,8 +39,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             lock_in_fir_bypass_ch1: False  # True: CIC only (~15 kHz BW, ~160 µs latency)
                                            # False: CIC+FIR (bandwidth per filter_select)
             lock_in_fir_bypass_ch2: False
-            lock_in_filter_ch1: '500Hz'  # FIR filter bandwidth: '500Hz', '2kHz', '5kHz'
-                                         # 500Hz: ~9 ms latency, 2kHz/5kHz: lower latency
+            lock_in_filter_ch1: '500Hz'  # Filter: '500Hz', '1kHz' (IIR), '1kHz_LP' (FIR linear-phase),
+                                         #         '1kHz_FIR' (FIR min-phase), '2kHz', '5kHz'
             lock_in_filter_ch2: '500Hz'
     """
 
@@ -58,7 +58,8 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
     # FIR bypass: True = CIC only (~15 kHz BW, ~160 µs latency), False = CIC+FIR
     _lock_in_fir_bypass_ch1 = ConfigOption('lock_in_fir_bypass_ch1', default=False, missing='info')
     _lock_in_fir_bypass_ch2 = ConfigOption('lock_in_fir_bypass_ch2', default=False, missing='info')
-    # Filter selection (active when fir_bypass is False): '500Hz', '2kHz', '5kHz'
+    # Filter selection (active when fir_bypass is False):
+    # '500Hz', '1kHz' (IIR), '1kHz_LP' (FIR linear-phase), '1kHz_FIR' (FIR min-phase), '2kHz', '5kHz'
     _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='500Hz', missing='info')
     _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='500Hz', missing='info')
     # Demodulation bypass: True = DC passthrough (no ref mixing), False = normal lock-in demod
@@ -401,7 +402,7 @@ class RedPitayaFiniteSamplingInput(FiniteSamplingInputInterface):
             lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
 
             # Configure filter selection (only active when FIR bypass is False)
-            valid_filters = {'500Hz', '2kHz', '5kHz'}
+            valid_filters = {'500Hz', '2kHz', '5kHz', '1kHz', '1kHz_LP', '1kHz_FIR'}
 
             if self._lock_in_filter_ch1 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '

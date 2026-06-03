@@ -97,7 +97,7 @@ class SensitivitySweepGui(GuiBase):
 
     # Lock-in filter parameters
     _fir_bypass = StatusVar('fir_bypass', default=False)
-    _fir_filter_bandwidth = StatusVar('fir_filter_bandwidth', default='500Hz')  # '500Hz', '2kHz', '5kHz'
+    _fir_filter_bandwidth = StatusVar('fir_filter_bandwidth', default='500Hz')  # '500Hz', '1kHz', '1kHz_LP', '1kHz_FIR', '2kHz', '5kHz'
 
     # Off-resonant measurement parameters
     _include_off_resonant = StatusVar('include_off_resonant', default=False)
@@ -416,32 +416,45 @@ class SensitivitySweepGui(GuiBase):
         )
         stream_layout.addRow('Filter ENBW:', self._stream_f_enbw_spinbox)
 
-        # Lock-in FIR filter settings
+        # Lock-in filter settings
         stream_layout.addRow(QtWidgets.QLabel(''))  # Spacer
         fir_label = QtWidgets.QLabel('<b>Lock-in Filter Settings</b>')
         stream_layout.addRow(fir_label)
 
-        self._fir_bypass_checkbox = QtWidgets.QCheckBox('Bypass FIR filter (CIC only)')
+        self._fir_bypass_checkbox = QtWidgets.QCheckBox('Bypass filter (CIC only)')
         self._fir_bypass_checkbox.setChecked(self._fir_bypass)
         self._fir_bypass_checkbox.setToolTip(
-            'Bypass the FIR lowpass filter and use only CIC decimation.\n'
+            'Bypass the lowpass filter and use only CIC decimation.\n'
             'When bypassed: ~15 kHz bandwidth, ~160 µs latency.\n'
-            'When using FIR: bandwidth set by filter selection below.'
+            'When not bypassed: bandwidth set by filter selection below.'
         )
         stream_layout.addRow(self._fir_bypass_checkbox)
 
         self._fir_filter_combobox = QtWidgets.QComboBox()
-        self._fir_filter_combobox.addItems(['500Hz', '2kHz', '5kHz'])
-        # Set current index based on saved value
-        filter_index = {'500Hz': 0, '2kHz': 1, '5kHz': 2}.get(self._fir_filter_bandwidth, 0)
+        self._fir_filter_combobox.addItems([
+            '500Hz',
+            '1kHz (IIR)',
+            '1kHz_LP (FIR linear-phase)',
+            '1kHz_FIR (FIR min-phase)',
+            '2kHz',
+            '5kHz'
+        ])
+        # Map stored value to combobox index
+        _filter_index_map = {
+            '500Hz': 0, '1kHz': 1, '1kHz_LP': 2, '1kHz_FIR': 3, '2kHz': 4, '5kHz': 5
+        }
+        filter_index = _filter_index_map.get(self._fir_filter_bandwidth, 0)
         self._fir_filter_combobox.setCurrentIndex(filter_index)
         self._fir_filter_combobox.setToolTip(
-            'Select lock-in FIR lowpass filter bandwidth.\n'
-            '500Hz: Narrowest bandwidth, best noise rejection\n'
-            '2kHz: Medium bandwidth\n'
-            '5kHz: Widest bandwidth, fastest response'
+            'Select lock-in lowpass filter.\n'
+            '500Hz: FIR, narrowest bandwidth, best noise rejection\n'
+            '1kHz (IIR): IIR 8th-order Butterworth, 1 kHz bandwidth\n'
+            '1kHz_LP (FIR linear-phase): FIR linear-phase, 1 kHz bandwidth\n'
+            '1kHz_FIR (FIR min-phase): FIR minimum-phase, 1 kHz bandwidth\n'
+            '2kHz: FIR, medium bandwidth\n'
+            '5kHz: FIR, widest bandwidth, fastest response'
         )
-        stream_layout.addRow('  FIR Bandwidth:', self._fir_filter_combobox)
+        stream_layout.addRow('  Filter:', self._fir_filter_combobox)
 
         # Enable/disable filter selection based on bypass checkbox
         self._fir_filter_combobox.setEnabled(not self._fir_bypass)
@@ -835,7 +848,11 @@ class SensitivitySweepGui(GuiBase):
 
         # Lock-in filter settings
         self._fir_bypass = self._fir_bypass_checkbox.isChecked()
-        self._fir_filter_bandwidth = self._fir_filter_combobox.currentText()
+        # Map combobox index to PyRPL register key
+        _filter_key_from_index = {0: '500Hz', 1: '1kHz', 2: '1kHz_LP', 3: '1kHz_FIR', 4: '2kHz', 5: '5kHz'}
+        self._fir_filter_bandwidth = _filter_key_from_index.get(
+            self._fir_filter_combobox.currentIndex(), '500Hz'
+        )
 
         # Off-resonant measurement settings
         self._include_off_resonant = self._off_resonant_checkbox.isChecked()

@@ -116,7 +116,13 @@ class ContinuousLineScanMixin:
                 return
             
             # Start by moving to line start
-            motor.move_abs(start_pos)
+            result = motor.move_abs(start_pos)
+            if result != 0:
+                self.log.error(
+                    f"Failed to issue move to line {line_index} start position: {start_pos}"
+                )
+                self._finalize_scan(completed=False)
+                return
             self.sigScanStatusMessage.emit(f'Moving to line {line_index + 1}/{n_lines} start...')
 
             # Wait for arrival at line start
@@ -226,7 +232,14 @@ class ContinuousLineScanMixin:
                             f"Re-issuing move (attempt {self._line_start_retries}/"
                             f"{self._LINE_START_MAX_RETRIES})."
                         )
-                        motor.move_abs(self._line_start_position)
+                        result = motor.move_abs(self._line_start_position)
+                        if result != 0:
+                            self.log.error(
+                                f"Line {self._current_line_index}: failed to re-issue "
+                                f"move to start position. Aborting scan."
+                            )
+                            self._finalize_scan(completed=False)
+                            return
                     # Keep polling — motor may need time to reach target.
                     # Use 500ms interval to avoid flooding USB with get_pos() calls.
                     self._line_motor_poll_timer.start(500)
@@ -267,7 +280,15 @@ class ContinuousLineScanMixin:
                 # The slow axis is already at the correct position from Phase 1.
                 fast_axis = self._scan_data.get_fast_axis()
                 fast_axis_move = {fast_axis: self._line_end_position[fast_axis]}
-                motor.move_abs(fast_axis_move)
+                result = motor.move_abs(fast_axis_move)
+                if result != 0:
+                    self.log.error(
+                        f"Line {self._current_line_index}: failed to issue move "
+                        f"to line end position: {fast_axis_move}"
+                    )
+                    self._stop_position_sampling()
+                    self._finalize_scan(completed=False)
+                    return
 
                 n_lines = self._scan_data.get_num_lines()
                 self.log.info(f"Scanning line {self._current_line_index + 1}/{n_lines} "
@@ -370,9 +391,19 @@ class ContinuousLineScanMixin:
             # Continue movement to line end
             motor = self._motor_hardware()
             if motor is not None:
-                motor.move_abs(self._line_end_position)
+                fast_axis = self._scan_data.get_fast_axis()
+                fast_axis_move = {fast_axis: self._line_end_position[fast_axis]}
+                result = motor.move_abs(fast_axis_move)
+                if result != 0:
+                    self.log.error(
+                        f"Line {self._current_line_index}: failed to resume move "
+                        f"to line end position: {fast_axis_move}"
+                    )
+                    self._stop_position_sampling()
+                    self._finalize_scan(completed=False)
+                    return False
             
             self._waiting_for_line_end = True
-            self._line_motor_poll_timer.start(50)
+            self._line_motor_poll_timer.start(200)
             
             return True

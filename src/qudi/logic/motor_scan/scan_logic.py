@@ -66,6 +66,10 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     - DataProcessingMixin: Data acquisition, ODMR fitting, streaming
     - DataSavingMixin: Saving data to files, figure generation
     """
+
+    _POINT_POSITION_TOLERANCE = 100e-6  # 100 um
+    _POINT_MOVE_TIMEOUT = 120.0
+    _POINT_MOVE_MAX_RETRIES = 3
     
     # Connectors
     _motor_hardware = Connector(interface='MotorInterface', name='motor_hardware')
@@ -141,6 +145,11 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     _home_before_scan = ConfigOption(
         name='home_before_scan',
         default=False,
+        missing='info'
+    )
+    _require_homed_before_scan = ConfigOption(
+        name='require_homed_before_scan',
+        default=True,
         missing='info'
     )
     _lock_status_poll_interval = ConfigOption(
@@ -248,6 +257,8 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
 
         # Non-blocking manual movement state
         self._moving_in_progress = False
+        self._point_move_start_time = 0.0
+        self._point_move_retries = 0
 
         # Initialize mixin state
         self._init_position_sampling_state()  # From MotorControlMixin
@@ -421,6 +432,24 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         except Exception as e:
             self.log.warning(f"Failed to get motor position: {e}")
             return {}
+
+    def _motor_is_homed_for_axes(self, axes: List[str]) -> bool:
+        """Return True if the motor driver reports a valid home for all axes."""
+        motor = self._motor_hardware()
+        if motor is None or not hasattr(motor, 'is_homed'):
+            return True
+
+        try:
+            return bool(motor.is_homed(list(axes)))
+        except TypeError:
+            try:
+                return bool(motor.is_homed())
+            except Exception as e:
+                self.log.warning(f"Could not query motor homed state: {e}")
+                return False
+        except Exception as e:
+            self.log.warning(f"Could not query motor homed state: {e}")
+            return False
     
     @property
     def scan_pattern(self) -> ScanPattern:
@@ -542,6 +571,19 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             if self._homing_in_progress:
                 self.log.error("Cannot start scan while homing is in progress.")
                 return
+
+            if self._moving_in_progress:
+                self.log.error("Cannot start scan while manual movement is in progress.")
+                return
+
+            motor = self._motor_hardware()
+            if motor is not None and hasattr(motor, 'is_moving'):
+                try:
+                    if motor.is_moving():
+                        self.log.error("Cannot start scan while motor hardware is moving.")
+                        return
+                except Exception as e:
+                    self.log.warning(f"Could not query motor movement state: {e}")
             
             # Default to available axes
             if axes is None:
@@ -551,6 +593,15 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             for axis in axes:
                 if axis not in self._scan_ranges:
                     self.log.error(f"Axis '{axis}' not configured. Available: {list(self._scan_ranges.keys())}")
+                    return
+
+            if self._require_homed_before_scan and not self._home_before_scan:
+                if not self._motor_is_homed_for_axes(axes):
+                    self.log.error(
+                        f"Cannot start scan: axes {axes} are not homed. "
+                        f"Home the stages first or enable home_before_scan."
+                    )
+                    self.sigScanStatusMessage.emit('Scan aborted: stages not homed')
                     return
 
             # Clear any loaded data when starting a new scan
@@ -579,10 +630,25 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             axes: List of axes to scan.
         """
         try:
+            motor = self._motor_hardware()
+            if self._moving_in_progress:
+                self.log.error("Scan start aborted: manual movement is still in progress.")
+                self._scan_state = ScanState.IDLE
+                self.sigScanStateChanged.emit(self._scan_state)
+                return
+            if motor is not None and hasattr(motor, 'is_moving'):
+                try:
+                    if motor.is_moving():
+                        self.log.error("Scan start aborted: motor hardware is still moving.")
+                        self._scan_state = ScanState.IDLE
+                        self.sigScanStateChanged.emit(self._scan_state)
+                        return
+                except Exception as e:
+                    self.log.warning(f"Could not query motor movement state: {e}")
+
             # Home stages before scan if configured
             if self._home_before_scan:
                 self.log.info("Homing stages before scan...")
-                motor = self._motor_hardware()
                 if motor is not None:
                     try:
                         result = motor.calibrate(axes)
@@ -608,6 +674,16 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
+
+            if self._require_homed_before_scan and not self._motor_is_homed_for_axes(axes):
+                self.log.error(
+                    f"Scan start aborted: axes {axes} do not report a valid "
+                    f"home reference."
+                )
+                self.sigScanStatusMessage.emit('Scan aborted: stages not homed')
+                self._scan_state = ScanState.IDLE
+                self.sigScanStateChanged.emit(self._scan_state)
+                return
             
             # Determine scan mode
             mode = ScanMode(self._active_scan_mode) if isinstance(self._active_scan_mode, int) else self._active_scan_mode
@@ -897,11 +973,22 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
 
             # Start motor movement (non-blocking)
             motor = self._motor_hardware()
-            motor.move_abs(self._current_pos_dict)
+            result = motor.move_abs(self._current_pos_dict)
+            if result != 0:
+                self.log.error(
+                    f"Failed to issue move for scan point {self._current_point_idx}: "
+                    f"{self._current_pos_dict}"
+                )
+                self._finalize_scan(completed=False)
+                return
 
             # Set state and start polling timer
             self._waiting_for_motor = True
-            self._motor_poll_timer.start(50)  # Poll every 50ms
+            self._point_move_start_time = time.time()
+            self._point_move_retries = 0
+            # Give KDC101 controllers time to process the USB command before
+            # trusting is_moving(); otherwise the first poll can see a false idle.
+            self._motor_poll_timer.start(200)
 
     @QtCore.Slot()
     def _on_motor_poll_timeout(self):
@@ -933,34 +1020,43 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             # Verify position is within tolerance of target
             if hasattr(motor, 'get_pos'):
                 actual_pos = motor.get_pos()
-                position_tolerance = 100e-6  # 100 µm
-                
+
                 position_ok = all(
-                    abs(actual_pos.get(axis, 0) - target) <= position_tolerance
+                    abs(actual_pos.get(axis, 0) - target) <= self._POINT_POSITION_TOLERANCE
                     for axis, target in self._current_pos_dict.items()
                 )
-                
+
                 if not position_ok:
-                    # Wait up to 2 seconds for position to settle
-                    if not hasattr(self, '_position_settle_start'):
-                        self._position_settle_start = time.time()
-                    
-                    if time.time() - self._position_settle_start < 2.0:
-                        self._motor_poll_timer.start(100)
-                        return
-                    else:
-                        # Timeout - log warning
+                    elapsed = time.time() - self._point_move_start_time
+
+                    if elapsed > self._POINT_MOVE_TIMEOUT:
                         for axis, target in self._current_pos_dict.items():
                             error = abs(actual_pos.get(axis, 0) - target)
-                            if error > position_tolerance:
-                                self.log.warning(
-                                    f"Position error on {axis}: target={target*1000:.2f}mm, "
-                                    f"actual={actual_pos.get(axis, 0)*1000:.2f}mm"
+                            if error > self._POINT_POSITION_TOLERANCE:
+                                self.log.error(
+                                    f"Scan point {self._current_point_idx} failed to reach "
+                                    f"{axis} target after {elapsed:.1f}s: "
+                                    f"target={target*1000:.3f}mm, "
+                                    f"actual={actual_pos.get(axis, 0)*1000:.3f}mm, "
+                                    f"error={error*1e6:.0f}um"
                                 )
-                
-                if hasattr(self, '_position_settle_start'):
-                    delattr(self, '_position_settle_start')
-                
+                        self._waiting_for_motor = False
+                        motor.abort()
+                        self._finalize_scan(completed=False)
+                        return
+
+                    if not is_moving and self._point_move_retries < self._POINT_MOVE_MAX_RETRIES:
+                        self._point_move_retries += 1
+                        self.log.warning(
+                            f"Scan point {self._current_point_idx}: motor idle before "
+                            f"target was reached. Re-issuing move "
+                            f"({self._point_move_retries}/{self._POINT_MOVE_MAX_RETRIES})."
+                        )
+                        motor.move_abs(self._current_pos_dict)
+
+                    self._motor_poll_timer.start(500 if not is_moving else 100)
+                    return
+
                 # Log position at measurement point
                 point_idx = self._scan_data.current_point_index
                 total_points = len(self._scan_data.target_positions)

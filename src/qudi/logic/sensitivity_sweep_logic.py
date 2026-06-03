@@ -969,7 +969,7 @@ class SensitivitySweepLogic(LogicBase):
             # Configure filter bandwidth (only effective when bypass is False)
             if not fir_bypass:
                 # Validate filter bandwidth option
-                valid_filters = {'500Hz', '2kHz', '5kHz'}
+                valid_filters = {'500Hz', '2kHz', '5kHz', '1kHz', '1kHz_LP', '1kHz_FIR'}
                 if fir_filter_bw not in valid_filters:
                     self.log.warning(f'Invalid filter bandwidth "{fir_filter_bw}", using "500Hz"')
                     fir_filter_bw = '500Hz'
