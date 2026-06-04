@@ -116,6 +116,16 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _max_fpga_read_samples = ConfigOption('max_fpga_read_samples', default=None, missing='info')
     _stream_input = ConfigOption('stream_input', default='demod', missing='info')
 
+    # Push-streaming headroom tuning (passed to scan.push_stream_start):
+    #   stream_ring_bytes : ARM-side DRAM ring size, sets how long a PC stall can
+    #                       last before any sample is lost (ring_bytes/wire_rate
+    #                       seconds). 0 = pyrpl default (16 MB ~ tens of seconds).
+    #                       e.g. 67108864 (64 MB) for ~1-2 min of headroom.
+    #   stream_coalesce_us: max ARM batching latency in microseconds (0 = 5 ms
+    #                       default). Larger trims frame-header overhead.
+    _stream_ring_bytes = ConfigOption('stream_ring_bytes', default=0, missing='nothing')
+    _stream_coalesce_us = ConfigOption('stream_coalesce_us', default=0, missing='nothing')
+
     # Lock-in filter configuration (applies when stream_input='demod')
     # FIR bypass: True = CIC only (~15 kHz BW, ~160 µs latency), False = CIC+FIR
     _lock_in_fir_bypass_ch1 = ConfigOption('lock_in_fir_bypass_ch1', default=False, missing='info')
@@ -425,9 +435,12 @@ class RedPitayaDataInStream(DataInStreamInterface):
 
                 # Start push streaming: selects input, resets+enables the FPGA
                 # stream engine, lazily deploys+starts the ARM server, and starts
-                # the PC-side receiver thread. Returns the StreamClient.
+                # the PC-side receiver thread. Returns the StreamClient. The ring
+                # size sets the PC-stall headroom (see config options above).
                 self._rx = self._scan_module.push_stream_start(
-                    input_source=self._current_stream_input)
+                    input_source=self._current_stream_input,
+                    ring_bytes=int(self._stream_ring_bytes),
+                    coalesce_us=int(self._stream_coalesce_us))
 
                 # Mark as running
                 self._running = True
