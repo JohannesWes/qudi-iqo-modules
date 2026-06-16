@@ -154,8 +154,10 @@ class DataSavingMixin:
                 
                 file_path = None
                 
-                if self._scan_data.scan_mode == ScanMode.CONTINUOUS_STREAM:
+                if self._scan_data.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
                     # Save streaming data - one file per channel
+                    # (KDC_HW_SYNC fills stream_data_mean per grid point from the
+                    # hardware-marker reconstruction, same shape as CONTINUOUS_STREAM)
                     if self._scan_data.stream_data_mean:
                         for channel, data in self._scan_data.stream_data_mean.items():
                             file_path, _, _ = data_storage.save_data(
@@ -175,6 +177,18 @@ class DataSavingMixin:
                                 plt.close(fig)
                     else:
                         self.log.warning("No stream data to save.")
+
+                    # KDC_HW_SYNC: also persist the per-bin CUT TIME-TRACES and the
+                    # compact faithful dataset (continuous demod trace + hardware
+                    # x/y marker indices) so every position bin keeps both its raw
+                    # acquired trace and its average, and any binning is exactly
+                    # reproducible offline.
+                    if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                        try:
+                            self._save_hw_sync_raw(scan_folder)
+                        except Exception as e:
+                            self.log.warning("Failed to save KDC_HW_SYNC raw "
+                                             "traces/markers: %s", e)
 
                 elif self._scan_data.scan_mode == ScanMode.CONTINUOUS_FREQ_TRACK:
                     # Save absolute frequency data
@@ -474,9 +488,65 @@ class DataSavingMixin:
         
         return '\n'.join(lines)
     
+    def _save_hw_sync_raw(self, scan_folder: str):
+        """Persist the KDC_HW_SYNC raw deliverables into the scan folder:
+
+          * ``hw_sync_bin_traces.npy`` -- object array indexed by flat point index;
+            each entry is that position bin's CUT demod time-trace (float32). The
+            flat index maps to grid (ix, iy) via the scan pattern, identical to the
+            average map; ``mean(trace) == average`` for that bin.
+          * ``hw_sync_demod_trace.npy`` (float32) + ``hw_sync_x_markers.npy`` +
+            ``hw_sync_y_markers.npy`` -- the compact FAITHFUL dataset: the whole
+            continuous demod stream and the hardware marker sample-indices (x = bin
+            boundaries, y = line boundaries). These three reproduce ANY binning
+            exactly offline, independent of velocity/accel.
+
+        Binary ``.npy`` (not ``.dat``) because the trace is multi-million samples.
+        """
+        sd = self._scan_data
+        full = bool(getattr(self, '_save_full_traces', False))
+
+        # Always save the tiny hardware-sync record + USB position cross-check
+        # (negligible size, documents the scan's fidelity regardless of the toggle):
+        # the x/y marker indices and the measured-vs-target slow-axis position per line.
+        np.save(os.path.join(scan_folder, 'hw_sync_x_markers.npy'),
+                np.asarray(getattr(sd, 'hw_x_markers', []), dtype=np.int64))
+        np.save(os.path.join(scan_folder, 'hw_sync_y_markers.npy'),
+                np.asarray(getattr(sd, 'hw_y_markers', []), dtype=np.int64))
+        ya = getattr(sd, 'hw_y_positions_actual', None)
+        if ya is not None and len(ya):
+            np.save(os.path.join(scan_folder, 'hw_sync_y_actual_per_line.npy'),
+                    np.asarray(ya, dtype=np.float64))
+            np.save(os.path.join(scan_folder, 'hw_sync_y_target_per_line.npy'),
+                    np.asarray(getattr(sd, 'hw_y_positions_target', []), dtype=np.float64))
+
+        if not full:
+            self.log.info("KDC_HW_SYNC: 'save full traces' is OFF -> saved mean map + "
+                          "markers + per-line y only (no per-bin traces / demod trace).")
+            return
+
+        # Full per-bin CUT time-traces + the compact faithful demod trace.
+        n_saved = 0
+        ch = None
+        if sd.stream_data_raw:
+            ch = 'demod' if 'demod' in sd.stream_data_raw else next(iter(sd.stream_data_raw))
+        if ch is not None and sd.stream_data_raw.get(ch):
+            traces = np.array(
+                [np.asarray(seg, dtype=np.float32) for seg in sd.stream_data_raw[ch]],
+                dtype=object)
+            np.save(os.path.join(scan_folder, 'hw_sync_bin_traces.npy'),
+                    traces, allow_pickle=True)
+            n_saved = len(traces)
+        demod = getattr(sd, 'hw_demod_trace', None)
+        if demod is not None and len(demod):
+            np.save(os.path.join(scan_folder, 'hw_sync_demod_trace.npy'),
+                    np.asarray(demod, dtype=np.float32))
+        self.log.info("KDC_HW_SYNC raw saved: %d per-bin traces + faithful "
+                      "demod/markers + per-line y(USB) in %s", n_saved, scan_folder)
+
     def _save_odmr_raw_per_pixel(
-        self, 
-        scan_folder: str, 
+        self,
+        scan_folder: str,
         timestamp: datetime.datetime,
         metadata: Dict
     ):
@@ -599,6 +669,26 @@ class DataSavingMixin:
             axes = self._scan_data.scan_axes
             n_axes = len(axes)
             n_points = self._scan_data.total_points
+
+            # KDC_HW_SYNC: the per-point actual position is not polled (the fast axis
+            # sweeps continuously), but the SLOW axis is measured once per line via USB
+            # (the cross-check stored on scan_data). Surface that so the slow-axis
+            # Actual/Error columns are populated; the fast (per-bin) axis stays nan,
+            # since it genuinely is not measured per point.
+            hw_slow_actual = getattr(self._scan_data, 'hw_y_positions_actual', None)
+            hw_slow_axis = None
+            hw_slow_col = -1
+            if (hw_slow_actual is not None and len(hw_slow_actual)
+                    and self._scan_data.is_2d):
+                try:
+                    hw_slow_axis = self._scan_data.get_slow_axis()
+                    hw_slow_col = list(axes).index(hw_slow_axis)
+                except Exception:
+                    hw_slow_actual = None
+
+            def _hw_slow_line(grid_idx):
+                """Slow-axis line index for a point's (ix, iy) grid index."""
+                return int(grid_idx[0]) if hw_slow_axis == 'x' else int(grid_idx[1])
             
             # Build column headers
             col_headers = ['Point_Index']
@@ -638,7 +728,30 @@ class DataSavingMixin:
                                     f'max_abs_error={max_error[i]*1e6:.2f}um, '
                                     f'rms_error={rms_error[i]*1e6:.2f}um\n')
                         f.write('#\n')
-                
+
+                # KDC_HW_SYNC slow-axis (per-line USB cross-check) position accuracy.
+                # In this mode the fast/per-bin axis Actual is not measured (nan); the
+                # slow axis is measured once per settled line -- the authoritative
+                # position record. Per-bin position is hardware-anchored via markers.
+                if hw_slow_actual is not None:
+                    hw_slow_target = getattr(self._scan_data, 'hw_y_positions_target', None)
+                    ya = np.asarray(hw_slow_actual, dtype=float)
+                    yt = (np.asarray(hw_slow_target, dtype=float)
+                          if hw_slow_target is not None else None)
+                    f.write('# Note: KDC_HW_SYNC -- Actual/Error filled for the SLOW '
+                            f'axis ({hw_slow_axis}) only (per-line USB cross-check); the '
+                            'fast/per-bin axis is hardware-anchored via markers, not '
+                            'polled per point (nan).\n')
+                    if yt is not None and yt.shape == ya.shape:
+                        dev = ya - yt
+                        m = np.isfinite(dev)
+                        if m.any():
+                            f.write(f'#   {hw_slow_axis}-axis (slow, per line, n={int(m.sum())}): '
+                                    f'mean_abs_error={np.mean(np.abs(dev[m]))*1e6:.3f}um, '
+                                    f'max_abs_error={np.max(np.abs(dev[m]))*1e6:.3f}um, '
+                                    f'rms_error={np.sqrt(np.mean(dev[m]**2))*1e6:.3f}um\n')
+                    f.write('#\n')
+
                 # Write column headers
                 f.write('# ' + '\t'.join(col_headers) + '\n')
                 
@@ -658,29 +771,27 @@ class DataSavingMixin:
                     for i in range(n_axes):
                         row.append(f'{target[i]:.9e}')
                     
-                    # Actual positions
+                    # Actual positions: start from the per-point poll (if any), then
+                    # overlay the per-line slow-axis USB cross-check for KDC_HW_SYNC.
+                    actual_vals = [np.nan] * n_axes
                     if self._scan_data.actual_positions is not None:
-                        actual = self._scan_data.actual_positions[point_idx]
+                        ap = self._scan_data.actual_positions[point_idx]
                         for i in range(n_axes):
-                            if np.isnan(actual[i]):
-                                row.append('nan')
-                            else:
-                                row.append(f'{actual[i]:.9e}')
-                        
-                        # Errors
-                        for i in range(n_axes):
-                            if np.isnan(actual[i]):
-                                row.append('nan')
-                            else:
-                                error = actual[i] - target[i]
-                                row.append(f'{error:.9e}')
-                    else:
-                        # No actual positions recorded
-                        for i in range(n_axes):
-                            row.append('nan')
-                        for i in range(n_axes):
-                            row.append('nan')
-                    
+                            actual_vals[i] = ap[i]
+                    if hw_slow_actual is not None:
+                        line = _hw_slow_line(grid_idx)
+                        if 0 <= line < len(hw_slow_actual):
+                            v = hw_slow_actual[line]
+                            if np.isfinite(v):
+                                actual_vals[hw_slow_col] = float(v)
+
+                    for i in range(n_axes):
+                        row.append('nan' if not np.isfinite(actual_vals[i])
+                                   else f'{actual_vals[i]:.9e}')
+                    for i in range(n_axes):
+                        row.append('nan' if not np.isfinite(actual_vals[i])
+                                   else f'{actual_vals[i] - target[i]:.9e}')
+
                     f.write('\t'.join(row) + '\n')
             
             self.log.debug(f"Saved positions data to {file_path}")

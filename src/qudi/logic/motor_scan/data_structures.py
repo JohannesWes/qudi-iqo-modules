@@ -16,10 +16,13 @@ from typing import Dict, List, Tuple, Optional, Any
 
 class ScanMode(Enum):
     """Enumeration of available scan modes."""
-    CONTINUOUS_STREAM = 0     # Motors move continuously, data binned by position
+    CONTINUOUS_STREAM = 0     # Motors move continuously, data binned by position (software)
     STEP_ODMR = 1             # Motors stop at each point, ODMR scan taken
     CONTINUOUS_FREQ_TRACK = 2 # Motors move continuously, absolute frequency from lock
     POSITION_ONLY = 3         # Stage movement only, no data acquisition (debugging)
+    KDC_HW_SYNC = 4           # Motors move continuously; KDC101 position-step triggers
+                              # bin the FPGA demod stream in hardware (exact sync).
+                              # See pyrpl docs/developer_guide/motor_position_sync_scan.md
 
 
 class ScanPattern(Enum):
@@ -255,7 +258,8 @@ class MotorScanData:
         else:
             shape_2d = (self.scan_resolution[0],)
         
-        if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK):
+        if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK,
+                               ScanMode.KDC_HW_SYNC):
             self.stream_data_mean = {}
             self.stream_data_raw = {}
             if channel_names:
@@ -462,7 +466,7 @@ class MotorScanData:
             result['actual_positions'] = self.actual_positions.tolist()
             
         # Mode-specific data
-        if self.scan_mode == ScanMode.CONTINUOUS_STREAM:
+        if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
             if self.stream_data_mean:
                 result['stream_data_mean'] = {
                     k: v.tolist() for k, v in self.stream_data_mean.items()
@@ -518,7 +522,7 @@ class MotorScanData:
             instance.actual_positions = np.array(data['actual_positions'])
             
         # Mode-specific restoration
-        if mode == ScanMode.CONTINUOUS_STREAM:
+        if mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
             if 'stream_data_mean' in data:
                 instance.stream_data_mean = {
                     k: np.array(v) for k, v in data['stream_data_mean'].items()

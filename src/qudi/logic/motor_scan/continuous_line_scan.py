@@ -70,8 +70,9 @@ class ContinuousLineScanMixin:
         if self._scan_data is None:
             return False
         
-        # Only use for CONTINUOUS_* modes and POSITION_ONLY
-        if self._scan_data.scan_mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK, ScanMode.POSITION_ONLY):
+        # Only use for CONTINUOUS_* modes, POSITION_ONLY, and KDC_HW_SYNC
+        if self._scan_data.scan_mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK,
+                                             ScanMode.POSITION_ONLY, ScanMode.KDC_HW_SYNC):
             return False
         
         # Check if continuous line mode is enabled
@@ -93,8 +94,13 @@ class ContinuousLineScanMixin:
                 return
             
             self._current_line_index = line_index
-            start_pos, end_pos = self._scan_data.get_line_start_end_positions(line_index)
-            
+            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                # Fast-axis endpoints over-travel half a bin past the outer bin
+                # boundaries so the stage crosses every boundary (all ppl+1 pulses).
+                start_pos, end_pos = self._hw_sync_line_endpoints(line_index)
+            else:
+                start_pos, end_pos = self._scan_data.get_line_start_end_positions(line_index)
+
             if not start_pos or not end_pos:
                 self.log.error(f"Could not get positions for line {line_index}")
                 self._finalize_scan(completed=False)
@@ -166,8 +172,14 @@ class ContinuousLineScanMixin:
                     if motor is not None:
                         motor.abort()
                         self._line_pause_position = motor.get_pos()
-                    # Preserve position samples collected so far for resume
-                    self._line_pause_position_buffer = self._stop_position_sampling()
+                    if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                        # Continuous hardware-marker capture can't be cleanly resumed
+                        # mid-line; re-scan the whole current line on resume (its grid
+                        # row is overwritten when the line completes).
+                        self._hw_line_restart_on_resume = True
+                    else:
+                        # Preserve position samples collected so far for resume
+                        self._line_pause_position_buffer = self._stop_position_sampling()
                     self._line_paused_mid_scan = True
                     self.log.info(f"Line {self._current_line_index} paused mid-scan at position: "
                                  f"{self._line_pause_position}")
@@ -178,7 +190,16 @@ class ContinuousLineScanMixin:
                 return
             
             is_moving = motor.is_moving() if hasattr(motor, 'is_moving') else False
-            
+
+            # KDC_HW_SYNC: drain the FPGA demod + marker rings every poll, in EVERY
+            # phase (including inter-line / move-to-start), so the rings never sit
+            # undrained during a long move. The push client NaN-fills any gap and
+            # preserves the absolute sample count, so the demod array index stays
+            # exactly aligned with the FPGA marker sample indices regardless of when
+            # we drain.
+            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                self._hw_sync_drain()
+
             if hasattr(self, '_waiting_for_line_start') and self._waiting_for_line_start:
                 # Phase 1: Waiting to arrive at line start
                 if is_moving:
@@ -264,12 +285,16 @@ class ContinuousLineScanMixin:
                 self._waiting_for_line_start = False
                 self._waiting_for_line_end = True
 
-                # Clear data buffers and start position sampling
-                self._clear_line_raw_data_buffer()
                 self._line_data_start_time = time.time()
-
-                sample_interval_ms = int(getattr(self, '_position_poll_interval', 0.05) * 1000)
-                self._start_position_sampling(sample_interval_ms)
+                if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                    # Hardware data path: configure this line's fast-axis trigger and
+                    # reset the per-line x-marker baseline. No software sampling.
+                    self._hw_sync_line_start(self._current_line_index)
+                else:
+                    # Clear data buffers and start software position sampling
+                    self._clear_line_raw_data_buffer()
+                    sample_interval_ms = int(getattr(self, '_position_poll_interval', 0.05) * 1000)
+                    self._start_position_sampling(sample_interval_ms)
 
                 # Issue move to line end — ONLY command the fast axis.
                 # Sending both axes causes a race condition: for LINE_BY_LINE_Y,
@@ -301,17 +326,24 @@ class ContinuousLineScanMixin:
                 self._line_motor_poll_timer.start(200)
                 
             elif self._waiting_for_line_end:
-                # Phase 2: Waiting to arrive at line end (continuous scan in progress)
+                # Phase 2: Waiting to arrive at line end (continuous scan in progress).
+                # Draining is handled once at the top of this handler (all phases).
                 if is_moving:
                     self._line_motor_poll_timer.start(50)
                     return
                 
                 # Line complete - stop sampling and bin data
                 self._waiting_for_line_end = False
-                position_buffer = self._stop_position_sampling()
 
-                # Skip data binning for POSITION_ONLY mode
-                if self._scan_data.scan_mode != ScanMode.POSITION_ONLY:
+                if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                    # Hardware data path: final drain + reconstruct this line's grid
+                    # row from the x-markers captured during the sweep.
+                    self._hw_sync_line_finish(self._current_line_index)
+                elif self._scan_data.scan_mode == ScanMode.POSITION_ONLY:
+                    self._stop_position_sampling()
+                    self.log.debug(f"POSITION_ONLY: Line {self._current_line_index} completed (no data)")
+                else:
+                    position_buffer = self._stop_position_sampling()
                     raw_data_buffer = self._get_line_raw_data_buffer()
 
                     # Bin the collected data
@@ -327,8 +359,6 @@ class ContinuousLineScanMixin:
                                        f"{bin_result.get('error', 'unknown')}")
                         # Clean up failed line data to prevent corruption of next line
                         self._clear_line_raw_data_buffer()
-                else:
-                    self.log.debug(f"POSITION_ONLY: Line {self._current_line_index} completed (no data)")
                 
                 # Validate motor reached line end (Finding #4: motor stop detection)
                 fast_axis = self._scan_data.get_fast_axis()
@@ -370,8 +400,17 @@ class ContinuousLineScanMixin:
             if not self._line_paused_mid_scan:
                 # Normal resume - start next line
                 return False
-            
+
             self._line_paused_mid_scan = False
+
+            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC and self._hw_line_restart_on_resume:
+                # Re-scan the whole current line from its start (markers/demod keep
+                # streaming; the per-line baseline reset in _hw_sync_line_start
+                # discards the abandoned partial line's markers).
+                self._hw_line_restart_on_resume = False
+                self.log.info(f"Resuming KDC_HW_SYNC by re-scanning line {self._current_line_index}")
+                self._start_continuous_line_scan(self._current_line_index)
+                return True
             
             # Resume from pause position to line end
             self.log.info(f"Resuming line {self._current_line_index} from pause position")

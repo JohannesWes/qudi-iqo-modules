@@ -123,12 +123,15 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.mode_label = QtWidgets.QLabel(' Mode: ')
         self.toolbar.addWidget(self.mode_label)
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK', 'POSITION_ONLY'])
+        self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK',
+                                  'POSITION_ONLY', 'KDC_HW_SYNC'])
         self.mode_combo.setToolTip(
             'STEP_ODMR: Stop at each point, take ODMR spectrum\n'
             'CONTINUOUS_STREAM: Continuous movement, stream channel data\n'
             'CONTINUOUS_FREQ_TRACK: Continuous movement, record absolute frequency from lock\n'
-            'POSITION_ONLY: Move stage along pattern without data acquisition (debugging)'
+            'POSITION_ONLY: Move stage along pattern without data acquisition (debugging)\n'
+            'KDC_HW_SYNC: Continuous movement; KDC position-step triggers bin the FPGA '
+            'demod stream in hardware (exact sync, no line shifts)'
         )
         self.toolbar.addWidget(self.mode_combo)
         
@@ -144,9 +147,18 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
             'LINE_BY_LINE_Y: Scan Y lines, return to start each line'
         )
         self.toolbar.addWidget(self.pattern_combo)
-        
+
+        # KDC_HW_SYNC: keep+save the full per-bin time-traces, or just the mean map.
+        self.save_traces_check = QtWidgets.QCheckBox(' Save full traces ')
+        self.save_traces_check.setToolTip(
+            'KDC_HW_SYNC only: if checked, the full cut time-trace of every position '
+            'bin (plus the continuous demod trace) is kept and saved. If unchecked '
+            '(default), only the per-bin MEAN map is built and saved -- lower memory '
+            'and disk. The mean map is always what is shown here.')
+        self.toolbar.addWidget(self.save_traces_check)
+
         self.toolbar.addSeparator()
-        
+
         # Display channel selector
         self.channel_label = QtWidgets.QLabel(' Display: ')
         self.toolbar.addWidget(self.channel_label)
@@ -374,6 +386,7 @@ class MotorScanGui(GuiBase):
         self._mw.mode_combo.currentTextChanged.connect(self._mode_changed)
         self._mw.pattern_combo.currentTextChanged.connect(self._pattern_changed)
         self._mw.display_combo.currentTextChanged.connect(self._display_channel_changed)
+        self._mw.save_traces_check.toggled.connect(self._save_traces_toggled)
 
         # Connect stage control signals
         self._mw.move_button.clicked.connect(self._move_to_position)
@@ -471,6 +484,13 @@ class MotorScanGui(GuiBase):
             index = self._mw.pattern_combo.findText(pattern_name)
             if index >= 0:
                 self._mw.pattern_combo.setCurrentIndex(index)
+
+        # Restore the KDC_HW_SYNC "save full traces" toggle from the logic StatusVar
+        try:
+            self._mw.save_traces_check.blockSignals(True)
+            self._mw.save_traces_check.setChecked(bool(self._logic.save_full_traces))
+        finally:
+            self._mw.save_traces_check.blockSignals(False)
 
         # Ensure pixel spectrum panel visibility matches current mode
         current_mode = self._mw.mode_combo.currentText()
@@ -671,6 +691,10 @@ class MotorScanGui(GuiBase):
     def _display_channel_changed(self, channel: str):
         """Handle display channel change."""
         self._update_display()
+
+    def _save_traces_toggled(self, checked: bool):
+        """Handle the KDC_HW_SYNC 'save full traces' checkbox."""
+        self._logic.set_save_full_traces(bool(checked))
     
     def _on_scan_state_changed(self, state):
         """Handle scan state change from logic."""

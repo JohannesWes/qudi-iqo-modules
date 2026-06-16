@@ -43,6 +43,7 @@ from .data_processing import DataProcessingMixin
 from .data_saving import DataSavingMixin
 from .data_loading import DataLoadingMixin
 from .continuous_line_scan import ContinuousLineScanMixin
+from .hw_sync_scan import HwSyncScanMixin
 
 # Add qudi-core root to path to find my_software (same as sensitivity_sweep_logic)
 # Get path to qudi-core root (4 levels up from this file in the package)
@@ -51,7 +52,7 @@ if qudi_core_root not in sys.path:
     sys.path.insert(0, qudi_core_root)
 
 
-class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingMixin, DataSavingMixin, DataLoadingMixin, LogicBase):
+class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin, DataProcessingMixin, DataSavingMixin, DataLoadingMixin, LogicBase):
     """
     Logic module for motor-based XY scanning.
     
@@ -81,7 +82,14 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         name='odmr_frequency_tracking_logic',
         optional=True
     )
-    
+    # Shared Red Pitaya stream owner. When connected, KDC_HW_SYNC routes the board's
+    # single push stream through this owner (begin/end_scan_stream) so a marker-mode
+    # scan cleanly takes over from / restores the monitor stream instead of starting
+    # a competing second stream. Optional: without it the scan falls back to grabbing
+    # the pyrpl scan module directly (headless tests).
+    _streamer = Connector(interface='DataInStreamInterface', name='streamer',
+                          optional=True)
+
     # Config options
     _default_scan_mode = ConfigOption(
         name='default_scan_mode',
@@ -173,6 +181,45 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         default=True,  # Automatically save scan data when scan completes
         missing='info'
     )
+    # KDC_HW_SYNC mode options. The Red Pitaya scan module is obtained via the
+    # shared pyrpl instance (same hostname/config_name the other RP modules use),
+    # NOT a Connector, so it coexists with the streaming / ODMR-lock modules.
+    _redpitaya_hostname = ConfigOption(
+        name='redpitaya_hostname',
+        default=None,
+        missing='nothing'
+    )
+    _redpitaya_config_name = ConfigOption(
+        name='redpitaya_config_name',
+        default=None,
+        missing='nothing'
+    )
+    _hw_sync_channel = ConfigOption(
+        name='hw_sync_channel',
+        default='demod',  # FPGA stream input: 'demod' or 'ftw_corr'
+        missing='nothing'
+    )
+    _hw_sync_pulse_width = ConfigOption(
+        name='hw_sync_pulse_width',
+        default=1e-4,  # 100 us KDC trigger pulse width
+        missing='nothing'
+    )
+    _hw_sync_trig_port = ConfigOption(
+        name='hw_sync_trig_port',
+        default=1,  # KDC101 TRIG SMA port (1 or 2)
+        missing='nothing'
+    )
+    _hw_sync_margin_frac = ConfigOption(
+        name='hw_sync_margin_frac',
+        default=0.5,  # fast-axis over-travel past outer bin boundaries, in bins
+        missing='nothing'
+    )
+    _hw_sync_runup = ConfigOption(
+        name='hw_sync_runup',
+        default=0.5e-3,  # absolute fast-axis run-up (m) before the first (throwaway)
+                         # position-step pulse so the stage is at constant velocity.
+        missing='nothing'
+    )
 
     # Status variables (persistent across sessions)
     _scan_ranges = StatusVar(
@@ -185,6 +232,11 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     )
     _active_scan_mode = StatusVar(name='active_scan_mode', default=None)
     _active_scan_pattern = StatusVar(name='active_scan_pattern', default='SNAKE_X')
+    # KDC_HW_SYNC: whether to keep+save the full per-bin time-traces (and the faithful
+    # demod trace). Default False -> only the per-bin MEAN map (what the GUI plots) is
+    # built and saved; this also avoids holding every bin's samples in memory on large
+    # scans. Toggled from the GUI ("Save full traces").
+    _save_full_traces = StatusVar(name='save_full_traces', default=False)
     
     # Signals
     sigScanStateChanged = QtCore.Signal(object)  # ScanState
@@ -263,6 +315,7 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
         # Initialize mixin state
         self._init_position_sampling_state()  # From MotorControlMixin
         self._init_continuous_line_state()    # From ContinuousLineScanMixin
+        self._init_hw_sync_state()            # From HwSyncScanMixin
         self._init_data_loading()             # From DataLoadingMixin
 
     def on_activate(self):
@@ -342,6 +395,9 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
 
         # Disconnect time series signals if connected
         self._disconnect_time_series_signals()
+
+        # Release the shared pyrpl instance held for KDC_HW_SYNC (if any)
+        self._release_scan_module()
 
         # Disconnect signals
         try:
@@ -462,6 +518,26 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
     # Settings Methods
     # =========================================================================
     
+    @property
+    def save_full_traces(self) -> bool:
+        """Whether KDC_HW_SYNC scans keep+save the full per-bin time-traces (True) or
+        only the per-bin mean map (False, default)."""
+        return bool(self._save_full_traces)
+
+    @QtCore.Slot(bool)
+    def set_save_full_traces(self, enabled: bool):
+        """Enable/disable keeping+saving the full per-bin time-traces for KDC_HW_SYNC
+        scans (GUI toggle). When off, only the mean map is built and saved (lower
+        memory + disk). Cannot change mid-scan."""
+        with self._thread_lock:
+            if self.is_scanning:
+                self.log.error("Cannot change full-trace saving while scanning.")
+                return
+            self._save_full_traces = bool(enabled)
+            self.log.info("KDC_HW_SYNC full per-bin time-trace saving: %s",
+                          "ON" if self._save_full_traces else "OFF (mean only)")
+            self.sigScanSettingsChanged.emit(self.scan_settings)
+
     @QtCore.Slot(str)
     def set_scan_mode(self, mode: Union[str, ScanMode]):
         """Set the scan mode."""
@@ -740,6 +816,22 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             elif mode == ScanMode.POSITION_ONLY:
                 # POSITION_ONLY mode requires no measurement connectors
                 self.log.info("POSITION_ONLY mode - stage movement only, no data acquisition")
+            elif mode == ScanMode.KDC_HW_SYNC:
+                # Needs the Red Pitaya scan module (shared pyrpl instance) and a
+                # motor driver exposing setup_position_trigger.
+                if self._get_scan_module() is None:
+                    self.log.error("Red Pitaya scan module not available. "
+                                   "Cannot perform KDC_HW_SYNC scan (check "
+                                   "redpitaya_hostname / redpitaya_config_name).")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                if not hasattr(motor, 'setup_position_trigger'):
+                    self.log.error("Motor hardware does not support setup_position_trigger. "
+                                   "Cannot perform KDC_HW_SYNC scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
 
             # Create scan configuration
             scan_axes = tuple(axes)
@@ -820,6 +912,17 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
             elif mode == ScanMode.POSITION_ONLY:
                 # Initialize with empty channels - only track positions
                 self._scan_data.initialize_data_arrays(channel_names=[])
+                self._current_scan_folder = None
+            elif mode == ScanMode.KDC_HW_SYNC:
+                # Hardware-marker streaming: one channel (demod or ftw_corr).
+                channel_names = [self._hw_sync_channel_name()]
+                self._scan_data.initialize_data_arrays(channel_names)
+                # Configure the slow-axis trigger and start the FPGA marker stream.
+                if not self._hw_sync_scan_setup():
+                    self.log.error("KDC_HW_SYNC stream setup failed. Aborting scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
                 self._current_scan_folder = None
             else:
                 self._scan_data.initialize_data_arrays()
@@ -1166,6 +1269,16 @@ class MotorScanLogic(ContinuousLineScanMixin, MotorControlMixin, DataProcessingM
 
             # Reset tracking state
             self._paused_due_to_lock_loss = False
+
+        # KDC_HW_SYNC: stop the FPGA marker stream and disable the KDC triggers,
+        # then re-bin the whole demod trace from the hardware markers (both axes
+        # hardware-anchored) and stash the faithful raw trace+markers for saving.
+        if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+            self._hw_sync_scan_teardown()
+            try:
+                self._hw_sync_finalize()
+            except Exception as e:
+                self.log.error("KDC_HW_SYNC hardware finalize/re-bin failed: %s", e)
 
         # Update scan data
         self._scan_data.completed = completed

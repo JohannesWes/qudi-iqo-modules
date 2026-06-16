@@ -250,21 +250,34 @@ class ThorlabsKDC101Kinesis(MotorInterface):
 
             try:
                 self.log.debug(f"Connecting to {axis_label}-axis (serial: {serial})...")
-                stage = self._Thorlabs.KinesisMotor(serial, scale="stage")
+                # Pin the position scale explicitly instead of using scale="stage".
+                # pylablib's built-in MTS50-Z8 table uses an integer 67:1 gearbox
+                # ratio (512 * 67 * 1000 = 34_304_000 counts/m), but the actual
+                # MTS50-Z8 gearhead is 67.49:1, giving Thorlabs' documented
+                # 34,554.96 counts/mm (= SPECS.ENCODER_COUNTS_PER_M). The table
+                # value introduces a systematic ~0.73% position error. Passing the
+                # correct counts-per-metre makes pylablib derive the position,
+                # velocity and acceleration scales from the true value (vel/acc use
+                # the KDC101 2048/6e6 * 2**16 time base automatically).
+                stage = self._Thorlabs.KinesisMotor(
+                    serial, scale=SPECS.ENCODER_COUNTS_PER_M
+                )
 
-                # Verify units
-                units = stage.get_scale_units()
-                is_valid = False
-                if isinstance(units, tuple):
-                    if units and units[0] == 'm':
-                        is_valid = True
-                elif units == 'm':
-                    is_valid = True
-
-                if not is_valid:
-                    self.log.warning(
-                        f"{axis_label}-axis units are {units}, expected meters. "
-                        "Check stage configuration."
+                # Verify the scale was actually applied. With an explicit numeric
+                # scale pylablib reports units as "user_step", but the values are in
+                # metres (counts-per-metre). Check the scale magnitude rather than
+                # the unit label so a wrong/raw scale (e.g. 1 count/unit) is caught
+                # before any move command can drive the stage to a wrong position.
+                pos_scale = stage.get_scale()[0]
+                if abs(pos_scale - SPECS.ENCODER_COUNTS_PER_M) > 1.0:
+                    self.log.error(
+                        f"{axis_label}-axis position scale is {pos_scale:.1f} counts/m, "
+                        f"expected {SPECS.ENCODER_COUNTS_PER_M:.1f}. Refusing to "
+                        f"continue with an unverified scale."
+                    )
+                    raise RuntimeError(
+                        f"{axis_label}-axis scale verification failed "
+                        f"({pos_scale:.1f} != {SPECS.ENCODER_COUNTS_PER_M:.1f})"
                     )
 
                 # Check and correct velocity if too low
@@ -1065,6 +1078,183 @@ class ThorlabsKDC101Kinesis(MotorInterface):
         except Exception as e:
             self.log.error(f"Set acceleration failed: {e}")
             return -1
+
+    # =========================================================================
+    # KDC101 hardware position-step trigger output (for HW-synchronized scans)
+    # =========================================================================
+    # The KDC101 TRIG ports can emit a 5 V TTL pulse each time the encoder
+    # position crosses start + n*step ("At Position Steps" mode, manual §6.3.5).
+    # Fed (level-shifted) into the Red Pitaya, these pulses delimit spatial bins
+    # in the FPGA's clock domain, giving exact data<->position synchronization.
+    # See pyrpl docs/developer_guide/motor_position_sync_scan.md.
+
+    # direction -> pylablib kcube_trigio_mode output-pulse mode
+    _TRIG_OUT_MODES = {'fwd': 'out_pulse_fw',
+                       'rev': 'out_pulse_bk',
+                       'both': 'out_pulse_move'}
+
+    def setup_position_trigger(self, axis: str, start: float, step: float,
+                               num: int, pulse_width: float = 1e-4,
+                               direction: str = 'fwd', trig_port: int = 1,
+                               polarity: str = 'high', cycles: int = 1) -> int:
+        """Configure an 'At Position Steps' trigger output on one axis' KDC101.
+
+        All positions/steps are in meters and the pulse width in seconds; the
+        controller's pinned encoder scale (ENCODER_COUNTS_PER_M) is used via
+        pylablib ``scale=True``.
+
+        Args:
+            axis: axis label ('x' or 'y').
+            start: first trigger position [m] (e.g. first bin boundary).
+            step: position increment between pulses [m] (the bin pitch).
+            num: number of pulses (e.g. n_bins + 1 boundaries).
+            pulse_width: active pulse width [s]. Keep < min bin traversal time.
+            direction: 'fwd', 'rev', or 'both' (forward/backward/both travel).
+            trig_port: 1 or 2 (which TRIG SMA to drive).
+            polarity: 'high' (active-high pulse) or 'low'.
+            cycles: number of forward/reverse cycles (``ncycles``).
+
+        Returns:
+            int: 0 on success, -1 on error.
+        """
+        if axis not in self._stages:
+            self.log.warning(f"Unknown axis '{axis}' for position trigger.")
+            return -1
+        mode = self._TRIG_OUT_MODES.get(direction)
+        if mode is None:
+            self.log.error(f"Invalid trigger direction '{direction}' "
+                           f"(expected one of {list(self._TRIG_OUT_MODES)}).")
+            return -1
+        stage = self._stages[axis]
+        # pylablib enum-maps the *_mode args but packs *_pol as a raw int (bool):
+        # passing the string 'high'/'low' raises "required argument is not an
+        # integer". Map to a bool here (active-high == True). Verified on hardware.
+        pol = polarity if isinstance(polarity, (bool, int)) \
+            else (str(polarity).lower() in ('high', 'h', '1', 'true'))
+        try:
+            # 1. set the TRIG port to the position-step output mode + polarity
+            if trig_port == 1:
+                stage.setup_kcube_trigio(trig1_mode=mode, trig1_pol=pol)
+            elif trig_port == 2:
+                stage.setup_kcube_trigio(trig2_mode=mode, trig2_pol=pol)
+            else:
+                self.log.error(f"Invalid trig_port {trig_port} (expected 1 or 2).")
+                return -1
+
+            # 2. set the position-trigger geometry (physical units, scale=True).
+            #    Only one set of position-trigger parameters exists per controller.
+            kw = dict(width=pulse_width, ncycles=cycles, scale=True)
+            # IMPORTANT: explicitly zero the OTHER direction's count. The KCube
+            # keeps one parameter set per controller and, after the forward pulses,
+            # schedules reverse pulses (and repeats fwd-rev `ncycles` times) if
+            # num_bk != 0. Leaving num_bk at a stale/default value makes spurious
+            # pulses fire during the backward inter-line repositioning move -> extra
+            # markers (was responsible for the first line capturing far too many
+            # x-markers). So for 'fwd' force num_bk=0, and for 'rev' force num_fw=0.
+            if direction == 'rev':
+                kw.update(start_bk=start, step_bk=step, num_bk=num,
+                          start_fw=start, step_fw=step, num_fw=0)
+            elif direction == 'both':
+                kw.update(start_fw=start, step_fw=step, num_fw=num,
+                          start_bk=start, step_bk=step, num_bk=num)
+            else:  # 'fwd'
+                kw.update(start_fw=start, step_fw=step, num_fw=num,
+                          start_bk=start, step_bk=step, num_bk=0)
+            stage.setup_kcube_trigpos(**kw)
+
+            self.log.debug(
+                f"{axis}-axis position trigger (port {trig_port}, {direction}): "
+                f"start={start*1000:.3f}mm, step={step*1e6:.1f}um, num={num}, "
+                f"width={pulse_width*1e6:.0f}us"
+            )
+            return 0
+        except Exception as e:
+            self.log.error(f"Failed to set up position trigger on {axis}: {e}")
+            return -1
+
+    def setup_motion_trigger(self, axis: str, trig_port: int = 1,
+                             polarity: str = 'high') -> int:
+        """Configure an 'In Motion' trigger output on one axis' KDC101 TRIG port.
+
+        Unlike :meth:`setup_position_trigger` ('At Position Steps'), this drives the
+        TRIG port to its active level for the WHOLE time the stage is moving (KDC
+        ``out_in_motion`` mode). It is therefore a single, robust rising edge at the
+        instant the stage STARTS each move -- with nothing to "match" it cannot be
+        skipped the way the position-step trigger can under concurrent USB/poll load
+        (verified on hardware: position-step doubled/dropped slow-axis pulses, while
+        In-Motion gives exactly one clean edge per move even while get_position() is
+        hammered). Used for the slow (line) axis of a KDC_HW_SYNC scan: the FPGA
+        records one y-marker per inter-line move = one hardware line boundary.
+
+        Args:
+            axis: axis label ('x' or 'y').
+            trig_port: 1 or 2 (which TRIG SMA to drive).
+            polarity: 'high' (active-high while moving) or 'low'.
+
+        Returns:
+            int: 0 on success, -1 on error.
+        """
+        if axis not in self._stages:
+            self.log.warning(f"Unknown axis '{axis}' for motion trigger.")
+            return -1
+        stage = self._stages[axis]
+        pol = polarity if isinstance(polarity, (bool, int)) \
+            else (str(polarity).lower() in ('high', 'h', '1', 'true'))
+        try:
+            if trig_port == 1:
+                stage.setup_kcube_trigio(trig1_mode='out_in_motion', trig1_pol=pol)
+            elif trig_port == 2:
+                stage.setup_kcube_trigio(trig2_mode='out_in_motion', trig2_pol=pol)
+            else:
+                self.log.error(f"Invalid trig_port {trig_port} (expected 1 or 2).")
+                return -1
+            self.log.debug(f"{axis}-axis 'In Motion' trigger (port {trig_port}, "
+                           f"polarity={'high' if pol else 'low'}).")
+            return 0
+        except Exception as e:
+            self.log.error(f"Failed to set up motion trigger on {axis}: {e}")
+            return -1
+
+    def disable_position_trigger(self, axis: str, trig_port: int = 1) -> int:
+        """Disable the trigger output on one axis' KDC101 TRIG port.
+
+        Args:
+            axis: axis label ('x' or 'y').
+            trig_port: 1 or 2.
+
+        Returns:
+            int: 0 on success, -1 on error.
+        """
+        if axis not in self._stages:
+            self.log.warning(f"Unknown axis '{axis}' for disabling trigger.")
+            return -1
+        stage = self._stages[axis]
+        try:
+            if trig_port == 1:
+                stage.setup_kcube_trigio(trig1_mode='off')
+            elif trig_port == 2:
+                stage.setup_kcube_trigio(trig2_mode='off')
+            else:
+                self.log.error(f"Invalid trig_port {trig_port} (expected 1 or 2).")
+                return -1
+            return 0
+        except Exception as e:
+            self.log.error(f"Failed to disable position trigger on {axis}: {e}")
+            return -1
+
+    def get_position_trigger_parameters(self, axis: str) -> Optional[dict]:
+        """Return the current KCube trig-IO and trig-position parameters for an axis."""
+        if axis not in self._stages:
+            self.log.warning(f"Unknown axis '{axis}'.")
+            return None
+        stage = self._stages[axis]
+        try:
+            trigio = stage.get_kcube_trigio_parameters()
+            trigpos = stage.get_kcube_trigpos_parameters(scale=True)
+            return {'trigio': trigio, 'trigpos': trigpos}
+        except Exception as e:
+            self.log.warning(f"Failed to read trigger parameters of {axis}: {e}")
+            return None
 
     @staticmethod
     def list_devices() -> List[Tuple[str, str]]:
