@@ -77,6 +77,20 @@ def get_pyrpl_instance(hostname, config_name, gui=True):
     Factory function to get or create a shared pyrpl.Pyrpl instance.
     This ensures that only one connection per Red Pitaya is established.
     """
+    # Force headless if there is no GUI-capable QApplication (e.g. qudi started
+    # with --no-gui / -g, which runs a bare QCoreApplication). pyrpl's GUI needs
+    # a QWidget, which requires a QApplication; creating it under a QCoreApplication
+    # raises "QWidget: Cannot create a QWidget without QApplication".
+    if gui:
+        try:
+            from PySide2 import QtCore, QtWidgets
+            app = QtCore.QCoreApplication.instance()
+            # QApplication subclasses QCoreApplication, so .instance() returns the
+            # bare QCoreApplication in headless mode too; check the actual type.
+            if app is None or not isinstance(app, QtWidgets.QApplication):
+                gui = False
+        except Exception:
+            gui = False
     with _pyrpl_lock:
         instance_key = f"{hostname}_{config_name}"
 

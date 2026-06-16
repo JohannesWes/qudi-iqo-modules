@@ -157,6 +157,14 @@ class RedPitayaDataInStream(DataInStreamInterface):
         self._sample_rate = self._STREAM_SAMPLE_RATE
         self._current_stream_input = 'demod'  # Current input: 'demod' or 'ftw_corr'
 
+        # KDC_HW_SYNC handover state: the board streams ONE quantity at a time, so a
+        # marker-mode scan must take over this single stream. begin_scan_stream()
+        # remembers the monitor stream here and end_scan_stream() restores it.
+        self._scan_active = False
+        self._scan_resume = False
+        self._scan_resume_input = 'demod'
+        self._scan_tap = None        # display tap into the scan's feed (fan-out)
+
         # Push-streaming receiver (pyrpl StreamClient) + a small FIFO of samples
         # already drained from it but not yet handed to the consumer. The
         # StreamClient's own daemon thread does the continuous buffering, so we
@@ -420,8 +428,28 @@ class RedPitayaDataInStream(DataInStreamInterface):
             )
 
     def start_stream(self) -> None:
-        """Start the data acquisition/streaming."""
+        """Start the data acquisition/streaming.
+
+        While a KDC_HW_SYNC scan owns the board's single stream, this does NOT
+        start a competing stream (which would reset the shared counter and break
+        the scan). Instead it attaches a read-only *tap* to the scan's live feed,
+        so a time-trace can display the SAME samples the scan is binning.
+        """
         with self._thread_lock:
+            if self._scan_active:
+                if self._rx is None or not getattr(self._rx, 'running', False):
+                    self._scan_tap = self._scan_module.add_stream_tap()
+                    self._rx = self._scan_tap
+                self._pending = np.empty(0, dtype=np.float64)
+                self._total_samples_acquired = 0
+                self._last_gap_reported = 0
+                self._running = True
+                if self.module_state() != 'locked':
+                    self.module_state.lock()
+                self.log.info('Time-trace attached to the running scan stream (tap, '
+                              f'input={self._current_stream_input}).')
+                return
+
             assert self.module_state() == 'idle', \
                 'Stream already running'
             assert self._streaming_mode != StreamingMode.INVALID, \
@@ -462,8 +490,21 @@ class RedPitayaDataInStream(DataInStreamInterface):
         Any samples still buffered in the receiver are drained into the local
         FIFO so a consumer can read the tail after stopping; the FIFO is cleared
         on the next ``start_stream``.
+
+        While a scan owns the stream, this only detaches the display tap -- the
+        scan's stream is left running untouched.
         """
         with self._thread_lock:
+            if self._scan_active:
+                if self._scan_tap is not None:
+                    self._scan_module.remove_stream_tap(self._scan_tap)
+                    self._scan_tap = None
+                self._rx = None
+                self._running = False
+                if self.module_state() == 'locked':
+                    self.module_state.unlock()
+                self.log.info('Time-trace detached from scan stream (scan continues).')
+                return
             self._do_stop()
 
     def _do_stop(self) -> None:
@@ -494,6 +535,134 @@ class RedPitayaDataInStream(DataInStreamInterface):
         finally:
             if self.module_state() == 'locked':
                 self.module_state.unlock()
+
+    # ----- KDC_HW_SYNC stream handover ------------------------------------------
+    # The Red Pitaya streams ONE quantity at a time (single data3 ring, single
+    # free-running sample counter selected by input_select). A marker-mode motor
+    # scan therefore cannot run a *second* stream alongside this monitor stream --
+    # doing so resets the shared sample counter under the monitor and corrupts both
+    # (the bug that OOM'd the GUI). Instead the scan asks this single owner to hand
+    # the stream over: the scan becomes the sole socket reader in marker mode, and
+    # this module switches its own read path to a non-stealing *tap* on the scan's
+    # feed -- so a live time-trace keeps showing the SAME samples the scan is
+    # binning, with no second stream. end_scan_stream() restores the standalone
+    # monitor. The FPGA frequency lock is unaffected throughout (it runs in
+    # hardware and does not depend on the stream).
+
+    def get_scan_module(self):
+        """Return the shared pyrpl scan module (for marker register reads etc.)."""
+        return self._scan_module
+
+    @property
+    def scan_active(self) -> bool:
+        """True while a KDC_HW_SYNC scan owns the stream (monitor reads via a tap)."""
+        return self._scan_active
+
+    def begin_scan_stream(self, input_source='ftw_corr', ring_bytes=0, coalesce_us=0):
+        """Hand the single board stream to a marker-mode (MODE 3) motor scan.
+
+        The scan becomes the sole socket reader (marker mode) on ``input_source``.
+        If a monitor stream (time-series / ODMR tracking) was running, this module
+        seamlessly switches its read path to a tap on the scan's feed so the display
+        continues uninterrupted. Returns the pyrpl scan module. Pair with
+        end_scan_stream().
+        """
+        with self._thread_lock:
+            if self._scan_module is None:
+                raise RuntimeError('redpitaya_stream not activated; no scan module available')
+            if input_source not in ('demod', 'ftw_corr'):
+                self.log.warning("Scan stream input '%s' invalid; using 'ftw_corr'.",
+                                 input_source)
+                input_source = 'ftw_corr'
+            # Remember whether a monitor was displaying, so we can restore a
+            # standalone monitor stream afterwards.
+            was_running = bool(self._running)
+            self._scan_resume = was_running
+            self._scan_resume_input = self._current_stream_input
+            # Stop the monitor's OWN receiver (the scan will own the single socket);
+            # keep module_state as-is -- we re-point _rx at the scan's tap below so a
+            # running display does not skip a beat.
+            if was_running:
+                try:
+                    self._scan_module.push_stream_stop()
+                except Exception as e:  # noqa: BLE001
+                    self.log.warning('Error stopping monitor receiver for handover: %s', e)
+                self._rx = None
+            # Start marker-mode streaming on the requested quantity. The scan reads
+            # samples + markers from the same pyrpl scan module; we read a tap.
+            try:
+                self._current_stream_input = input_source
+                self._scan_module.input_select = input_source
+                self._scan_module.mapped_stream_start(
+                    input_source=input_source,
+                    ring_bytes=int(ring_bytes) if ring_bytes else int(self._stream_ring_bytes),
+                    coalesce_us=int(coalesce_us) if coalesce_us else int(self._stream_coalesce_us))
+            except Exception:
+                # Don't leave the monitor stranded if the scan stream fails to start.
+                self._scan_active = False
+                if was_running:
+                    try:
+                        self._current_stream_input = self._scan_resume_input
+                        if self.module_state() == 'locked':
+                            self.module_state.unlock()
+                        self._running = False
+                        self.start_stream()
+                        self.log.info('KDC_HW_SYNC: scan stream failed to start; '
+                                      'restored the monitor stream.')
+                    except Exception as e2:  # noqa: BLE001
+                        self.log.error('KDC_HW_SYNC: scan stream failed AND monitor '
+                                       'restore failed: %s', e2)
+                self._scan_resume = False
+                raise
+            self._scan_active = True
+            # If a display was running, attach a tap so it keeps reading seamlessly.
+            if was_running:
+                self._scan_tap = self._scan_module.add_stream_tap()
+                self._rx = self._scan_tap
+                self._pending = np.empty(0, dtype=np.float64)
+                self._total_samples_acquired = 0
+                self._last_gap_reported = 0
+                self._running = True
+            self.log.info("KDC_HW_SYNC scan now owns the push stream (marker mode, "
+                          "input='%s'%s).", input_source,
+                          '; time-trace tapped' if was_running else '')
+            return self._scan_module
+
+    def end_scan_stream(self):
+        """Stop the scan's marker stream and restore the standalone monitor stream."""
+        with self._thread_lock:
+            if not self._scan_active:
+                return
+            self._scan_active = False
+            # Was a display reading the scan's tap? (either resumed monitor or a
+            # time-trace started during the scan)
+            display_active = bool(self._running)
+            resume_input = self._scan_resume_input if self._scan_resume else self._current_stream_input
+            # Drop the tap and the scan's marker stream.
+            if self._scan_tap is not None:
+                try:
+                    self._scan_module.remove_stream_tap(self._scan_tap)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._scan_tap = None
+            self._rx = None
+            self._running = False
+            if self.module_state() == 'locked':
+                self.module_state.unlock()
+            try:
+                self._scan_module.mapped_stream_stop()
+            except Exception as e:  # noqa: BLE001
+                self.log.warning('Error stopping KDC_HW_SYNC scan stream: %s', e)
+            # Restore a standalone monitor stream if anything was (or should be) shown.
+            if self._scan_resume or display_active:
+                try:
+                    self._current_stream_input = resume_input
+                    self.start_stream()  # _scan_active is False -> real start
+                    self.log.info("KDC_HW_SYNC: restored monitor stream (input='%s').",
+                                  self._current_stream_input)
+                except Exception as e:  # noqa: BLE001
+                    self.log.error('Failed to restore monitor stream after scan: %s', e)
+            self._scan_resume = False
 
     def _drain_rx(self):
         """Pull all samples the receiver has buffered, calibrate them, and append
