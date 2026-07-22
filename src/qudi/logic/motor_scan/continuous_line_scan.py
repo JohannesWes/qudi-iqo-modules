@@ -70,9 +70,10 @@ class ContinuousLineScanMixin:
         if self._scan_data is None:
             return False
         
-        # Only use for CONTINUOUS_* modes, POSITION_ONLY, and KDC_HW_SYNC
+        # Only use for CONTINUOUS_* modes, POSITION_ONLY, and KDC_HW_SYNC*
         if self._scan_data.scan_mode not in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK,
-                                             ScanMode.POSITION_ONLY, ScanMode.KDC_HW_SYNC):
+                                             ScanMode.POSITION_ONLY, ScanMode.KDC_HW_SYNC,
+                                             ScanMode.KDC_HW_SYNC_MULTIRES):
             return False
         
         # Check if continuous line mode is enabled
@@ -94,7 +95,7 @@ class ContinuousLineScanMixin:
                 return
             
             self._current_line_index = line_index
-            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+            if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
                 # Fast-axis endpoints over-travel half a bin past the outer bin
                 # boundaries so the stage crosses every boundary (all ppl+1 pulses).
                 start_pos, end_pos = self._hw_sync_line_endpoints(line_index)
@@ -172,7 +173,7 @@ class ContinuousLineScanMixin:
                     if motor is not None:
                         motor.abort()
                         self._line_pause_position = motor.get_pos()
-                    if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                    if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
                         # Continuous hardware-marker capture can't be cleanly resumed
                         # mid-line; re-scan the whole current line on resume (its grid
                         # row is overwritten when the line completes).
@@ -197,7 +198,7 @@ class ContinuousLineScanMixin:
             # preserves the absolute sample count, so the demod array index stays
             # exactly aligned with the FPGA marker sample indices regardless of when
             # we drain.
-            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+            if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
                 self._hw_sync_drain()
 
             if hasattr(self, '_waiting_for_line_start') and self._waiting_for_line_start:
@@ -286,7 +287,7 @@ class ContinuousLineScanMixin:
                 self._waiting_for_line_end = True
 
                 self._line_data_start_time = time.time()
-                if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
                     # Hardware data path: configure this line's fast-axis trigger and
                     # reset the per-line x-marker baseline. No software sampling.
                     self._hw_sync_line_start(self._current_line_index)
@@ -335,7 +336,7 @@ class ContinuousLineScanMixin:
                 # Line complete - stop sampling and bin data
                 self._waiting_for_line_end = False
 
-                if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
                     # Hardware data path: final drain + reconstruct this line's grid
                     # row from the x-markers captured during the sweep.
                     self._hw_sync_line_finish(self._current_line_index)
@@ -403,7 +404,7 @@ class ContinuousLineScanMixin:
 
             self._line_paused_mid_scan = False
 
-            if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC and self._hw_line_restart_on_resume:
+            if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES) and self._hw_line_restart_on_resume:
                 # Re-scan the whole current line from its start (markers/demod keep
                 # streaming; the per-line baseline reset in _hw_sync_line_start
                 # discards the abandoned partial line's markers).

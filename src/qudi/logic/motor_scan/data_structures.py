@@ -23,6 +23,11 @@ class ScanMode(Enum):
     KDC_HW_SYNC = 4           # Motors move continuously; KDC101 position-step triggers
                               # bin the FPGA demod stream in hardware (exact sync).
                               # See pyrpl docs/developer_guide/motor_position_sync_scan.md
+    KDC_HW_SYNC_MULTIRES = 5  # As KDC_HW_SYNC, but the FPGA runs multi-resonance LO
+                              # hopping and the self-describing MARKED stream, so each
+                              # spatial bin gets BOTH resonances' error + correction
+                              # (4 maps). x/y markers ride the free marker banks (the
+                              # resonance label is inline in the demod ring).
 
 
 class ScanPattern(Enum):
@@ -259,7 +264,7 @@ class MotorScanData:
             shape_2d = (self.scan_resolution[0],)
         
         if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.CONTINUOUS_FREQ_TRACK,
-                               ScanMode.KDC_HW_SYNC):
+                               ScanMode.KDC_HW_SYNC, ScanMode.KDC_HW_SYNC_MULTIRES):
             self.stream_data_mean = {}
             self.stream_data_raw = {}
             if channel_names:
@@ -466,7 +471,8 @@ class MotorScanData:
             result['actual_positions'] = self.actual_positions.tolist()
             
         # Mode-specific data
-        if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
+        if self.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC,
+                              ScanMode.KDC_HW_SYNC_MULTIRES):
             if self.stream_data_mean:
                 result['stream_data_mean'] = {
                     k: v.tolist() for k, v in self.stream_data_mean.items()
@@ -522,7 +528,8 @@ class MotorScanData:
             instance.actual_positions = np.array(data['actual_positions'])
             
         # Mode-specific restoration
-        if mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
+        if mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC,
+                    ScanMode.KDC_HW_SYNC_MULTIRES):
             if 'stream_data_mean' in data:
                 instance.stream_data_mean = {
                     k: np.array(v) for k, v in data['stream_data_mean'].items()

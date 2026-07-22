@@ -34,11 +34,47 @@ See pyrpl ``docs/developer_guide/motor_position_sync_scan.md`` for the full desi
 and the FPGA/register details.
 """
 
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 
 import numpy as np
 
 from .data_structures import ScanMode
+
+
+# ---------------------------------------------------------------------------
+# Multi-resonance (KDC_HW_SYNC_MULTIRES) channel convention
+# ---------------------------------------------------------------------------
+# Per resonance we bin BOTH the demod error and the frequency correction, so the
+# 2D maps are named res{k}_err / res{k}_corr. The GUI derives difference/sum of
+# the corrections from these at display time.
+MULTIRES_QUANTITIES = ('err', 'corr')
+
+
+def multires_channel_names(nslots: int) -> List[str]:
+    """Canonical channel names for an N-resonance mapped scan (res0_err, res0_corr,
+    res1_err, ...). Order is (resonance-major, quantity-minor)."""
+    names = []
+    for k in range(int(nslots)):
+        for q in MULTIRES_QUANTITIES:
+            names.append(f'res{k}_{q}')
+    return names
+
+
+def _multires_trace_for_channel(traces: Dict[str, Any], channel: str) -> Optional[np.ndarray]:
+    """Return the 1-D fresh-only trace for a res{k}_{err|corr} channel, or None."""
+    try:
+        res_str, quantity = channel.split('_', 1)
+        k = int(res_str[3:])  # strip 'res'
+    except (ValueError, IndexError):
+        return None
+    key = 'err' if quantity == 'err' else 'corr_hz'
+    arr = traces.get(key)
+    if arr is None:
+        return None
+    arr = np.asarray(arr)
+    if arr.ndim != 2 or not (0 <= k < arr.shape[0]):
+        return None
+    return arr[k]
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +248,63 @@ def reconstruct_hw_sync_scan(scan_data,
     return diag
 
 
+def reconstruct_hw_sync_multires_line(scan_data,
+                                      traces: Dict[str, Any],
+                                      line_x_markers: np.ndarray,
+                                      line_index: int,
+                                      nslots: int,
+                                      reducer: Callable[[np.ndarray], float] = np.nanmean,
+                                      store_raw: bool = True,
+                                      logger=None) -> Dict[str, Any]:
+    """Bin one line for ALL res{k}_{err,corr} channels from reconstructed traces.
+
+    ``traces`` is the fresh-only per-resonance reconstruction
+    (``{'err': (N,T), 'corr_hz': (N,T)}``) whose sample axis (0..T-1) is the same
+    triplet axis the (triplet-index) x-markers address. Reuses the single-channel
+    binner per channel so the marker/bin/snake logic stays in one place; the
+    warning is logged once (channel 0) to avoid 2N-fold spam.
+    """
+    channels = multires_channel_names(nslots)
+    diag = {'line': line_index, 'channels': channels}
+    for i, ch in enumerate(channels):
+        trace = _multires_trace_for_channel(traces, ch)
+        if trace is None:
+            continue
+        d = reconstruct_hw_sync_line(
+            scan_data, trace, line_x_markers, line_index, channel=ch,
+            reducer=reducer, store_raw=store_raw,
+            logger=logger if i == 0 else None)
+        if i == 0:
+            diag.update({k: d[k] for k in ('n_x_markers', 'n_bins',
+                                           'expected_bins', 'warning')})
+    return diag
+
+
+def reconstruct_hw_sync_multires_scan(scan_data,
+                                      traces: Dict[str, Any],
+                                      x_markers: np.ndarray,
+                                      y_markers: Optional[np.ndarray],
+                                      nslots: int,
+                                      reducer: Callable[[np.ndarray], float] = np.nanmean,
+                                      store_raw: bool = True,
+                                      logger=None) -> Dict[str, Any]:
+    """Whole-scan re-bin of ALL res{k}_{err,corr} channels (offline / finalize)."""
+    channels = multires_channel_names(nslots)
+    diag = {'channels': channels}
+    for i, ch in enumerate(channels):
+        trace = _multires_trace_for_channel(traces, ch)
+        if trace is None:
+            continue
+        d = reconstruct_hw_sync_scan(
+            scan_data, trace, x_markers, y_markers=y_markers, channel=ch,
+            reducer=reducer, store_raw=store_raw,
+            logger=logger if i == 0 else None)
+        if i == 0:
+            diag.update({k: d.get(k) for k in ('n_lines', 'points_per_line',
+                                               'lines', 'n_warnings')})
+    return diag
+
+
 # ---------------------------------------------------------------------------
 # Non-blocking orchestration mixin
 # ---------------------------------------------------------------------------
@@ -248,6 +341,11 @@ class HwSyncScanMixin:
         self._scan_module = None
         self._pyrpl = None
         self._scan_via_streamer = False     # True if scan module came from redpitaya_stream
+        # Multi-resonance (KDC_HW_SYNC_MULTIRES) state: the tracker owns the stream,
+        # we drain raw triplet WORDS (reconstructed on the PC into 2N fresh-only
+        # traces) instead of a single demod array.
+        self._hw_word_chunks = []           # list[np.ndarray] - raw triplet words
+        self._hw_multires_nslots = 0        # resonance count for the active mapped scan
         self._hw_demod_chunks = []          # list[np.ndarray] - continuous demod
         self._hw_xmarks_flat = np.empty(0, dtype=np.int64)  # absolute x-marker indices
         self._hw_ymarks_flat = np.empty(0, dtype=np.int64)  # absolute y-marker indices (diagnostic)
@@ -374,6 +472,295 @@ class HwSyncScanMixin:
         self._scan_module = None
         self._pyrpl = None
 
+    # ---- multi-resonance (KDC_HW_SYNC_MULTIRES) data path -----------------------
+    # The multi-resonance tracker (redpitaya_odmr_lock, MultiResonanceTrackingInterface)
+    # owns the continuous LO-hop loop + self-describing MARKED stream. A mapped 2D scan
+    # keeps ALL the shared geometry/motion/trigger logic below and only swaps the data
+    # source: instead of the scan module's single demod stream we (a) ask the tracker
+    # to add x/y markers (which restarts + resets its stream for clean alignment), and
+    # (b) drain raw triplet WORDS + markers through the tracker, reconstructing 2N
+    # fresh-only per-resonance traces on the PC and binning each into its own map.
+    def _hw_sync_is_multires(self) -> bool:
+        sd = getattr(self, '_scan_data', None)
+        return sd is not None and sd.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES
+
+    def _get_multi_track_hw(self):
+        """The connected MultiResonanceTrackingInterface hardware, or None."""
+        conn = getattr(self, '_multi_track_hw', None)
+        if conn is None:
+            return None
+        try:
+            return conn()
+        except Exception:
+            return None
+
+    def _hw_sync_multires_setup(self) -> bool:
+        """Setup for KDC_HW_SYNC_MULTIRES: verify the trace stream is live, add x/y
+        markers, configure the slow-axis trigger, and warm up.
+
+        The FPGA lock is intentionally not required: with it enabled the correction
+        maps are closed-loop data; with it disabled the same path provides open-loop
+        demod-error maps (and normally zero correction maps).
+        """
+        sd = self._scan_data
+        motor = self._motor_hardware()
+        hw = self._get_multi_track_hw()
+        if sd is None or motor is None or hw is None:
+            self.log.error("KDC_HW_SYNC_MULTIRES setup failed: missing scan_data / "
+                           "motor / multi_track_hw connector. Connect the multi-"
+                           "resonance tracking hardware and start its stream first.")
+            return False
+        if not getattr(hw, 'nslots', 0):
+            self.log.error("KDC_HW_SYNC_MULTIRES: multi_track_hw reports 0 slots.")
+            return False
+        if not bool(getattr(hw, 'trace_stream_active', False)):
+            self.log.error(
+                "KDC_HW_SYNC_MULTIRES needs the multi-resonance trace stream. In the "
+                "Multi-Resonance ODMR Tracking GUI, configure tracking and click "
+                "Start Stream. Start Tracking is optional (lock-on and open-loop "
+                "motor scans are both supported).")
+            return False
+        self._hw_multires_nslots = int(hw.nslots)
+
+        # reset drain buffers
+        self._hw_word_chunks = []
+        self._hw_xmarks_flat = np.empty(0, dtype=np.int64)
+        self._hw_ymarks_flat = np.empty(0, dtype=np.int64)
+        self._hw_line_xmark_start = 0
+        self._hw_line_restart_on_resume = False
+        self._hw_line_y_actual = []
+        self._hw_line_y_target = []
+        self._hw_sync_clamp_warned = False
+        self._hw_empty_line_streak = 0
+        self._hw_empty_line_total = 0
+
+        # Add x/y position markers to the tracker's running MARKED stream. This
+        # restarts + resets the stream (word 0 aligns with marker 0) but leaves the
+        # hop loop + per-slot lock running. Do this before configuring motor outputs,
+        # so a stream race/failure cannot leave a KDC trigger armed after setup aborts.
+        try:
+            hw.enable_position_markers(True)
+        except Exception as e:
+            self.log.error("Failed to enable multi-resonance position markers: %s", e)
+            return False
+        if not bool(getattr(hw, 'position_markers_active', True)):
+            self.log.error("Multi-resonance hardware did not enter position-marker mode.")
+            return False
+
+        # slow-axis 'In Motion' line-boundary trigger (identical to single-res)
+        n_lines = sd.get_num_lines()
+        if n_lines > 1:
+            slow = sd.get_slow_axis()
+            try:
+                motor.setup_motion_trigger(
+                    slow, trig_port=self._hw_sync_trig_port_num(), polarity='high')
+                self.log.info("KDC_HW_SYNC_MULTIRES slow-axis (%s) trigger: 'In Motion'.",
+                              slow)
+            except Exception as e:
+                self.log.warning("Could not configure slow-axis 'In Motion' trigger: %s", e)
+
+        self._hw_sync_active = True
+        self.log.info("KDC_HW_SYNC_MULTIRES marker stream started (N=%d, channels=%s).",
+                      self._hw_multires_nslots,
+                      multires_channel_names(self._hw_multires_nslots))
+        self._hw_sync_warmup_sweep()
+        return True
+
+    def _hw_sync_multires_drain(self):
+        """Drain new triplet words + x/y markers from the tracker."""
+        hw = self._get_multi_track_hw()
+        if hw is None:
+            return
+        try:
+            w = hw.read_stream_words()
+            if w is not None and len(w):
+                self._hw_word_chunks.append(np.asarray(w, dtype=np.float64))
+            xm, ym = hw.read_position_markers()
+            if xm is not None and len(xm):
+                self._hw_xmarks_flat = np.concatenate(
+                    [self._hw_xmarks_flat, np.asarray(xm, dtype=np.int64)])
+            if ym is not None and len(ym):
+                self._hw_ymarks_flat = np.concatenate(
+                    [self._hw_ymarks_flat, np.asarray(ym, dtype=np.int64)])
+        except Exception as e:
+            self.log.warning("KDC_HW_SYNC_MULTIRES drain error: %s", e)
+
+    def _hw_sync_multires_traces(self, w_lo: Optional[int] = None,
+                                 w_hi: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Reconstruct accumulated words into fresh-only per-resonance traces.
+
+        If ``w_lo``/``w_hi`` (triplet indices) are given, only that word window
+        ``[3*w_lo, 3*w_hi)`` is decoded (cheap, for the live per-line map); the
+        returned traces are then indexed from 0 at ``w_lo``. Marked-series is
+        fresh-only and per-sample self-labelled, so slicing the words is exact.
+        """
+        hw = self._get_multi_track_hw()
+        if hw is None or not self._hw_word_chunks:
+            return None
+        words = np.concatenate(self._hw_word_chunks)
+        if w_lo is not None:
+            a = max(0, 3 * int(w_lo))
+            b = words.size if w_hi is None else min(words.size, 3 * int(w_hi))
+            if b <= a:
+                return None
+            words = words[a:b]
+        try:
+            return hw.reconstruct_mapped_traces(words)
+        except Exception as e:
+            self.log.warning("KDC_HW_SYNC_MULTIRES reconstruct failed: %s", e)
+            return None
+
+    def _hw_sync_multires_line_finish(self, line_index: int) -> Dict[str, Any]:
+        """Final drain + reconstruct + bin this line for all 2N channels."""
+        self._hw_sync_multires_drain()
+        line_xm = self._hw_bin_marks()[self._hw_line_xmark_start:]
+
+        # hardware y-anchor clamp (identical policy to single-res)
+        line_marks = self._hw_line_marks()
+        y_anchor = int(line_marks[-1]) if line_marks.size else None
+        if y_anchor is not None and line_xm.size and int(line_xm[0]) < y_anchor:
+            n_leak = int(np.sum(line_xm < y_anchor))
+            self.log.warning(
+                "KDC_HW_SYNC_MULTIRES line %d: %d x-marker(s) precede the hardware "
+                "y-row crossing (sample %d); clamping.", line_index, n_leak, y_anchor)
+            line_xm = line_xm[line_xm >= y_anchor]
+
+        ppl = self._scan_data.get_points_per_line()
+        if line_xm.size > ppl + 1:
+            line_xm = line_xm[-(ppl + 1):]
+
+        # Reconstruct ONLY this line's word window (cheap), then bin with markers
+        # rebased to the window origin. Full-scan re-bin happens once at finalize.
+        traces = None
+        if line_xm.size >= 2:
+            w_lo = int(line_xm[0])
+            traces = self._hw_sync_multires_traces(w_lo=w_lo, w_hi=int(line_xm[-1]) + 1)
+            line_xm = line_xm - w_lo
+        if traces is None:
+            self.log.warning("KDC_HW_SYNC_MULTIRES line %d: no traces yet; skipping.",
+                             line_index)
+            self._hw_empty_line_streak = getattr(self, '_hw_empty_line_streak', 0) + 1
+            self._hw_empty_line_total = getattr(self, '_hw_empty_line_total', 0) + 1
+            return {'line': line_index, 'n_bins': 0}
+        diag = reconstruct_hw_sync_multires_line(
+            self._scan_data, traces, line_xm, line_index, self._hw_multires_nslots,
+            store_raw=bool(getattr(self, '_save_full_traces', False)), logger=self.log)
+        diag['y_anchor'] = y_anchor
+        self.log.info("KDC_HW_SYNC_MULTIRES line %d: %d x-markers -> %d/%d bins "
+                      "(y-anchor=%s)%s.", line_index, diag.get('n_x_markers', 0),
+                      diag.get('n_bins', 0), diag.get('expected_bins', ppl), y_anchor,
+                      ' (WARN)' if diag.get('warning') else '')
+        fast = self._scan_data.get_fast_axis()
+        dio = 'DIO5_P' if fast == 'x' else 'DIO6_P'
+        if diag.get('n_bins', 0) == 0:
+            self._hw_empty_line_streak = getattr(self, '_hw_empty_line_streak', 0) + 1
+            self._hw_empty_line_total = getattr(self, '_hw_empty_line_total', 0) + 1
+            self.log.error("KDC_HW_SYNC_MULTIRES line %d EMPTY: 0 fast-axis (%s) pulses "
+                           "-> no data (check %s TRIG path). %d in a row.",
+                           line_index, fast, dio, self._hw_empty_line_streak)
+        else:
+            self._hw_empty_line_streak = 0
+        return diag
+
+    def _hw_sync_multires_finalize(self) -> Dict[str, Any]:
+        """Whole-scan hardware re-bin of all 2N channels (both axes hw-anchored)."""
+        sd = self._scan_data
+        if sd is None:
+            return {}
+        traces = self._hw_sync_multires_traces()
+        xm = np.asarray(self._hw_bin_marks(), dtype=np.int64)
+        ym = np.asarray(self._hw_line_marks(), dtype=np.int64)
+        n_lines = sd.get_num_lines()
+        # stash faithful hardware dataset for offline re-binning / saving
+        try:
+            words = (np.concatenate(self._hw_word_chunks)
+                     if self._hw_word_chunks else np.empty(0, dtype=np.float64))
+            sd.hw_stream_words = words
+            sd.hw_x_markers = xm
+            sd.hw_y_markers = ym
+            sd.hw_multires_nslots = self._hw_multires_nslots
+            sd.hw_y_positions_actual = np.asarray(self._hw_line_y_actual, dtype=float)
+            sd.hw_y_positions_target = np.asarray(self._hw_line_y_target, dtype=float)
+        except Exception as e:
+            self.log.warning("Could not stash multires hw-sync raw trace: %s", e)
+
+        if traces is None:
+            self.log.warning("KDC_HW_SYNC_MULTIRES finalize: no reconstructed traces; "
+                             "keeping the live per-line map.")
+            return {'applied': False}
+
+        # Snapshot the N-specific reconstruction at scan finalization. Saving may
+        # happen later, after the tracking GUI has been reconfigured to a different
+        # slot count; the saved time/error/correction traces must still describe this
+        # scan rather than the hardware's later configuration.
+        if bool(getattr(self, '_save_full_traces', False)):
+            try:
+                sd.hw_multires_times = np.asarray(traces['times'], dtype=np.float64)
+                sd.hw_multires_err = np.asarray(traces['err'], dtype=np.float64)
+                sd.hw_multires_corr_hz = np.asarray(traces['corr_hz'], dtype=np.float64)
+                sd.hw_multires_sample_rate = float(traces['sample_rate'])
+            except Exception as e:
+                self.log.warning("Could not snapshot multi-resonance trace/time data: %s", e)
+
+        # y-marker spread sanity (identical policy to single-res)
+        need_y = max(0, n_lines - 1)
+        n_total = int(np.asarray(traces.get('err')).shape[1]) if traces.get('err') is not None else 0
+        ym_sorted = np.sort(ym)
+        y_spread_ok = (n_lines <= 1) or (
+            ym_sorted.size >= need_y and n_total > 0 and
+            int(ym_sorted[-1]) >= 0.5 * n_total)
+        if not y_spread_ok:
+            self.log.warning("KDC_HW_SYNC_MULTIRES: y-markers unusable as line "
+                             "delimiters (%d for %d lines); keeping the live map.",
+                             int(ym.size), n_lines)
+            return {'y_markers': int(ym.size), 'y_hardware_complete': False,
+                    'applied': False}
+
+        snap = None
+        if sd.stream_data_mean is not None:
+            snap = {k: np.array(v, copy=True) for k, v in sd.stream_data_mean.items()}
+        diag = reconstruct_hw_sync_multires_scan(
+            sd, traces, xm, y_markers=ym, nslots=self._hw_multires_nslots,
+            store_raw=bool(getattr(self, '_save_full_traces', False)), logger=self.log)
+        empty_lines = sum(1 for l in diag.get('lines', []) if l['n_bins'] == 0)
+        if empty_lines > 0 and snap is not None:
+            for k, v in snap.items():
+                sd.stream_data_mean[k] = v
+            self.log.warning("KDC_HW_SYNC_MULTIRES: hardware re-bin produced %d empty "
+                             "line(s); reverted to the live map.", empty_lines)
+            return {'applied': False, 'empty_lines': empty_lines}
+        diag['applied'] = True
+        diag['y_hardware_complete'] = True
+        self.log.info("KDC_HW_SYNC_MULTIRES finalize: re-binned %d channels over "
+                      "%d samples / %d x-markers / %d y-markers.",
+                      len(diag.get('channels', [])), n_total, int(xm.size), int(ym.size))
+        return diag
+
+    def _hw_sync_multires_teardown(self):
+        """Stop x/y markers and disable KDC triggers, leaving stream/lock as found."""
+        if not getattr(self, '_hw_sync_active', False):
+            return
+        self._hw_sync_active = False
+        hw = self._get_multi_track_hw()
+        if hw is not None:
+            try:
+                hw.enable_position_markers(False)
+            except Exception as e:
+                self.log.warning("Error disabling multires position markers: %s", e)
+        motor = self._motor_hardware()
+        if motor is not None:
+            sd = self._scan_data
+            axes = set()
+            if sd is not None:
+                axes.add(sd.get_fast_axis())
+                axes.add(sd.get_slow_axis())
+            for ax in axes:
+                try:
+                    motor.disable_position_trigger(ax, trig_port=self._hw_sync_trig_port_num())
+                except Exception:
+                    pass
+        self.log.debug("KDC_HW_SYNC_MULTIRES teardown complete (stream/lock left running).")
+
     # ---- geometry --------------------------------------------------------------
     def _hw_sync_fast_axis_limits(self):
         """(pos_min, pos_max) travel limits [m] for the fast axis, or None."""
@@ -447,6 +834,8 @@ class HwSyncScanMixin:
     def _hw_sync_scan_setup(self) -> bool:
         """Acquire the scan module, configure the slow-axis trigger, and start the
         FPGA marker stream. Returns True on success."""
+        if self._hw_sync_is_multires():
+            return self._hw_sync_multires_setup()
         sd = self._scan_data
         motor = self._motor_hardware()
         scan = self._get_scan_module()
@@ -644,6 +1033,8 @@ class HwSyncScanMixin:
 
     def _hw_sync_drain(self):
         """Pull new demod samples + markers from the FPGA into the buffers."""
+        if self._hw_sync_is_multires():
+            return self._hw_sync_multires_drain()
         scan = self._scan_module
         if scan is None:
             return
@@ -704,6 +1095,8 @@ class HwSyncScanMixin:
         y-pulse, not to the software move sequencing -- the inter-line/return move
         cannot leak a bin into the wrong row even if the USB idle detection is late.
         """
+        if self._hw_sync_is_multires():
+            return self._hw_sync_multires_line_finish(line_index)
         self._hw_sync_drain()
         demod = np.concatenate(self._hw_demod_chunks) if self._hw_demod_chunks else np.empty(0)
         line_xm = self._hw_bin_marks()[self._hw_line_xmark_start:]
@@ -779,6 +1172,8 @@ class HwSyncScanMixin:
         Logs explicitly whether every line boundary came from a hardware y-pulse
         (full both-axis guarantee) or whether any had to be inferred.
         """
+        if self._hw_sync_is_multires():
+            return self._hw_sync_multires_finalize()
         sd = self._scan_data
         if sd is None:
             return {}
@@ -879,6 +1274,8 @@ class HwSyncScanMixin:
 
     def _hw_sync_scan_teardown(self):
         """Stop the FPGA stream and disable the KDC triggers (idempotent)."""
+        if self._hw_sync_is_multires():
+            return self._hw_sync_multires_teardown()
         if not getattr(self, '_hw_sync_active', False):
             return
         self._hw_sync_active = False

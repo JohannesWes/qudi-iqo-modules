@@ -154,24 +154,37 @@ class DataSavingMixin:
                 
                 file_path = None
                 
-                if self._scan_data.scan_mode in (ScanMode.CONTINUOUS_STREAM, ScanMode.KDC_HW_SYNC):
-                    # Save streaming data - one file per channel
-                    # (KDC_HW_SYNC fills stream_data_mean per grid point from the
-                    # hardware-marker reconstruction, same shape as CONTINUOUS_STREAM)
+                if self._scan_data.scan_mode in (ScanMode.CONTINUOUS_STREAM,
+                                                 ScanMode.KDC_HW_SYNC,
+                                                 ScanMode.KDC_HW_SYNC_MULTIRES):
+                    # Save streaming data - one file per channel. KDC_HW_SYNC fills
+                    # stream_data_mean per grid point from the hardware-marker
+                    # reconstruction (KDC_HW_SYNC_MULTIRES: 2N channels =
+                    # res{k}_err/res{k}_corr), same shape as CONTINUOUS_STREAM.
                     if self._scan_data.stream_data_mean:
                         for channel, data in self._scan_data.stream_data_mean.items():
+                            if (channel.endswith('_corr') or
+                                    (self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC and
+                                     channel == 'ftw_corr')):
+                                unit = 'Hz'
+                            elif (self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES and
+                                  channel.endswith('_err')):
+                                unit = 'LSB'
+                            else:
+                                unit = 'V'
                             file_path, _, _ = data_storage.save_data(
                                 data,
                                 metadata=metadata,
                                 nametag=channel,
                                 timestamp=timestamp,
-                                column_headers=f'{channel} data (columns is X, rows is Y)',
+                                column_headers=(
+                                    f'{channel} data ({unit}; columns is X, rows is Y)'),
                                 use_timestamp=False
                             )
 
                             # Save thumbnail if configured
                             if self._save_thumbnails and file_path:
-                                fig = self._draw_figure(data, channel, unit='V')
+                                fig = self._draw_figure(data, channel, unit=unit)
                                 fig_path = file_path.rsplit('.', 1)[0]
                                 data_storage.save_thumbnail(fig, file_path=fig_path)
                                 plt.close(fig)
@@ -183,7 +196,8 @@ class DataSavingMixin:
                     # x/y marker indices) so every position bin keeps both its raw
                     # acquired trace and its average, and any binning is exactly
                     # reproducible offline.
-                    if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+                    if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC,
+                                                     ScanMode.KDC_HW_SYNC_MULTIRES):
                         try:
                             self._save_hw_sync_raw(scan_folder)
                         except Exception as e:
@@ -489,7 +503,7 @@ class DataSavingMixin:
         return '\n'.join(lines)
     
     def _save_hw_sync_raw(self, scan_folder: str):
-        """Persist the KDC_HW_SYNC raw deliverables into the scan folder:
+        """Persist KDC hardware-sync raw deliverables into the scan folder.
 
           * ``hw_sync_bin_traces.npy`` -- object array indexed by flat point index;
             each entry is that position bin's CUT demod time-trace (float32). The
@@ -525,7 +539,63 @@ class DataSavingMixin:
                           "markers + per-line y only (no per-bin traces / demod trace).")
             return
 
-        # Full per-bin CUT time-traces + the compact faithful demod trace.
+        # Multi-resonance mode has one cut trace per resonance/quantity plus the
+        # faithful self-describing triplet stream. Keep all of them: selecting just
+        # the first channel would silently discard either correction or demod error.
+        if sd.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES:
+            saved_channels = 0
+            for ch, segments in (sd.stream_data_raw or {}).items():
+                if not segments:
+                    continue
+                traces = np.array(
+                    [np.asarray(seg, dtype=np.float32) for seg in segments],
+                    dtype=object)
+                np.save(os.path.join(scan_folder, f'hw_sync_{ch}_bin_traces.npy'),
+                        traces, allow_pickle=True)
+                saved_channels += 1
+
+            words = np.asarray(getattr(sd, 'hw_stream_words', []), dtype=np.float64)
+            if words.size:
+                np.save(os.path.join(scan_folder, 'hw_sync_stream_words.npy'), words)
+            try:
+                times = getattr(sd, 'hw_multires_times', None)
+                err = getattr(sd, 'hw_multires_err', None)
+                corr = getattr(sd, 'hw_multires_corr_hz', None)
+                sample_rate = getattr(sd, 'hw_multires_sample_rate', None)
+                if times is None or err is None or corr is None:
+                    # Backward-compatible fallback for scan-data objects created
+                    # before finalization began snapshotting the reconstruction.
+                    hw = self._get_multi_track_hw()
+                    reconstructed = (
+                        hw.reconstruct_mapped_traces(words)
+                        if hw is not None and words.size else None)
+                    if reconstructed is not None:
+                        times = reconstructed['times']
+                        err = reconstructed['err']
+                        corr = reconstructed['corr_hz']
+                        sample_rate = reconstructed.get('sample_rate')
+                if times is not None and err is not None and corr is not None:
+                    times = np.asarray(times, dtype=np.float64)
+                    err = np.asarray(err, dtype=np.float32)
+                    corr = np.asarray(corr, dtype=np.float64)
+                    np.save(os.path.join(scan_folder, 'hw_sync_time_s.npy'), times)
+                    if sample_rate is not None:
+                        np.save(os.path.join(scan_folder, 'hw_sync_sample_rate_hz.npy'),
+                                np.asarray(float(sample_rate), dtype=np.float64))
+                    for k in range(min(err.shape[0], corr.shape[0])):
+                        np.save(os.path.join(scan_folder, f'hw_sync_res{k}_err_trace.npy'),
+                                err[k])
+                        np.save(os.path.join(scan_folder, f'hw_sync_res{k}_corr_hz_trace.npy'),
+                                corr[k])
+            except Exception as e:
+                self.log.warning("Could not save reconstructed multi-resonance "
+                                 "faithful traces: %s", e)
+            self.log.info("KDC_HW_SYNC_MULTIRES raw saved: %d per-channel cut-trace "
+                          "arrays + triplet stream/markers in %s",
+                          saved_channels, scan_folder)
+            return
+
+        # Single-resonance full per-bin CUT time-traces + faithful demod trace.
         n_saved = 0
         ch = None
         if sd.stream_data_raw:

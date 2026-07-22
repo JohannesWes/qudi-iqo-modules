@@ -27,6 +27,15 @@ from qudi.util.colordefs import QudiPalettePale as palette
 from qudi.util.widgets.plotting.image_widget import RubberbandZoomSelectionImageWidget
 from qudi.gui.motor_scan.pixel_odmr_widget import PixelOdmrSpectrumWidget
 
+# KDC_HW_SYNC_MULTIRES display selector: individual per-resonance correction/error
+# plus the difference/sum of the two corrections. Maps a display label to how the
+# 2D data array is built from the 4 stored channels (res{k}_err / res{k}_corr).
+MULTIRES_DISPLAY_OPTIONS = [
+    'Res0 Correction', 'Res1 Correction',
+    'Res0 Error', 'Res1 Error',
+    'Δ Correction (R1−R0)', 'Σ Correction (R0+R1)',
+]
+
 
 class MotorScanMainWindow(QtWidgets.QMainWindow):
     """Main window for Motor Scan GUI."""
@@ -124,14 +133,17 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.mode_label)
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(['STEP_ODMR', 'CONTINUOUS_STREAM', 'CONTINUOUS_FREQ_TRACK',
-                                  'POSITION_ONLY', 'KDC_HW_SYNC'])
+                                  'POSITION_ONLY', 'KDC_HW_SYNC', 'KDC_HW_SYNC_MULTIRES'])
         self.mode_combo.setToolTip(
             'STEP_ODMR: Stop at each point, take ODMR spectrum\n'
             'CONTINUOUS_STREAM: Continuous movement, stream channel data\n'
             'CONTINUOUS_FREQ_TRACK: Continuous movement, record absolute frequency from lock\n'
             'POSITION_ONLY: Move stage along pattern without data acquisition (debugging)\n'
             'KDC_HW_SYNC: Continuous movement; KDC position-step triggers bin the FPGA '
-            'demod stream in hardware (exact sync, no line shifts)'
+            'demod stream in hardware (exact sync, no line shifts)\n'
+            'KDC_HW_SYNC_MULTIRES: As KDC_HW_SYNC, but bins BOTH resonances\' error + '
+            'correction per pixel (4 maps). Configure and Start Stream in the Multi-'
+            'Resonance ODMR GUI first; Start Tracking is optional (open-loop supported).'
         )
         self.toolbar.addWidget(self.mode_combo)
         
@@ -151,10 +163,10 @@ class MotorScanMainWindow(QtWidgets.QMainWindow):
         # KDC_HW_SYNC: keep+save the full per-bin time-traces, or just the mean map.
         self.save_traces_check = QtWidgets.QCheckBox(' Save full traces ')
         self.save_traces_check.setToolTip(
-            'KDC_HW_SYNC only: if checked, the full cut time-trace of every position '
-            'bin (plus the continuous demod trace) is kept and saved. If unchecked '
-            '(default), only the per-bin MEAN map is built and saved -- lower memory '
-            'and disk. The mean map is always what is shown here.')
+            'KDC_HW_SYNC / KDC_HW_SYNC_MULTIRES: if checked, the full cut time-trace '
+            'of every position bin (for MULTIRES, per resonance and quantity) is kept '
+            'and saved. If unchecked (default), only the per-bin MEAN map is built and '
+            'saved -- lower memory and disk. The mean map is always what is shown here.')
         self.toolbar.addWidget(self.save_traces_check)
 
         self.toolbar.addSeparator()
@@ -660,6 +672,8 @@ class MotorScanGui(GuiBase):
             self._mw.display_combo.addItems(['Absolute Frequency'])
         elif mode_text == 'POSITION_ONLY':
             self._mw.display_combo.addItems(['Scan Progress'])
+        elif mode_text == 'KDC_HW_SYNC_MULTIRES':
+            self._mw.display_combo.addItems(MULTIRES_DISPLAY_OPTIONS)
         else:
             self._mw.display_combo.addItems(['Mean Value'])
 
@@ -900,6 +914,39 @@ class MotorScanGui(GuiBase):
             self._mw.lock_status_label.setText('🔓 Unlocked')
             self._mw.lock_status_label.setStyleSheet('color: orange;')
 
+    def _multires_display_array(self, scan_data, label: str):
+        """Build the (data, unit) to display for a KDC_HW_SYNC_MULTIRES channel.
+
+        Individual channels map to a stored map (res{k}_corr in Hz, res{k}_err in
+        LSB); the derived options compute the difference/sum of the two corrections.
+        Returns (None, None) if the needed channel(s) are unavailable.
+        """
+        maps = scan_data.stream_data_mean
+        if not maps:
+            return None, None
+
+        def _get(name):
+            return maps.get(name)
+
+        if label == 'Res0 Correction':
+            return _get('res0_corr'), 'Hz'
+        if label == 'Res1 Correction':
+            return _get('res1_corr'), 'Hz'
+        if label == 'Res0 Error':
+            return _get('res0_err'), ''
+        if label == 'Res1 Error':
+            return _get('res1_err'), ''
+        if label in ('Δ Correction (R1−R0)', 'Σ Correction (R0+R1)'):
+            c0, c1 = _get('res0_corr'), _get('res1_corr')
+            if c0 is None or c1 is None:
+                return None, None
+            if label.startswith('Δ'):
+                return c1 - c0, 'Hz'
+            return c0 + c1, 'Hz'
+        # Fallback: first available channel
+        first = next(iter(maps.values()), None)
+        return (first, 'Hz') if first is not None else (None, None)
+
     def _update_display(self):
         """Update the scan image display."""
         scan_data = self._logic.display_scan_data
@@ -950,6 +997,10 @@ class MotorScanGui(GuiBase):
                 data = scan_data.stream_data_mean['absolute_frequency'] / 1e9  # Hz to GHz
                 unit = 'GHz'
             else:
+                return
+        elif scan_data.scan_mode == ScanMode.KDC_HW_SYNC_MULTIRES:
+            data, unit = self._multires_display_array(scan_data, display_channel)
+            if data is None:
                 return
         else:
             # Continuous stream mode
