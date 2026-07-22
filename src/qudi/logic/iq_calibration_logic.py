@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
+ok"""
 IQ mixer calibration logic module for qudi.
 
 This module orchestrates the automated calibration of IQ mixers by:

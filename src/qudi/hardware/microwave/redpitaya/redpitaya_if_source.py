@@ -285,6 +285,71 @@ class RedPitayaIFSource(IFSourceBase):
         return (interpolated_values['g'], interpolated_values['phi'],
                 interpolated_values['I_offset'], interpolated_values['Q_offset'])
 
+    def load_cal_into_slot(self, slot: int, lo_frequency: float,
+                           frequencies: List[float], amplitudes: List[float],
+                           calibration_files: Optional[Dict[float, str]] = None) -> None:
+        """Interpolate the SSB calibration for ``lo_frequency`` and load it into the
+        FPGA cal-slot bank slot ``slot`` (multi-resonance tracking).
+
+        This is the per-slot analogue of :meth:`set_multi_frequency_signal`'s cal
+        step: it does NOT change the IF frequencies / FM / component enables (those
+        are global, set once via the normal single-LO configuration). It only writes
+        the per-LO SSB correction (amplitudes + DAC-B phase + carrier-null DC) into
+        the chosen cal slot, which the FPGA selects in lockstep with the LO hop when
+        ``fgen3.active_slot_src`` follows ``current_step``.
+
+        Args:
+            slot: cal-slot index (0..nslots-1) = resonance index.
+            lo_frequency: LO frequency (Hz) for this resonance.
+            frequencies: active IF frequencies (Hz), one per component.
+            amplitudes: per-component IF amplitudes (0..1), same length.
+            calibration_files: optional {if_freq: csv_path}; loaded if not cached.
+        """
+        if len(frequencies) != len(amplitudes):
+            raise ValueError('frequencies and amplitudes must have the same length')
+        if not (0 <= slot < self.fgen3.nslots):
+            raise ValueError(f'slot must be in 0..{self.fgen3.nslots - 1}, got {slot}')
+
+        # ensure calibration data is loaded for each IF frequency
+        for freq in frequencies:
+            if freq in self._calibration_data:
+                continue
+            cal_file = None
+            if calibration_files is None:
+                cal_file = f'calibration_redpitaya_all_results_IF_{freq / 1e6:.3f}MHz.csv'
+            elif freq in calibration_files:
+                cal_file = calibration_files[freq]
+            if cal_file:
+                try:
+                    self.load_calibration_data(freq, cal_file)
+                except Exception as e:
+                    self.logger.warning(
+                        f'Could not load calibration for {freq / 1e6:.3f} MHz: {e}')
+
+        comps = []
+        dc_offsets_i, dc_offsets_q = [], []
+        for freq, amp in zip(frequencies, amplitudes):
+            if freq not in self._calibration_data:
+                # no cal for this component: identity correction (uncalibrated)
+                comps.append((amp, amp, self._q_base_phase_deg()))
+                continue
+            g, phi, i_offset, q_offset = self._interpolate_calibration_parameters(
+                freq, lo_frequency / 1e9, amp)
+            amp_a = amp * (1 + g)
+            amp_b = amp * (1 - g)
+            phase_b = float((self._q_base_phase_deg() + np.degrees(phi)) % 360.0)
+            comps.append((amp_a, amp_b, phase_b))
+            dc_offsets_i.append(i_offset)
+            dc_offsets_q.append(q_offset)
+
+        dc_a = float(np.mean(dc_offsets_i)) if dc_offsets_i else 0.0
+        dc_b = float(np.mean(dc_offsets_q)) if dc_offsets_q else 0.0
+
+        self.fgen3.load_cal_slot(slot, comps, dc_a, dc_b)
+        self.logger.info(
+            f'Loaded SSB cal into slot {slot} for LO={lo_frequency / 1e9:.6f} GHz '
+            f'({len(comps)} comps, dc_a={dc_a:.5f}, dc_b={dc_b:.5f})')
+
     def set_fm_modulation_frequency(self, frequency: float, phase_offset: float = None) -> None:
         """
         Set the FM modulation frequency via iq0 module.
@@ -406,8 +471,8 @@ class RedPitayaIFSource(IFSourceBase):
         setattr(self.fgen3, f'amplitude_a{component_index}', config.amplitude_i)
         setattr(self.fgen3, f'amplitude_b{component_index}', config.amplitude_q)
 
-        # Set phases
-        setattr(self.fgen3, f'phase_offset_a{component_index}', config.phase_i)
+        # Set phase. I-phase (DAC A) is hardwired to 0 in the FPGA (cal-slot bank);
+        # only the DAC-B (Q) phase offset is programmable.
         setattr(self.fgen3, f'phase_offset_b{component_index}', config.phase_q)
 
         # Set FM parameters
@@ -464,10 +529,10 @@ class RedPitayaIFSource(IFSourceBase):
         phase_i = 0.0
         phase_q = float((self._q_base_phase_deg() + np.degrees(phase_imbalance)) % 360.0)
 
-        # Apply corrections
+        # Apply corrections. I-phase (DAC A) is hardwired to 0 in the FPGA cal-slot
+        # bank, so only amplitudes and the DAC-B phase offset are written.
         setattr(self.fgen3, f'amplitude_a{component_index}', amp_i)
         setattr(self.fgen3, f'amplitude_b{component_index}', amp_q)
-        setattr(self.fgen3, f'phase_offset_a{component_index}', phase_i)
         setattr(self.fgen3, f'phase_offset_b{component_index}', phase_q)
         setattr(self.fgen3, f'enable{component_index}', True)
 
@@ -490,9 +555,9 @@ class RedPitayaIFSource(IFSourceBase):
             raise RuntimeError("Red Pitaya not connected")
 
         # Set amplitude on component 0 for backward compatibility
+        # (I-phase / DAC A offset is hardwired to 0 in the FPGA cal-slot bank).
         self.fgen3.amplitude_a0 = amplitude
         self.fgen3.amplitude_b0 = amplitude
-        self.fgen3.phase_offset_a0 = 0.0
         self.fgen3.phase_offset_b0 = self._q_base_phase_deg()
         self.fgen3.enable0 = True
 
@@ -526,7 +591,7 @@ class RedPitayaIFSource(IFSourceBase):
                                    getattr(self.fgen3, f'amplitude_b{i}')) / 2,
                         amplitude_i=getattr(self.fgen3, f'amplitude_a{i}'),
                         amplitude_q=getattr(self.fgen3, f'amplitude_b{i}'),
-                        phase_i=getattr(self.fgen3, f'phase_offset_a{i}'),
+                        phase_i=0.0,  # I-phase hardwired to 0 in the FPGA cal-slot bank
                         phase_q=getattr(self.fgen3, f'phase_offset_b{i}'),
                         enabled=True,
                         fm_enabled=getattr(self.fgen3, f'fm_enable{i}', False),
@@ -577,7 +642,7 @@ class RedPitayaIFSource(IFSourceBase):
                 'frequency': getattr(self.fgen3, f'frequency{i}'),
                 'amplitude_a': getattr(self.fgen3, f'amplitude_a{i}'),
                 'amplitude_b': getattr(self.fgen3, f'amplitude_b{i}'),
-                'phase_offset_a': getattr(self.fgen3, f'phase_offset_a{i}'),
+                'phase_offset_a': 0.0,  # I-phase hardwired to 0 in the FPGA cal-slot bank
                 'phase_offset_b': getattr(self.fgen3, f'phase_offset_b{i}'),
                 'fm_enabled': getattr(self.fgen3, f'fm_enable{i}'),
                 'fm_deviation_khz': getattr(self.fgen3, f'fm_deviation_khz{i}')

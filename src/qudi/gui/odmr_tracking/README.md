@@ -367,6 +367,72 @@ which connects to the same TimeSeriesReaderLogic instance.
 - Click "Stop Stream" first, then change mode
 - Mode selection radio buttons are disabled while streaming
 
+## Multi-resonance tracking data export
+
+In `MultiResonanceOdmrTrackingGui`, the inherited **Save Measurement** action saves
+the ODMR scan and the available tracking traces under the same name tag. Tracking
+data can be saved while tracking is active or after it has been stopped.
+
+The tracking export contains simultaneous error and frequency-correction columns
+on one common elapsed-time axis. The number of columns follows the selected mode:
+
+- N=1: elapsed time, resonance 0 error, resonance 0 correction
+- N=2: elapsed time, resonance 0 error/correction, resonance 1 error/correction
+
+Two tracking products are written when high-rate streaming is enabled:
+
+- `ODMR_tracking_history.dat`: retained low-rate register-poll history, suitable
+  for long-duration drift tracking.
+- `ODMR_tracking_high_rate.npy` plus its `_metadata.txt` sidecar: the full-resolution
+  current rolling high-rate window. Load the array with `numpy.load`; column names
+  and acquisition settings are recorded in the sidecar.
+
+Low-rate elapsed time is measured from the hopping/acquisition engine start using a
+monotonic host clock. High-rate elapsed time is measured from each explicit stream
+start using the FPGA sample count and retains its stream-session offset when the
+rolling window discards old samples. Both wall-clock start references are included
+in the metadata. For readability, the live GUI rebases the newest rolling window to
+the fixed `0..Window` x-axis, like the Time Series GUI; this is display-only and does
+not alter the elapsed timestamps written to disk. In N=2
+high-rate data only one resonance is live during a hop dwell; the parked resonance is
+zero-order held on the common time grid, as recorded in the file metadata.
+
+## Independent multi-resonance lock and stream control
+
+`MultiResonanceOdmrTrackingGui` has separate **Start/Stop Tracking** and
+**Start/Stop Stream** controls after **Configure Tracking** has completed. The four
+supported operating states are:
+
+- Lock off, stream off: idle.
+- Lock on, stream off: FPGA tracking and N=2 hopping continue; only low-rate status
+  polling is collected.
+- Lock off, stream on: open-loop measurement. The oscillator and N=2 hopping run,
+  but the FPGA frequency lock is explicitly disabled. The stream carries the
+  demodulated error and correction fields on the same time grid; after a fresh
+  open-loop start, the cleared/disabled correction is normally zero.
+- Lock on, stream on: closed-loop high-rate error and correction acquisition.
+
+Starting or stopping either control does not change the other. In particular,
+stopping the stream does not stop the N=2 hop FSM while tracking remains enabled,
+and disabling tracking leaves an active open-loop stream running.
+
+### Motor-scan integration
+
+`KDC_HW_SYNC_MULTIRES` consumes the same simultaneous error/correction stream and
+temporarily adds encoder-position markers to it. Configure tracking and click
+**Start Stream** before starting this motor-scan mode. **Start Tracking** is optional:
+
+- tracking + streaming produces closed-loop error and correction maps;
+- streaming alone produces an open-loop error map and a normally zero correction map.
+
+The motor scan refuses to start without the stream instead of creating empty maps.
+While it owns the position-marker stream, **Stop Stream** is rejected; stopping the
+motor scan restores the ordinary unmarked stream and leaves the pre-existing lock
+and stream states running. For N resonances, both `res{k}_err` (LSB) and
+`res{k}_corr` (Hz) are binned and saved. With **Save full traces** selected, the
+per-bin traces, faithful triplet stream, marker indices, reconstructed common time
+axis, and both quantities for every resonance are also saved.
+
 ## Development Status
 
 **Current Status**: ✅ **COMPLETE AND OPERATIONAL**
@@ -393,7 +459,7 @@ which connects to the same TimeSeriesReaderLogic instance.
 **Future Enhancements**:
 - [ ] Embedded time series plot in tracking GUI (optional)
 - [ ] Auto-calibration (polarity detection, slope measurement)
-- [ ] Data export (tracking history, error time series)
+- [x] Multi-resonance tracking export (simultaneous error/correction time series)
 - [ ] Advanced diagnostics (PSD, Allan variance)
 - [ ] Unit tests
 

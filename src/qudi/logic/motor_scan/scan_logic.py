@@ -89,6 +89,14 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
     # the pyrpl scan module directly (headless tests).
     _streamer = Connector(interface='DataInStreamInterface', name='streamer',
                           optional=True)
+    # Multi-resonance tracking hardware (redpitaya_odmr_lock). Required only for the
+    # KDC_HW_SYNC_MULTIRES mode: the tracker owns the continuous LO-hop loop + the
+    # self-describing MARKED stream, and this logic asks it to add x/y markers and to
+    # drain/reconstruct the per-resonance traces for spatial binning. The user
+    # configures + starts the trace stream in the Multi-Resonance ODMR Tracking GUI;
+    # the FPGA lock may independently be on (closed loop) or off (open loop).
+    _multi_track_hw = Connector(interface='MultiResonanceTrackingInterface',
+                                name='multi_track_hw', optional=True)
 
     # Config options
     _default_scan_mode = ConfigOption(
@@ -832,6 +840,37 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
+            elif mode == ScanMode.KDC_HW_SYNC_MULTIRES:
+                # Needs the multi-resonance tracker (which owns the LO-hop loop + the
+                # MARKED trace stream) with STREAMING already running, and a motor
+                # driver exposing setup_position_trigger.
+                hw = self._get_multi_track_hw()
+                if hw is None:
+                    self.log.error("KDC_HW_SYNC_MULTIRES needs the 'multi_track_hw' "
+                                   "connector (multi-resonance tracking hardware).")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                if not getattr(hw, 'nslots', 0):
+                    self.log.error("KDC_HW_SYNC_MULTIRES: tracker reports 0 slots.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                if not bool(getattr(hw, 'trace_stream_active', False)):
+                    message = ('KDC_HW_SYNC_MULTIRES needs Start Stream in the '
+                               'Multi-Resonance ODMR Tracking GUI; Start Tracking '
+                               'is optional.')
+                    self.log.error(message)
+                    self.sigScanStatusMessage.emit(message)
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                if not hasattr(motor, 'setup_position_trigger'):
+                    self.log.error("Motor hardware does not support setup_position_trigger. "
+                                   "Cannot perform KDC_HW_SYNC_MULTIRES scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
 
             # Create scan configuration
             scan_axes = tuple(axes)
@@ -920,6 +959,22 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
                 # Configure the slow-axis trigger and start the FPGA marker stream.
                 if not self._hw_sync_scan_setup():
                     self.log.error("KDC_HW_SYNC stream setup failed. Aborting scan.")
+                    self._scan_state = ScanState.IDLE
+                    self.sigScanStateChanged.emit(self._scan_state)
+                    return
+                self._current_scan_folder = None
+            elif mode == ScanMode.KDC_HW_SYNC_MULTIRES:
+                # Multi-resonance mapped streaming: 2N channels (res{k}_err/res{k}_corr).
+                from .hw_sync_scan import multires_channel_names
+                hw = self._get_multi_track_hw()
+                nslots = int(getattr(hw, 'nslots', 2)) if hw is not None else 2
+                channel_names = multires_channel_names(nslots)
+                self._scan_data.initialize_data_arrays(channel_names)
+                # Add x/y markers to the running stream + slow-axis trigger.
+                if not self._hw_sync_scan_setup():
+                    self.log.error("KDC_HW_SYNC_MULTIRES setup failed. Aborting scan. "
+                                   "Configure multi-resonance tracking and click Start "
+                                   "Stream in its GUI (Start Tracking is optional).")
                     self._scan_state = ScanState.IDLE
                     self.sigScanStateChanged.emit(self._scan_state)
                     return
@@ -1273,12 +1328,14 @@ class MotorScanLogic(HwSyncScanMixin, ContinuousLineScanMixin, MotorControlMixin
         # KDC_HW_SYNC: stop the FPGA marker stream and disable the KDC triggers,
         # then re-bin the whole demod trace from the hardware markers (both axes
         # hardware-anchored) and stash the faithful raw trace+markers for saving.
-        if self._scan_data.scan_mode == ScanMode.KDC_HW_SYNC:
+        if self._scan_data.scan_mode in (ScanMode.KDC_HW_SYNC,
+                                         ScanMode.KDC_HW_SYNC_MULTIRES):
             self._hw_sync_scan_teardown()
             try:
                 self._hw_sync_finalize()
             except Exception as e:
-                self.log.error("KDC_HW_SYNC hardware finalize/re-bin failed: %s", e)
+                self.log.error("%s hardware finalize/re-bin failed: %s",
+                               self._scan_data.scan_mode.name, e)
 
         # Update scan data
         self._scan_data.completed = completed

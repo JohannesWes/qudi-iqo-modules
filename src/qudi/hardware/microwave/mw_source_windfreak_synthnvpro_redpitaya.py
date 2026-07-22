@@ -8,6 +8,15 @@ The actual output frequency depends on sideband selection:
 - Upper sideband (USB, default): RF = LO + IF
 - Lower sideband (LSB):         RF = LO - IF
 For multi-frequency excitation: RF_i = LO ± IF_i for each IF frequency
+
+Device quirks:
+    - ``Z0``: disable temperature compensation. A firmware bug otherwise forces
+    the *sweep* power back to the *CW* power every ~10 s, causing ~10 dB power
+    jumps between hops.
+    - ``Y0``: trigger polarity active-low. The Windfreak must trigger on the low edge, problems otherwise.
+    - ``f?`` (I think) f? reports the *next/pre-loaded* table point, NOT the frequency
+    currently being output. Do not use ``f?`` to verify the live output in
+    tabular trigger mode -- sometimes it lags the true output by one step - check on scope.
 """
 
 import time
@@ -118,6 +127,10 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         self._scan_sample_rate = 0.
         self._scan_step_time = 0.
         self._in_cw_mode = True
+
+        # Jump-list (tabular hop) state
+        self._list_num_points = 0
+        self._list_continuous = False  # c0 (clamp, ODMR) by default; c1 (wrap) for tracking
 
         # IF frequency for calculations (from config)
         self._if_frequency = None
@@ -654,7 +667,11 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
             # Start Windfreak scan
             if self._scan_mode == SamplingOutputMode.EQUIDISTANT_SWEEP:
                 self._windfreak_device.write('g1g0')  # Enable and reset sweep
-            # For jump list, the list is already configured and will start on trigger
+            else:
+                # Jump list: arm the table at point 0. The output then advances one
+                # table point per external trigger, wrapping after the
+                # last point (no redundant trigger -- scope-verified).
+                self.arm_list()
 
             self.module_state.lock()
             self.log.debug('Scan started')
@@ -673,10 +690,8 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
                 # Reset Windfreak sweep
                 self._windfreak_device.write('g1g0')
             else:
-                # For jump list mode
-                time.sleep(self._scan_step_time)
-                self._windfreak_device.write('X1')
-                self._windfreak_device.write('g0')
+                # Jump list: re-arm at point 0 (each subsequent trigger advances one point).
+                self.arm_list()
 
             self.log.debug('Scan reset')
 
@@ -713,39 +728,125 @@ class MicrowaveRedPitayaWindfreak(MicrowaveInterface):
         self._windfreak_device.write(f'[{self._lo_power:2.3f}')  # sweep lower power
         self._windfreak_device.write(f']{self._lo_power:2.3f}')  # sweep upper power
 
-    def _configure_windfreak_list(self, lo_frequencies, sample_rate):
-        """Configure Windfreak for jump list mode."""
-        # Set step time
+    def _configure_windfreak_list(self, lo_frequencies, sample_rate, continuous=False):
+        """Configure Windfreak for jump-list (tabular hop) mode.
+
+        First frequency convention (consistent across both modes): after ``g1g0`` the output
+        sits on table point 0; the ODMR logic issues one ``generate_pulse`` sync
+        trigger (which holds frequency 0, absorbing the device's first-jump quirk) and then
+        ``acquire_frame`` steps through points 1..N. The tracking mode instead reads
+        ``current_step`` and never relies on a fixed trigger phase.
+
+        """
+        wf = self._windfreak_device
+
+        # Step time
         step_time_ms = 1000 * 0.75 / sample_rate
-        self._windfreak_device.write(f't{step_time_ms:f}')
         self._scan_step_time = 0.75 / sample_rate
 
-        # Disable temperature compensation
-        self._windfreak_device.write('Z0')
+        wf.write('g0')                       # stop any running sweep before reprogramming
+        wf.write('Z0')                       # disable temp-comp (power-stability bug workaround)
+        wf.write(f'W{self._lo_power:2.3f}')  # base/CW power
+        wf.write(f't{step_time_ms:f}')
 
-        # Configure for tabular sweep
-        self._windfreak_device.write('c0')  # non-continuous
-        self._windfreak_device.write('X1')  # tabular sweep mode
-        self._windfreak_device.write('y2')  # trigger mode: single step
-
-        # Delete old list
-        self._windfreak_device.write('Ld')
-
-        # Create frequency list with constant LO power
-        list_strings = []
+        # --- program the tabular hop table ---
+        wf.write('Ld')                       # clear any previous table
+        time.sleep(0.05)
         for i, freq in enumerate(lo_frequencies):
-            list_strings.append(f"L{i}f{freq / 1e6:.6f}L{i}a{self._lo_power}")
+            wf.write(f'L{i}f{freq / 1e6:.6f}')
+            wf.write(f'L{i}a{self._lo_power:2.3f}')
+            time.sleep(0.02)
 
-        # Write list in chunks due to VISA limitations
-        chunk_size = 175
-        for i in range(0, len(list_strings), chunk_size):
-            chunk = "".join(list_strings[i:i + chunk_size])
-            self._windfreak_device.write(chunk)
-            time.sleep(0.1)
+        # --- sweep type / trigger configuration ---
+        wf.write('X1')                       # tabular hop table
+        wf.write('y2')                       # advance one point per external trigger
+        wf.write('Y0')                       # trigger polarity active-low
+        wf.write('^1')                       # normal step order
+        wf.write('c1' if continuous else 'c0')  # c0=clamp (ODMR, matches sweep) / c1=wrap (cycling the list)
+        time.sleep(0.1)
+        wf.write('g1g0')                     # arm: output sits at point 0, then waits for triggers
+        time.sleep(0.1)
 
-        # Reset to beginning of list
-        self._windfreak_device.write('X1')
-        self._windfreak_device.write('g0')
+        self._list_num_points = len(lo_frequencies)
+        self._list_continuous = continuous
+
+    def arm_list(self):
+        """(Re)arm the jump list so the output sits on table point 0.
+
+        After this call the LO outputs the first table frequency (point 0); each
+        subsequent external (Red Pitaya) trigger advances the output by exactly one
+        table point, wrapping after the last (verified on the scope -- there is no
+        redundant priming trigger). Call before starting a trigger sequence to
+        guarantee a known starting point.
+        """
+        self._windfreak_device.write('g1g0')
+
+    # -------------------------------------------------------------------------
+    # Multi-resonance tracking: LO jump-list + per-slot SSB calibration
+    # -------------------------------------------------------------------------
+    def rf_to_lo(self, rf_frequency: float) -> float:
+        """Public sideband-aware RF center frequency -> required LO frequency (Hz)."""
+        return self._rf_to_lo_frequency(rf_frequency)
+
+    def configure_jump_list(self, rf_frequencies, sample_rate, continuous=True,
+                            enable_output=True):
+        """Program the Windfreak JUMP_LIST from per-resonance RF center frequencies.
+
+        Converts each RF center to its LO (sideband-aware), programs the tabular hop
+        table, and sets one-step-per-trigger (``y2``), wrap (``c1`` when
+        ``continuous``) so each Red Pitaya hop trigger advances the LO by one point
+        and the table cycles indefinitely (the multi-resonance tracking LO source).
+
+        Args:
+            rf_frequencies: list of per-resonance RF center frequencies (Hz), in the
+                order they map to scan ``current_step`` 0..N-1.
+            sample_rate: hop rate (Hz); sets the Windfreak step time (0.75/rate).
+            continuous: c1 (wrap) for indefinite tracking; c0 (clamp) otherwise.
+            enable_output: also enable the RF output (E1 h1).
+
+        Returns:
+            list of LO frequencies (Hz) actually programmed (same order).
+        """
+        lo_frequencies = [self._rf_to_lo_frequency(float(f)) for f in rf_frequencies]
+        with self._thread_lock:
+            self._configure_windfreak_list(lo_frequencies, sample_rate, continuous=continuous)
+            if enable_output:
+                self._windfreak_device.write('E1h1')
+        self.log.info(
+            f'Jump-list configured: RF={[round(f/1e9, 6) for f in rf_frequencies]} GHz -> '
+            f'LO={[round(f/1e9, 6) for f in lo_frequencies]} GHz, '
+            f'rate={sample_rate:.1f} Hz, continuous={continuous}'
+        )
+        return lo_frequencies
+
+    def calibration_load_slot(self, slot, rf_frequency, power=None):
+        """Interpolate and load the per-LO SSB calibration for the resonance at RF
+        center ``rf_frequency`` into FPGA cal-slot ``slot``.
+
+        Uses the currently active IF frequencies/amplitudes (the shared triplet). The
+        IF tones / FM are global (configured once); this only writes the per-LO SSB
+        correction into the slot the FPGA selects in lockstep with the hop.
+        """
+        lo_frequency = self._rf_to_lo_frequency(float(rf_frequency))
+        power = self._current_rf_power if power is None else power
+        if_amplitudes = [self._power_to_if_amplitude(power) * amp_ratio
+                         for amp_ratio in self._active_if_amplitudes]
+        active_cal_files = {freq: self._calibration_files[freq]
+                            for freq in self._active_if_frequencies
+                            if freq in self._calibration_files}
+        self._redpitaya.load_cal_into_slot(
+            slot, lo_frequency, self._active_if_frequencies, if_amplitudes,
+            calibration_files=active_cal_files)
+        self.log.info(
+            f'Cal slot {slot} loaded for RF={rf_frequency/1e9:.6f} GHz '
+            f'(LO={lo_frequency/1e9:.6f} GHz)')
+
+    def set_cal_slot_source(self, hardware: bool = True):
+        """Make the fgen3 cal-slot follow the live hop index (``current_step``) when
+        True (the tracking mode), or use the software-selected slot when False."""
+        self._redpitaya.fgen3.active_slot_src = bool(hardware)
+        self.log.info(f'fgen3 cal-slot source = '
+                      f'{"current_step (hardware)" if hardware else "software"}')
 
     def _windfreak_off(self):
         """Turn off Windfreak output."""

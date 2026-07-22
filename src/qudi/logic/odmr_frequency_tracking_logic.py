@@ -122,9 +122,30 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         self._status_polling_active = False
         self._last_fit_result = None  # {slope, offset, ...}
 
-        # Status polling timer (for lock status only - streaming handled by TSR)
-        self._status_timer = QtCore.QTimer()
-        self._status_timer.timeout.connect(self._poll_lock_status)
+        # Status polling timer (for lock status only - streaming handled by TSR).
+        # Created in on_activate so it has the logic thread affinity.
+        self._status_timer = None
+
+    def _prepare_legacy_single_resonance_hardware(self):
+        """Restore the legacy slot-0/IQ0 path before using this old N=1 logic."""
+        try:
+            lock_hw = self._odmr_lock_hw()
+            if hasattr(lock_hw, 'prepare_legacy_single_resonance'):
+                lock_hw.prepare_legacy_single_resonance()
+            else:
+                if hasattr(lock_hw, 'enable_oscillator'):
+                    lock_hw.enable_oscillator(False)
+                if hasattr(lock_hw, 'set_integrator_source'):
+                    lock_hw.set_integrator_source('sw')
+        except Exception as e:
+            self.log.debug(f'Could not restore legacy lock hardware state: {e}')
+
+        try:
+            microwave = self._microwave()
+            if hasattr(microwave, 'set_cal_slot_source'):
+                microwave.set_cal_slot_source(hardware=False)
+        except Exception as e:
+            self.log.debug(f'Could not restore legacy microwave cal-slot state: {e}')
 
     # =========================================================================
     # ODMR Scan Preparation (ensure proper hardware state before scanning)
@@ -184,6 +205,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         # This ensures the hardware register is set correctly even if mode was
         # already 'error' but hardware was in different state
         self._apply_stream_mode_to_hardware()
+        self._prepare_legacy_single_resonance_hardware()
 
         if changes_made:
             self.log.info('Hardware state updated for ODMR scan (lock disabled, input=DEMOD)')
@@ -219,9 +241,13 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         ts_logic.sigNewRawData.connect(self._on_tsr_raw_data, QtCore.Qt.QueuedConnection)
         ts_logic.sigDataChanged.connect(self._on_tsr_data_changed, QtCore.Qt.QueuedConnection)
         ts_logic.sigStatusChanged.connect(self._on_tsr_status_changed, QtCore.Qt.QueuedConnection)
+        self._status_timer = QtCore.QTimer(parent=self)
+        self._status_timer.setSingleShot(False)
+        self._status_timer.timeout.connect(self._poll_lock_status)
 
         # Set initial stream input mode on hardware (via TSR's streamer)
         self._apply_stream_mode_to_hardware()
+        self._prepare_legacy_single_resonance_hardware()
 
         # Apply saved lock bandwidth
         if self._lock_bandwidth != self._default_lock_bandwidth:
@@ -240,7 +266,8 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.stop_error_stream()
 
         # Stop status polling
-        self._status_timer.stop()
+        if self._status_timer is not None:
+            self._status_timer.stop()
 
         # Disconnect from TSR signals
         try:
@@ -393,6 +420,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
         # Configure hardware lock
         # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
+        self._prepare_legacy_single_resonance_hardware()
         lock_hw = self._odmr_lock_hw()
         lock_hw.set_bandwidth(bandwidth_hz, slope_lsb_per_hz)
 
@@ -433,6 +461,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
 
         # Configure hardware lock (PI mode)
         # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
+        self._prepare_legacy_single_resonance_hardware()
         lock_hw = self._odmr_lock_hw()
         lock_hw.set_bandwidth_pi(bandwidth_hz, slope_lsb_per_hz, zero_ratio)
 
@@ -527,6 +556,8 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
         """
         if self._last_fit_result is None:
             raise ValueError('No fit result available. Run fit_resonance() first.')
+
+        self._prepare_legacy_single_resonance_hardware()
 
         zero_crossing_freq = self._last_fit_result.get('zero_crossing_freq')
         if zero_crossing_freq is None:
@@ -645,7 +676,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.sigStreamStateChanged.emit(True)
 
             # Start status polling timer if not already running (for lock status only)
-            if not self._status_polling_active:
+            if not self._status_polling_active and self._status_timer is not None:
                 self._status_timer.start(int(self._status_poll_interval * 1000))
                 self._status_polling_active = True
 
@@ -677,7 +708,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.sigStreamStateChanged.emit(False)
 
             # Stop status polling timer only if lock is also inactive
-            if not self._lock_enabled and self._status_polling_active:
+            if not self._lock_enabled and self._status_polling_active and self._status_timer is not None:
                 self._status_timer.stop()
                 self._status_polling_active = False
 
@@ -702,6 +733,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             return
 
         try:
+            self._prepare_legacy_single_resonance_hardware()
             # Enable hardware lock (single register write to FPGA)
             # Thread-safe: MonitorClient uses RLock to serialize TCP socket access
             lock_hw = self._odmr_lock_hw()
@@ -721,7 +753,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.sigLockStateChanged.emit(True)
 
             # Ensure status polling is active
-            if not self._status_polling_active:
+            if not self._status_polling_active and self._status_timer is not None:
                 self._status_timer.start(int(self._status_poll_interval * 1000))
                 self._status_polling_active = True
 
@@ -755,7 +787,7 @@ class OdmrFrequencyTrackingLogic(OdmrLogic):
             self.sigLockStateChanged.emit(False)
 
             # Stop status polling timer only if stream is also inactive
-            if not self._stream_active and self._status_polling_active:
+            if not self._stream_active and self._status_polling_active and self._status_timer is not None:
                 self._status_timer.stop()
                 self._status_polling_active = False
 
