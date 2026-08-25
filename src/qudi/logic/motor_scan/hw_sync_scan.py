@@ -346,6 +346,7 @@ class HwSyncScanMixin:
         # traces) instead of a single demod array.
         self._hw_word_chunks = []           # list[np.ndarray] - raw triplet words
         self._hw_multires_nslots = 0        # resonance count for the active mapped scan
+        self._hw_multires_words_per_sample = 3  # legacy default; queried at setup
         self._hw_demod_chunks = []          # list[np.ndarray] - continuous demod
         self._hw_xmarks_flat = np.empty(0, dtype=np.int64)  # absolute x-marker indices
         self._hw_ymarks_flat = np.empty(0, dtype=np.int64)  # absolute y-marker indices (diagnostic)
@@ -521,6 +522,8 @@ class HwSyncScanMixin:
                 "motor scans are both supported).")
             return False
         self._hw_multires_nslots = int(hw.nslots)
+        self._hw_multires_words_per_sample = int(
+            getattr(hw, 'stream_words_per_sample', 3))
 
         # reset drain buffers
         self._hw_word_chunks = []
@@ -589,8 +592,8 @@ class HwSyncScanMixin:
                                  w_hi: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Reconstruct accumulated words into fresh-only per-resonance traces.
 
-        If ``w_lo``/``w_hi`` (triplet indices) are given, only that word window
-        ``[3*w_lo, 3*w_hi)`` is decoded (cheap, for the live per-line map); the
+        If ``w_lo``/``w_hi`` (sample indices) are given, only that record window
+        is decoded (cheap, for the live per-line map); the
         returned traces are then indexed from 0 at ``w_lo``. Marked-series is
         fresh-only and per-sample self-labelled, so slicing the words is exact.
         """
@@ -599,8 +602,9 @@ class HwSyncScanMixin:
             return None
         words = np.concatenate(self._hw_word_chunks)
         if w_lo is not None:
-            a = max(0, 3 * int(w_lo))
-            b = words.size if w_hi is None else min(words.size, 3 * int(w_hi))
+            width = int(self._hw_multires_words_per_sample)
+            a = max(0, width * int(w_lo))
+            b = words.size if w_hi is None else min(words.size, width * int(w_hi))
             if b <= a:
                 return None
             words = words[a:b]

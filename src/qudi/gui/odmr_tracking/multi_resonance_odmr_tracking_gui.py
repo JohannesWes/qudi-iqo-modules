@@ -102,8 +102,10 @@ class MultiResonanceOdmrTrackingGui(OdmrGui):
         self._trace_dock = None
         self._corr_plot = None                # bottom plot: Correction [Hz]
         self._err_plot = None                 # top plot: Error [LSB]
+        self._cic_plot = None                 # middle plot: post-CIC/pre-FIR [LSB]
         self._corr_curves = []                # one per resonance (Hz)
         self._err_curves = []                 # one per resonance (LSB)
+        self._cic_curves = []                 # one per resonance (CIC LSB)
         # When the high-rate dual-quantity stream is live it drives both plots; the
         # low-rate register-poll history is the fallback until the first high-rate
         # frame arrives (or when stream_traces is disabled).
@@ -127,7 +129,8 @@ class MultiResonanceOdmrTrackingGui(OdmrGui):
         self._restore_settings()
         self._mw.setWindowTitle('Multi-Resonance ODMR Tracking')
         self._mw.action_save_measurement.setToolTip(
-            'Save the current ODMR scan and the simultaneous tracking error/correction traces.')
+            'Save the current ODMR scan and synchronized post-FIR error, frequency '
+            'correction, and post-CIC/pre-FIR traces for the selected Window.')
         self.restore_default_view()
         self.log.info('Multi-Resonance ODMR Tracking GUI activated')
 
@@ -381,9 +384,10 @@ class MultiResonanceOdmrTrackingGui(OdmrGui):
         vbox.setContentsMargins(2, 2, 2, 2)
         container.setLayout(vbox)
 
-        # Two stacked plots showing all 4 high-rate traces simultaneously:
-        #   top    = Error [LSB]      (both resonances)
-        #   bottom = Correction [Hz]  (both resonances)
+        # Three stacked plots on the same FPGA time axis:
+        #   top    = post-FIR error [LSB]
+        #   middle = post-CIC/pre-FIR error [LSB]
+        #   bottom = frequency correction [Hz]
         # Fed by the dual-quantity stream; falls back to the ~5 Hz register-poll
         # history when the high-rate stream is not (yet) running.
         header_row = QtWidgets.QHBoxLayout()
@@ -423,6 +427,21 @@ class MultiResonanceOdmrTrackingGui(OdmrGui):
                 self._err_plot.plot(pen=pg.mkPen(_RES_COLORS[i], width=2),
                                     name=f'Resonance {i}'))
         vbox.addWidget(self._err_plot)
+
+        self._cic_plot = pg.PlotWidget()
+        self._cic_plot.setLabel('left', 'After CIC', units='LSB')
+        self._cic_plot.setLabel('bottom', 'Time', units='s')
+        self._cic_plot.setMinimumHeight(130)
+        self._cic_plot.showGrid(x=True, y=True)
+        self._cic_plot.disableAutoRange(axis='x')
+        self._cic_plot.setMouseEnabled(x=False, y=True)
+        self._cic_plot.addLegend()
+        for i in range(_N_RES):
+            self._cic_curves.append(
+                self._cic_plot.plot(pen=pg.mkPen(_RES_COLORS[i], width=2),
+                                    name=f'Resonance {i}'))
+        self._cic_plot.setXLink(self._err_plot)
+        vbox.addWidget(self._cic_plot)
 
         self._corr_plot = pg.PlotWidget()
         self._corr_plot.setLabel('left', 'Correction', units='Hz')
@@ -854,11 +873,12 @@ class MultiResonanceOdmrTrackingGui(OdmrGui):
         for i in range(min(_N_RES, data.shape[0], len(curves))):
             curves[i].setData(x=times, y=data[i])
 
-    @QtCore.Slot(object, object, object)
-    def _on_high_rate_traces(self, times, err, corr_hz):
-        """High-rate dual-quantity update: drives BOTH plots (4 traces)."""
+    @QtCore.Slot(object, object, object, object)
+    def _on_high_rate_traces(self, times, err, corr_hz, cic):
+        """Update all three quantities from one synchronized FPGA record stream."""
         self._got_high_rate = True
         self._set_curves(self._err_curves, times, err)
+        self._set_curves(self._cic_curves, times, cic)
         self._set_curves(self._corr_curves, times, corr_hz)
         self._set_trace_x_range()
 

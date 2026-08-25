@@ -113,9 +113,9 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
     sigCorrectionHistoryUpdated = QtCore.Signal(object, object)  # times, (N x T) Hz
     sigErrorHistoryUpdated = QtCore.Signal(object, object)       # times, (N x T) LSB
     sigResonanceTracesUpdated = QtCore.Signal(object, object)    # times, (N x T) Hz (high-rate, legacy)
-    # High-rate simultaneous 4-trace stream (dual-quantity): times, err (N x T) LSB,
-    # corr (N x T) Hz. Decimated for display before emission.
-    sigHighRateTracesUpdated = QtCore.Signal(object, object, object)
+    # High-rate synchronous stream: times, post-FIR error, correction, pre-FIR CIC.
+    # All arrays share the same FPGA sample axis and are decimated together for display.
+    sigHighRateTracesUpdated = QtCore.Signal(object, object, object, object)
     sigNumResonancesChanged = QtCore.Signal(int)
 
     # Max points per curve pushed to the GUI for the high-rate view (decimation cap).
@@ -162,6 +162,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         self._high_rate_times = None
         self._high_rate_err = None
         self._high_rate_corr = None
+        self._high_rate_cic = None
         self._high_rate_sample_rate = None
         # status poll timer: created in on_activate (on the logic thread) so it can
         # be started/stopped from the logic thread (a timer created here in __init__
@@ -181,6 +182,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         self._field_tail_words = np.empty(0, dtype=np.float64)
         self._field_sample_base = 0        # absolute sample index of tail_words[0]
         self._field_rate = None            # stream sample rate [Hz]
+        self._field_words_per_sample = 3   # overwritten from FPGA stream metadata
         self._field_start_wall = None      # wall-clock at the first logged sample
         self._field_written = 0            # visit rows written
         self._field_loss_words = 0         # NaN (transport-loss) words seen
@@ -626,6 +628,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
                 self._high_rate_times = None
                 self._high_rate_err = None
                 self._high_rate_corr = None
+                self._high_rate_cic = None
                 self._high_rate_sample_rate = None
             self._multi_stream_active = True
             self._stream_started_at = datetime.now()
@@ -690,6 +693,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         self._high_rate_times = None
         self._high_rate_err = None
         self._high_rate_corr = None
+        self._high_rate_cic = None
         self._high_rate_sample_rate = None
 
     @QtCore.Slot()
@@ -736,11 +740,13 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
                 times = np.asarray(traces['times'], dtype=np.float64)
                 err = np.asarray(traces['err'], dtype=np.float64)          # (N, T) LSB
                 corr_hz = np.asarray(traces['corr_hz'], dtype=np.float64)  # (N, T) Hz
+                cic = np.asarray(traces['cic'], dtype=np.float64)          # (N, T) CIC LSB
                 # Cache the full rolling window before display decimation.  The
                 # same common time vector is used for error and correction.
                 self._high_rate_times = times
                 self._high_rate_err = err
                 self._high_rate_corr = corr_hz
+                self._high_rate_cic = cic
                 self._high_rate_sample_rate = float(traces.get('sample_rate', np.nan))
                 t_n = times.shape[0]
                 if t_n > self._HIGH_RATE_MAX_POINTS:
@@ -748,7 +754,8 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
                     times = times[idx]
                     err = err[:, idx]
                     corr_hz = corr_hz[:, idx]
-                self.sigHighRateTracesUpdated.emit(times, err, corr_hz)
+                    cic = cic[:, idx]
+                self.sigHighRateTracesUpdated.emit(times, err, corr_hz, cic)
                 # legacy single-quantity signal (corrections) for any older consumer
                 self.sigResonanceTracesUpdated.emit(times, corr_hz)
 
@@ -763,6 +770,28 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
     def _tracking_metadata(self, data_kind: str) -> Dict:
         """Metadata shared by low- and high-rate tracking exports."""
         n = int(self._num_resonances)
+        signed_slopes = tuple(
+            float(fit['slope']) if fit is not None else np.nan
+            for fit in self._resonance_fits[:n])
+        demod_hz_per_lsb = tuple(
+            (1.0 / slope) if np.isfinite(slope) and slope != 0 else np.nan
+            for slope in signed_slopes)
+        filters = tuple('' for _ in range(n))
+        fir_gains = tuple(np.nan for _ in range(n))
+        try:
+            calibration = self._multi_track_hw().get_trace_calibration()
+            filters = tuple(calibration.get('filters', filters))
+            fir_gains = tuple(calibration.get('fir_dc_gain_from_cic_lsb', fir_gains))
+        except Exception as e:
+            self.log.debug('Could not read CIC/FIR stream calibration: %s', e)
+        cic_slopes = tuple(
+            (signed_slopes[i] / fir_gains[i])
+            if (i < len(fir_gains) and np.isfinite(signed_slopes[i]) and
+                np.isfinite(fir_gains[i]) and fir_gains[i] != 0) else np.nan
+            for i in range(n))
+        cic_hz_per_lsb = tuple(
+            (1.0 / slope) if np.isfinite(slope) and slope != 0 else np.nan
+            for slope in cic_slopes)
         return {
             'Data kind': data_kind,
             'Number of resonances': n,
@@ -782,26 +811,42 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
             'Low-rate history capacity (points)': int(self._trace_history_points),
             'Lock bandwidth (Hz)': float(self._lock_bandwidth),
             'Maximum correction (Hz)': float(self._max_correction_hz_sv),
+            'Selected lock-in FIR filters': filters,
+            'Demod discriminator slopes (signed LSB/Hz)': signed_slopes,
+            'Demod conversion factors (signed Hz/LSB)': demod_hz_per_lsb,
+            'FIR DC gain (post-FIR LSB/pre-FIR CIC LSB)': fir_gains,
+            'CIC discriminator slopes (signed CIC LSB/Hz)': cic_slopes,
+            'CIC conversion factors (signed Hz/CIC LSB)': cic_hz_per_lsb,
         }
 
     @staticmethod
-    def _join_tracking_columns(times, errors, corrections, n):
-        """Return time/error/correction columns sharing an identical row axis."""
+    def _join_tracking_columns(times, errors, corrections, n, cic=None):
+        """Return synchronized tracking columns sharing an identical row axis."""
         times = np.asarray(times, dtype=np.float64)
         errors = np.asarray(errors, dtype=np.float64)
         corrections = np.asarray(corrections, dtype=np.float64)
         if times.ndim != 1 or errors.ndim != 2 or corrections.ndim != 2:
             raise ValueError('Tracking traces must have shapes (T,), (N, T), (N, T).')
-        n = min(int(n), errors.shape[0], corrections.shape[0])
+        cic_array = None if cic is None else np.asarray(cic, dtype=np.float64)
+        if cic_array is not None and cic_array.ndim != 2:
+            raise ValueError('CIC trace must have shape (N, T).')
+        n = min(int(n), errors.shape[0], corrections.shape[0],
+                cic_array.shape[0] if cic_array is not None else int(n))
         length = min(times.size, errors.shape[1], corrections.shape[1])
+        if cic_array is not None:
+            length = min(length, cic_array.shape[1])
         if n < 1 or length < 1:
-            return np.empty((0, 1 + 2 * max(n, 0)), dtype=np.float64), tuple()
+            per_res = 3 if cic_array is not None else 2
+            return np.empty((0, 1 + per_res * max(n, 0)), dtype=np.float64), tuple()
         columns = [times[:length]]
         headers = ['Elapsed time (s)']
         for i in range(n):
             columns.extend((errors[i, :length], corrections[i, :length]))
             headers.extend((f'Resonance {i} error (LSB)',
                             f'Resonance {i} correction (Hz)'))
+            if cic_array is not None:
+                columns.append(cic_array[i, :length])
+                headers.append(f'Resonance {i} after-CIC error (LSB)')
         return np.column_stack(columns), tuple(headers)
 
     @QtCore.Slot(str)
@@ -848,12 +893,14 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
             if self._high_rate_times is not None:
                 data, headers = self._join_tracking_columns(
                     self._high_rate_times, self._high_rate_err,
-                    self._high_rate_corr, n)
+                    self._high_rate_corr, n, cic=self._high_rate_cic)
                 if data.shape[0]:
                     metadata = self._tracking_metadata('high-rate rolling-window snapshot')
                     metadata['Sample rate (Hz)'] = self._high_rate_sample_rate
                     metadata['Trace alignment'] = (
-                        'Common uniform stream axis; parked resonances are zero-order held')
+                        'Post-FIR error, correction, and pre-FIR CIC are captured in one '
+                        'FPGA stream record on a common uniform axis; parked resonances '
+                        'are zero-order held')
                     metadata['Saved window start elapsed time (s)'] = float(data[0, 0])
                     metadata['Saved window stop elapsed time (s)'] = float(data[-1, 0])
                     # Binary storage avoids blocking the tracking logic for a long
@@ -1026,6 +1073,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         os.makedirs(os.path.dirname(self._field_log_path) or '.', exist_ok=True)
         hw.begin_field_drain()
         self._field_rate = float(getattr(hw, 'stream_sample_rate', 125e6 / 4096))
+        self._field_words_per_sample = int(getattr(hw, 'stream_words_per_sample', 3))
         self._field_tail_words = np.empty(0, dtype=np.float64)
         self._field_sample_base = 0
         self._field_start_wall = None
@@ -1051,12 +1099,13 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
             self._field_loss_words += int(np.count_nonzero(np.isnan(w)))
         words = (np.concatenate([self._field_tail_words, w])
                  if self._field_tail_words.size else w)
-        n_samp = words.size // 3
+        width = int(getattr(self, '_field_words_per_sample', 3))
+        n_samp = words.size // width
         if n_samp == 0:
             # No complete triplet yet -- carry the whole (sub-triplet) remainder.
             self._field_tail_words = words
             return
-        usable = words[:3 * n_samp]
+        usable = words[:width * n_samp]
         traces = hw.reconstruct_mapped_traces(usable)
         err = np.asarray(traces['err'], dtype=np.float64)
         corr = np.asarray(traces['corr_hz'], dtype=np.float64)
@@ -1069,8 +1118,8 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
             # Keep the word<->sample mapping consistent with the reconstruction's own
             # sample count (marked stream is 1 triplet/sample, so this is a safety net).
             n_samp = t
-            usable = words[:3 * n_samp]
-        remainder = words[3 * n_samp:]  # 0..2 leftover mid-triplet words -> carry
+            usable = words[:width * n_samp]
+        remainder = words[width * n_samp:]
         guard = 0 if final else int(self._FIELD_GUARD_SAMPLES)
         events, cut_idx = self._find_complete_visits(err, corr, guard)
         cut_idx = max(0, min(int(cut_idx), n_samp))
@@ -1092,7 +1141,7 @@ class MultiResonanceOdmrTrackingLogic(OdmrFrequencyTrackingLogic):
         if final:
             self._field_tail_words = np.empty(0, dtype=np.float64)
         else:
-            self._field_tail_words = np.concatenate([usable[3 * cut_idx:], remainder])
+            self._field_tail_words = np.concatenate([usable[width * cut_idx:], remainder])
         self._field_sample_base += cut_idx
 
     def _close_field_log(self, hw) -> None:

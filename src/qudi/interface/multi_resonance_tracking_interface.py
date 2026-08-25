@@ -247,8 +247,16 @@ class MultiResonanceTrackingInterface(Base):
                 live, zero-order-hold while parked; NaN = transport loss).
               - 'corr_hz' (np.ndarray, shape (nslots, len(times))): each row is a
                 resonance's frequency correction (Hz), same axis/semantics.
-              - 'sample_rate' (float): stream sample rate (Hz), per-sample (triplet).
+              - 'cic' (np.ndarray, shape (nslots, len(times))): each row is the
+                resonance's demodulation signal after CIC and before FIR (raw LSB),
+                captured in the same FPGA record as err and corr_hz.
+              - 'sample_rate' (float): stream sample rate (Hz), per record.
         """
+        pass
+
+    @abstractmethod
+    def get_trace_calibration(self) -> Dict[str, Any]:
+        """Return stream format, selected FIRs, and pre-CIC-to-post-FIR DC gains."""
         pass
 
     # =========================================================================
@@ -272,7 +280,7 @@ class MultiResonanceTrackingInterface(Base):
         Enabling records
         the fast-axis (bin-boundary) and slow-axis (line-boundary) encoder pulses
         into the otherwise-free FPGA marker banks WITHOUT disturbing or resetting the
-        per-resonance triplet stream. Correct per-bin, fresh-only binning needs the
+        per-resonance self-describing stream. Correct per-bin, fresh-only binning needs the
         MARKED stream (uniform grid, no zero-order hold); implementations should warn
         if a different stream source is active. Implementations must raise if enabling
         is requested without an active stream, so a motor scan cannot silently acquire
@@ -286,8 +294,8 @@ class MultiResonanceTrackingInterface(Base):
         New (x, y) position markers since the last call, as TRIPLET (time-sample)
         indices into the reconstructed per-resonance traces.
 
-        The raw FPGA markers are WORD indices (3 words per [err, corr, step]
-        triplet); this returns them already converted to triplet indices, so they
+        The raw FPGA markers are WORD indices (four words per current synchronized
+        record); this returns them already converted to sample indices, so they
         index directly into the ``read_stream_words``/``reconstruct_mapped_traces``
         sample axis. x = fast-axis bin boundaries, y = slow-axis line boundaries.
 
@@ -299,7 +307,7 @@ class MultiResonanceTrackingInterface(Base):
     @abstractmethod
     def read_stream_words(self) -> Any:
         """
-        New raw triplet stream words since the last call (float64, NaN = transport
+        New raw self-describing stream words since the last call (float64, NaN = transport
         loss), for a mapped 2D scan that reconstructs + spatially bins the traces.
 
         The caller accumulates these into one contiguous array (index 0 = first word
@@ -313,17 +321,17 @@ class MultiResonanceTrackingInterface(Base):
     @abstractmethod
     def reconstruct_mapped_traces(self, words: Any) -> Dict[str, Any]:
         """
-        Decode an accumulated raw triplet-word array into per-resonance err/corr
+        Decode an accumulated raw record-word array into per-resonance err/corr/CIC
         traces on the uniform sample grid, FRESH-ONLY (NaN when parked / in the
         per-hop dead-time / transport loss -- no zero-order hold), so a per-bin
         ``nanmean`` sees only that resonance's own live samples.
 
         Args:
-            words: contiguous triplet-word array (float64, NaN = loss), index 0 =
+            words: contiguous record-word array (float64, NaN = loss), index 0 =
                 first word of the session.
 
         Returns:
-            dict with 'err' (N, T) raw LSB, 'corr_hz' (N, T) Hz, 'times' (T,) s, and
-            'sample_rate' (float, Hz), where T is the number of complete triplets.
+            dict with 'err' and 'cic' (N, T) raw LSB, 'corr_hz' (N, T) Hz, 'times' (T,) s, and
+            'sample_rate' (float, Hz), where T is the number of complete records.
         """
         pass

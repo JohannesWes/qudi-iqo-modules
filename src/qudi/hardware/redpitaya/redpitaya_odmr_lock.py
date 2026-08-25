@@ -65,8 +65,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     # Size (in stream WORDS) of the high-rate display buffer for read_traces. It is a
     # ROLLING window: once full, the oldest samples are dropped so the tracking GUI
     # shows the most recent slice at CONSTANT resolution (like the Time Series GUI),
-    # instead of growing unbounded / freezing. In the marked stream 3 words = 1 sample
-    # (~30.5 kHz), so 2 MWords ~= 666k samples ~= 21.8 s window. Reduce for a shorter,
+    # instead of growing unbounded / freezing. In the current marked stream 4 words
+    # = 1 sample (~30.5 kHz), so 2 MWords ~= 500k samples ~= 16.4 s window. Reduce for a shorter,
     # finer-resolution window. Indefinite drift is still fully covered by the low-rate
     # per-slot register polling (get_slot_status / correction-history plot).
     _max_trace_samples = ConfigOption('max_trace_samples', default=2_000_000, missing='nothing')
@@ -89,9 +89,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._trace_values = np.array([], dtype=np.float64)
         self._trace_ticks = np.array([], dtype=np.int64)
         self._trace_steps = np.array([], dtype=np.int64)
-        # Number of complete triplets removed from the front of the rolling
+        # Number of complete stream records removed from the front of the rolling
         # buffer.  This preserves an elapsed-since-stream-start time axis.
         self._trace_sample_offset = 0
+        self._stream_words_per_sample = 3  # legacy-safe until the FPGA reports 4
         # Runtime rolling-window size in WORDS for the high-rate display buffer
         # (settable live via set_trace_window_seconds; initialized from the
         # max_trace_samples ConfigOption in on_activate).
@@ -121,7 +122,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         )
 
         # Runtime high-rate display window (words), seeded from the ConfigOption.
-        self._trace_window_words = max(3, int(self._max_trace_samples))
+        self._trace_window_words = max(4, int(self._max_trace_samples))
 
         rp = self._pyrpl.rp
         # Get odmrfreqlock module (PyRPL naming: all lowercase, no underscores)
@@ -130,6 +131,13 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._multitrack = getattr(rp, 'odmrmultitrack', None)
         self._fgen3 = getattr(rp, 'fgen3', None)
         self._scan = getattr(rp, 'scan', None)
+        if self._scan is not None:
+            self._stream_words_per_sample = int(self._scan.stream_words_per_sample)
+            if self._stream_words_per_sample != 4:
+                self.log.warning(
+                    'FPGA reports the legacy %d-word tracking stream; the pre-FIR CIC '
+                    'trace is unavailable until the new bitstream is loaded.',
+                    self._stream_words_per_sample)
 
         # Multitrack routes resonance 1 through lockin channel 1 and resonance 2
         # through lockin1 channel 1. Configure both instances explicitly.
@@ -176,6 +184,23 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                 '2kHz_minphase' if filter_name == '2kHz' else filter_name)
             self.log.info(
                 f'Resonance {index} FIR ({module_name}): {filter_name}')
+
+    def get_trace_calibration(self) -> Dict[str, Any]:
+        """Return the fixed-point scaling needed to calibrate the CIC trace.
+
+        ``fir_dc_gain_from_cic_lsb`` maps the exported CIC word (CIC[39:8]) to
+        the selected 32-bit FIR output at DC.  The discriminator fit supplies the
+        remaining physical LSB/Hz factor in the tracking logic.
+        """
+        minphase_gain = 937716.0 / (2 ** 21)
+        linear_gain = (802861.0 / (2 ** 21)) * (299.0 / 256.0)
+        gains = [linear_gain if name == '2kHz_linear' else minphase_gain
+                 for name in self._configured_lock_in_filters]
+        return {
+            'stream_words_per_sample': int(self._stream_words_per_sample),
+            'filters': tuple(self._configured_lock_in_filters[:self._nslots]),
+            'fir_dc_gain_from_cic_lsb': tuple(gains[:self._nslots]),
+        }
 
     def on_deactivate(self):
         """Disable lock and disconnect."""
@@ -367,6 +392,11 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def stream_sample_rate(self) -> float:
         """Aggregate demod stream rate [Hz] (125 MHz / 4096 ~= 30.5 kHz)."""
         return float(self._STREAM_SAMPLE_RATE_HZ)
+
+    @property
+    def stream_words_per_sample(self) -> int:
+        """Number of 32-bit words in one synchronized stream record."""
+        return int(self._stream_words_per_sample)
 
     def begin_field_drain(self) -> None:
         """Hand the physical stream drain to a single-position field logger.
@@ -575,6 +605,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                              f"falling back to legacy 'dual'.")
             self._stream_source = 'dual'
             self._scan.hop_stream_start(input_source='dual')
+        self._stream_words_per_sample = int(self._scan.stream_words_per_sample)
+        if self._stream_words_per_sample != 4:
+            self.log.warning('Tracking stream has %d words/sample; CIC trace will be NaN.',
+                             self._stream_words_per_sample)
         self._streaming_traces = True
 
     def start_trace_stream(self) -> None:
@@ -608,8 +642,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
     def read_traces(self) -> Optional[Dict[str, Any]]:
         """Reconstructed per-resonance high-rate traces since session start (capped).
 
-        Decodes the dual-quantity self-describing stream ([err, corr, step] triplets)
-        into four simultaneous per-resonance traces: both errors AND both corrections
+        Decodes the self-describing stream ([err, corr, cic, state] records)
+        into synchronous per-resonance post-FIR error, correction, and pre-FIR CIC traces
         at the full demod rate (~30.5 kHz aggregate, shared across resonances by the
         hop schedule). Indefinite operation is covered by per-slot register polling
         (:meth:`get_slot_status`); this high-rate buffer is a ROLLING window of the
@@ -619,12 +653,12 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         Returns:
             dict or None: ``{'times': (T,), 'err': (N, T) raw LSB,
             'corr_hz': (N, T) Hz, 'sample_rate': Hz}`` where T is the number of
-            complete triplets received and N is the number of resonances.
+            complete records received and N is the number of resonances.
         """
         if not (self._tracking_active and self._streaming_traces):
             return None
 
-        # pull any new stream words (3 words = 1 sample: err, corr, step).
+        # Pull new words; the FPGA-reported record width keeps all columns aligned.
         # While a mapped 2D scan owns the drain, it feeds self._trace_values via
         # read_stream_words(); draining here too would steal words from it, so skip
         # the physical drain and just reconstruct the shared buffer's current state.
@@ -636,7 +670,8 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
                                                      np.asarray(new_vals, dtype=np.float64)])
                 self._trim_trace_buffer()
 
-        if self._trace_values.size < 3:
+        width = int(self._stream_words_per_sample)
+        if self._trace_values.size < width:
             return None
 
         if getattr(self, '_stream_source', 'dual') == 'marked':
@@ -645,20 +680,24 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             # dead or another resonance); ZOH-fill here so the GUI shows continuous
             # per-resonance traces (the field estimate is held while parked).
             rec = self._scan.reconstruct_marked_series(
-                self._trace_values, nslots=self._nslots, to_hz_corr=True)
-            err = self._ffill_rows(rec['err'])
-            corr_hz = self._ffill_rows(rec['corr'])
+                self._trace_values, nslots=self._nslots, to_hz_corr=True,
+                words_per_sample=width)
+            err = self._ffill_marked_rows(rec['err'], rec['step'])
+            corr_hz = self._ffill_marked_rows(rec['corr'], rec['step'])
+            cic = self._ffill_marked_rows(rec['cic'], rec['step'])
             dead = rec.get('dead')
         else:
             rec = self._scan.reconstruct_dual_hop_series(
-                self._trace_values, nslots=self._nslots, to_hz_corr=True)
+                self._trace_values, nslots=self._nslots, to_hz_corr=True,
+                words_per_sample=width)
             err = rec['err']        # (N, T) raw LSB
             corr_hz = rec['corr']   # (N, T) Hz
+            cic = rec['cic']        # (N, T) raw CIC LSB
             dead = None
         t_count = err.shape[1]
         times = (self._trace_sample_offset + np.arange(t_count, dtype=np.float64)) \
                 / self._STREAM_SAMPLE_RATE_HZ
-        out = {'times': times, 'err': err, 'corr_hz': corr_hz,
+        out = {'times': times, 'err': err, 'corr_hz': corr_hz, 'cic': cic,
                'sample_rate': self._STREAM_SAMPLE_RATE_HZ}
         if dead is not None:
             out['dead'] = dead
@@ -681,27 +720,39 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             out[r] = row[idx]
         return out
 
+    @classmethod
+    def _ffill_marked_rows(cls, a, step):
+        """Hold parked/dead slots while preserving loss in a resonance's live slot."""
+        source = np.asarray(a, dtype=np.float64)
+        out = cls._ffill_rows(source)
+        step = np.asarray(step, dtype=np.int64)
+        for r in range(out.shape[0]):
+            live_loss = (step == r) & np.isnan(source[r])
+            out[r, live_loss] = np.nan
+        return out
+
     def _trim_trace_buffer(self) -> None:
         """Roll the high-rate display buffer to the last ``_trace_window_words`` words.
 
-        Trims on a TRIPLET boundary (word 0 = session start is triplet-aligned, so
-        dropping a multiple of 3 words from the front keeps [err, corr, step] column
+        Trims on a record boundary (word 0 = session start is aligned, so
+        dropping a multiple of the reported width keeps the columns
         phase intact). Keeps the tracking GUI window bounded + constant-resolution
         instead of growing unbounded and freezing at a cap.
         """
         window = int(self._trace_window_words)
-        n_complete = self._trace_values.size // 3
-        keep = window // 3
+        width = int(self._stream_words_per_sample)
+        n_complete = self._trace_values.size // width
+        keep = window // width
         if keep >= 1 and n_complete > keep:
             dropped = n_complete - keep
-            start = dropped * 3                     # multiple of 3 -> triplet-aligned
+            start = dropped * width
             self._trace_values = self._trace_values[start:]
             self._trace_sample_offset += dropped
 
     def set_trace_window_seconds(self, seconds: float) -> None:
         """Set the high-rate display window duration (rolling buffer length).
 
-        Live-settable from the tracking GUI. In the marked stream 3 words = 1 sample
+        Live-settable from the tracking GUI. In the marked stream one fixed-width
         at ~30.5 kHz, so the buffer holds ``seconds * rate`` samples; shrinking trims
         immediately on the next read, growing fills over ``seconds``. Independent of
         the per-slot register-poll drift history (that has its own length).
@@ -710,7 +761,9 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         if not np.isfinite(s) or s <= 0:
             self.log.warning('set_trace_window_seconds: ignoring non-positive value %r', seconds)
             return
-        self._trace_window_words = max(3, int(round(s * self._STREAM_SAMPLE_RATE_HZ)) * 3)
+        width = int(self._stream_words_per_sample)
+        self._trace_window_words = max(width,
+                                       int(round(s * self._STREAM_SAMPLE_RATE_HZ)) * width)
         # Trim right away if the new window is shorter than the current buffer.
         self._trim_trace_buffer()
         self.log.debug('High-rate trace window set to %.2f s (%d words).',
@@ -782,11 +835,11 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # Preserve elapsed time across this intentional stream restart.  The exact
         # restart latency is not represented by FPGA samples, but the saved/visible
         # time axis never jumps backwards to zero.
-        self._trace_sample_offset += self._trace_values.size // 3
+        self._trace_sample_offset += self._trace_values.size // int(self._stream_words_per_sample)
         self._trace_values = np.array([], dtype=np.float64)
 
     def read_position_markers(self) -> Tuple[np.ndarray, np.ndarray]:
-        """New (x, y) position markers since the last call, as triplet indices."""
+        """New (x, y) position markers since the last call, as sample indices."""
         empty = (np.array([], dtype=np.int64), np.array([], dtype=np.int64))
         if self._scan is None or not self._streaming_traces:
             return empty
@@ -797,15 +850,17 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self.log.warning('read_position_markers failed: %s', e)
             return empty
         # In the self-describing marked/dual stream the marker values are WORD
-        # indices (3 words/triplet); convert to triplet = time-sample indices so
+        # indices; convert with the FPGA-reported width to time-sample indices so
         # they index the reconstructed per-resonance traces directly.
         if getattr(self, '_stream_source', 'marked') in ('marked', 'dual'):
-            xm = self._scan.markers_to_triplet_index(xm)
-            ym = self._scan.markers_to_triplet_index(ym)
+            xm = self._scan.markers_to_sample_index(
+                xm, words_per_sample=self._stream_words_per_sample)
+            ym = self._scan.markers_to_sample_index(
+                ym, words_per_sample=self._stream_words_per_sample)
         return xm, ym
 
     def read_stream_words(self) -> np.ndarray:
-        """New raw triplet stream words since the last call (destructive drain)."""
+        """New raw self-describing stream words (destructive drain)."""
         if self._scan is None or not self._streaming_traces:
             return np.array([], dtype=np.float64)
         try:
@@ -824,21 +879,25 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         return w
 
     def reconstruct_mapped_traces(self, words) -> Dict[str, Any]:
-        """Decode accumulated triplet words -> fresh-only per-resonance err/corr."""
+        """Decode accumulated record words -> fresh-only err/corr/CIC traces."""
         words = np.asarray(words, dtype=np.float64)
         rate = self._STREAM_SAMPLE_RATE_HZ
         if getattr(self, '_stream_source', 'marked') == 'marked':
             # Marked-continuous: fresh-only (NaN when parked/dead/loss). Exactly what
             # per-bin nanmean needs -- no zero-order hold leaking parked values.
             rec = self._scan.reconstruct_marked_series(
-                words, nslots=self._nslots, to_hz_corr=True)
+                words, nslots=self._nslots, to_hz_corr=True,
+                words_per_sample=self._stream_words_per_sample)
         else:
             # Dual fallback: this ZOH-fills parked regions, so per-bin means may
             # include held values (warned in enable_position_markers).
             rec = self._scan.reconstruct_dual_hop_series(
-                words, nslots=self._nslots, to_hz_corr=True)
+                words, nslots=self._nslots, to_hz_corr=True,
+                words_per_sample=self._stream_words_per_sample)
         err = np.asarray(rec['err'], dtype=np.float64)
         corr = np.asarray(rec['corr'], dtype=np.float64)
+        cic = np.asarray(rec['cic'], dtype=np.float64)
         t_count = err.shape[1] if err.ndim == 2 else 0
         times = np.arange(t_count, dtype=np.float64) / rate
-        return {'err': err, 'corr_hz': corr, 'times': times, 'sample_rate': rate}
+        return {'err': err, 'corr_hz': corr, 'cic': cic,
+                'times': times, 'sample_rate': rate}
