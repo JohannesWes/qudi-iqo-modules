@@ -924,7 +924,7 @@ class SensitivitySweepLogic(LogicBase):
         and applies them to the lock-in module via the time_series_logic's streamer.
         """
         fir_bypass = self._stream_parameters.get('fir_bypass', False)
-        fir_filter_bw = self._stream_parameters.get('fir_filter_bandwidth', '500Hz')
+        fir_filter_bw = self._stream_parameters.get('fir_filter_bandwidth', '2kHz_minphase')
 
         self.log.info(f'Configuring lock-in filters: bypass={fir_bypass}, bandwidth={fir_filter_bw}')
 
@@ -969,10 +969,11 @@ class SensitivitySweepLogic(LogicBase):
             # Configure filter bandwidth (only effective when bypass is False)
             if not fir_bypass:
                 # Validate filter bandwidth option
-                valid_filters = {'500Hz', '2kHz', '5kHz', '1kHz', '1kHz_LP', '1kHz_FIR'}
+                valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
                 if fir_filter_bw not in valid_filters:
-                    self.log.warning(f'Invalid filter bandwidth "{fir_filter_bw}", using "500Hz"')
-                    fir_filter_bw = '500Hz'
+                    self.log.warning(
+                        f'Invalid filter selection "{fir_filter_bw}", using "2kHz_minphase"')
+                    fir_filter_bw = '2kHz_minphase'
 
                 lock_in.filter_select_ch1 = fir_filter_bw
                 self.log.debug(f'Set filter_select_ch1 = {fir_filter_bw}')

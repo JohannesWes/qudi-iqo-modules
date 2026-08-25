@@ -50,12 +50,18 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             options:
                 redpitaya_config_name: 'rpy_shared_config'
                 redpitaya_hostname: '10.203.129.28'
+                lock_in_filter_resonance_1: '2kHz_minphase'
+                lock_in_filter_resonance_2: '2kHz_minphase'
                 max_trace_samples: 2000000   # cap on the high-rate trace buffer
     """
 
     _redpitaya_config_name = ConfigOption('redpitaya_config_name',
                                           default='rpy_shared_config', missing='info')
     _redpitaya_hostname = ConfigOption('redpitaya_hostname', missing='error')
+    _lock_in_filter_resonance_1 = ConfigOption(
+        'lock_in_filter_resonance_1', default='2kHz_minphase', missing='info')
+    _lock_in_filter_resonance_2 = ConfigOption(
+        'lock_in_filter_resonance_2', default='2kHz_minphase', missing='info')
     # Size (in stream WORDS) of the high-rate display buffer for read_traces. It is a
     # ROLLING window: once full, the oldest samples are dropped so the tracking GUI
     # shows the most recent slice at CONSTANT resolution (like the Time Series GUI),
@@ -91,6 +97,7 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         # max_trace_samples ConfigOption in on_activate).
         self._trace_window_words = 2_000_000
         self._stream_source = 'marked'
+        self._configured_lock_in_filters = ['2kHz_minphase', '2kHz_minphase']
         # 2D motor-scan takeover: while True the motor scan owns the physical stream
         # drain (read_stream_words), so read_traces must NOT also drain (word theft).
         self._mapped_scan_active = False
@@ -124,6 +131,10 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
         self._fgen3 = getattr(rp, 'fgen3', None)
         self._scan = getattr(rp, 'scan', None)
 
+        # Multitrack routes resonance 1 through lockin channel 1 and resonance 2
+        # through lockin1 channel 1. Configure both instances explicitly.
+        self._configure_lock_in_filters(rp)
+
         # Ensure lock + oscillator are disabled on activation
         self._lock.enable = False
         if self._multitrack is not None:
@@ -136,6 +147,35 @@ class RedPitayaOdmrLockHardware(OdmrFreqLockInterface, MultiResonanceTrackingInt
             self.log.warning('rp.odmrmultitrack not found - multi-resonance tracking '
                              'unavailable (old bitstream?). Single-resonance lock still works.')
         self.log.info(f'Red Pitaya ODMR Lock connected: {self._redpitaya_hostname}')
+
+    def _configure_lock_in_filters(self, rp) -> None:
+        """Apply the per-resonance FIR phase selection to both lock-in instances."""
+        valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
+        requested = [self._lock_in_filter_resonance_1,
+                     self._lock_in_filter_resonance_2]
+
+        for index, (module_name, filter_name) in enumerate(
+                zip(('lockin', 'lockin1'), requested), start=1):
+            if filter_name not in valid_filters:
+                self.log.warning(
+                    f'Invalid lock-in filter for resonance {index}: "{filter_name}"; '
+                    'using "2kHz_minphase"')
+                filter_name = '2kHz_minphase'
+
+            lock_in = getattr(rp, module_name, None)
+            if lock_in is None:
+                self.log.warning(
+                    f'rp.{module_name} not found; cannot configure resonance {index} FIR')
+                continue
+
+            # Channel 1 is the current multitrack data path. Keep channel 2 in
+            # step so it is ready if the unused quadrature lane is enabled later.
+            lock_in.filter_select_ch1 = filter_name
+            lock_in.filter_select_ch2 = filter_name
+            self._configured_lock_in_filters[index - 1] = (
+                '2kHz_minphase' if filter_name == '2kHz' else filter_name)
+            self.log.info(
+                f'Resonance {index} FIR ({module_name}): {filter_name}')
 
     def on_deactivate(self):
         """Disable lock and disconnect."""

@@ -97,7 +97,7 @@ class SensitivitySweepGui(GuiBase):
 
     # Lock-in filter parameters
     _fir_bypass = StatusVar('fir_bypass', default=False)
-    _fir_filter_bandwidth = StatusVar('fir_filter_bandwidth', default='500Hz')  # '500Hz', '1kHz', '1kHz_LP', '1kHz_FIR', '2kHz', '5kHz'
+    _fir_filter_bandwidth = StatusVar('fir_filter_bandwidth', default='2kHz_minphase')
 
     # Off-resonant measurement parameters
     _include_off_resonant = StatusVar('include_off_resonant', default=False)
@@ -432,27 +432,22 @@ class SensitivitySweepGui(GuiBase):
 
         self._fir_filter_combobox = QtWidgets.QComboBox()
         self._fir_filter_combobox.addItems([
-            '500Hz',
-            '1kHz (IIR)',
-            '1kHz_LP (FIR linear-phase)',
-            '1kHz_FIR (FIR min-phase)',
-            '2kHz',
-            '5kHz'
+            '2 kHz minimum phase',
+            '2 kHz linear phase',
         ])
         # Map stored value to combobox index
         _filter_index_map = {
-            '500Hz': 0, '1kHz': 1, '1kHz_LP': 2, '1kHz_FIR': 3, '2kHz': 4, '5kHz': 5
+            '2kHz_minphase': 0,
+            '2kHz_linear': 1,
+            '2kHz': 0,  # migrate the legacy minimum-phase spelling
         }
         filter_index = _filter_index_map.get(self._fir_filter_bandwidth, 0)
         self._fir_filter_combobox.setCurrentIndex(filter_index)
         self._fir_filter_combobox.setToolTip(
             'Select lock-in lowpass filter.\n'
-            '500Hz: FIR, narrowest bandwidth, best noise rejection\n'
-            '1kHz (IIR): IIR 8th-order Butterworth, 1 kHz bandwidth\n'
-            '1kHz_LP (FIR linear-phase): FIR linear-phase, 1 kHz bandwidth\n'
-            '1kHz_FIR (FIR min-phase): FIR minimum-phase, 1 kHz bandwidth\n'
-            '2kHz: FIR, medium bandwidth\n'
-            '5kHz: FIR, widest bandwidth, fastest response'
+            'Both choices have the same CIC-compensated 2 kHz magnitude response.\n'
+            'Minimum phase: established low-latency response.\n'
+            'Linear phase: constant 1.933 ms FIR group delay.'
         )
         stream_layout.addRow('  Filter:', self._fir_filter_combobox)
 
@@ -849,9 +844,9 @@ class SensitivitySweepGui(GuiBase):
         # Lock-in filter settings
         self._fir_bypass = self._fir_bypass_checkbox.isChecked()
         # Map combobox index to PyRPL register key
-        _filter_key_from_index = {0: '500Hz', 1: '1kHz', 2: '1kHz_LP', 3: '1kHz_FIR', 4: '2kHz', 5: '5kHz'}
+        _filter_key_from_index = {0: '2kHz_minphase', 1: '2kHz_linear'}
         self._fir_filter_bandwidth = _filter_key_from_index.get(
-            self._fir_filter_combobox.currentIndex(), '500Hz'
+            self._fir_filter_combobox.currentIndex(), '2kHz_minphase'
         )
 
         # Off-resonant measurement settings

@@ -37,9 +37,8 @@ Example config:
             # Lock-in filter options (only used when stream_input='demod'):
             lock_in_fir_bypass_ch1: False  # True: CIC only (~15 kHz BW), False: CIC+FIR
             lock_in_fir_bypass_ch2: False
-            lock_in_filter_ch1: '2kHz'     # Filter: '500Hz', '1kHz' (IIR), '1kHz_LP' (FIR LP),
-                                           #         '1kHz_FIR' (FIR min-phase), '2kHz', '5kHz'
-            lock_in_filter_ch2: '2kHz'
+            lock_in_filter_ch1: '2kHz_minphase'  # '2kHz_minphase' or '2kHz_linear'
+            lock_in_filter_ch2: '2kHz_minphase'
 
 Usage Example:
 
@@ -131,9 +130,9 @@ class RedPitayaDataInStream(DataInStreamInterface):
     _lock_in_fir_bypass_ch1 = ConfigOption('lock_in_fir_bypass_ch1', default=False, missing='info')
     _lock_in_fir_bypass_ch2 = ConfigOption('lock_in_fir_bypass_ch2', default=False, missing='info')
     # Filter selection (active when fir_bypass is False):
-    # '500Hz', '1kHz' (IIR), '1kHz_LP' (FIR linear-phase), '1kHz_FIR' (FIR min-phase), '2kHz', '5kHz'
-    _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='2kHz', missing='info')
-    _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='2kHz', missing='info')
+    # Both filters have the same CIC-compensated 2 kHz magnitude response.
+    _lock_in_filter_ch1 = ConfigOption('lock_in_filter_ch1', default='2kHz_minphase', missing='info')
+    _lock_in_filter_ch2 = ConfigOption('lock_in_filter_ch2', default='2kHz_minphase', missing='info')
 
     # FPGA constants from pyrpl scan module
     _FPGA_CLOCK_FREQ = 125e6  # Hz
@@ -269,18 +268,18 @@ class RedPitayaDataInStream(DataInStreamInterface):
             lock_in.fir_bypass_ch2 = self._lock_in_fir_bypass_ch2
 
             # Configure filter selection (only active when FIR bypass is False)
-            valid_filters = {'500Hz', '2kHz', '5kHz', '1kHz', '1kHz_LP', '1kHz_FIR'}
+            valid_filters = {'2kHz_minphase', '2kHz_linear', '2kHz'}
 
             if self._lock_in_filter_ch1 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch1 "{self._lock_in_filter_ch1}". '
-                                 f'Using "2kHz". Valid options: {valid_filters}')
-                self._lock_in_filter_ch1 = '2kHz'
+                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
+                self._lock_in_filter_ch1 = '2kHz_minphase'
             lock_in.filter_select_ch1 = self._lock_in_filter_ch1
 
             if self._lock_in_filter_ch2 not in valid_filters:
                 self.log.warning(f'Invalid lock_in_filter_ch2 "{self._lock_in_filter_ch2}". '
-                                 f'Using "2kHz". Valid options: {valid_filters}')
-                self._lock_in_filter_ch2 = '2kHz'
+                                 f'Using "2kHz_minphase". Valid options: {valid_filters}')
+                self._lock_in_filter_ch2 = '2kHz_minphase'
             lock_in.filter_select_ch2 = self._lock_in_filter_ch2
 
             # Log configuration summary
